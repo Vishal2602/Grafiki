@@ -1,0 +1,24 @@
+[package]
+name = "grafiki-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+fastembed = { workspace = true, optional = true }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlite-vec = { workspace = true, optional = true }
+thiserror.workspace = true
+ulid.workspace = true
+
+[features]
+default = []
+fastembed = ["dep:fastembed"]
+sqlite-vec = ["dep:sqlite-vec"]
+
+[dev-dependencies]
+tempfile.workspace = true
