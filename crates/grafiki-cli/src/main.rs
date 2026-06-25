@@ -4629,10 +4629,11 @@ fn print_import_report_plain(report: &grafiki_core::ImportReport) {
     println!("Relations: {}", report.relations);
     println!("Skipped relations: {}", report.skipped_relations);
     println!("Observations: {}", report.observations);
+    println!("Skipped observations: {}", report.skipped_observations);
     println!("Decisions: {}", report.decisions);
     println!("State items: {}", report.state);
-    println!("Context skipped: {}", report.context_skipped);
-    println!("Sessions skipped: {}", report.sessions_skipped);
+    println!("Context: {}", report.context);
+    println!("Sessions: {}", report.sessions);
 }
 
 fn print_import_report_md(report: &grafiki_core::ImportReport) {
@@ -4644,10 +4645,11 @@ fn print_import_report_md(report: &grafiki_core::ImportReport) {
     println!("- Relations: {}", report.relations);
     println!("- Skipped relations: {}", report.skipped_relations);
     println!("- Observations: {}", report.observations);
+    println!("- Skipped observations: {}", report.skipped_observations);
     println!("- Decisions: {}", report.decisions);
     println!("- State items: {}", report.state);
-    println!("- Context skipped: {}", report.context_skipped);
-    println!("- Sessions skipped: {}", report.sessions_skipped);
+    println!("- Context: {}", report.context);
+    println!("- Sessions: {}", report.sessions);
 }
 
 fn print_embedding_status(

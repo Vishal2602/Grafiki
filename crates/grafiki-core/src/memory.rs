@@ -583,8 +583,18 @@ pub struct ExportBundle {
     pub observations: Vec<ExportObservation>,
     pub decisions: Vec<ExportDecision>,
     pub state: Vec<StateItem>,
-    pub context: Vec<ContextSummary>,
+    pub context: Vec<ExportContext>,
     pub sessions: Vec<SessionLogItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportContext {
+    pub key: String,
+    pub title: String,
+    pub category: String,
+    pub scope: String,
+    pub version: i64,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -604,6 +614,8 @@ pub struct ExportDecision {
     pub status: String,
     pub scope: String,
     pub reasoning: Option<String>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -616,8 +628,9 @@ pub struct ImportReport {
     pub observations: usize,
     pub decisions: usize,
     pub state: usize,
-    pub context_skipped: usize,
-    pub sessions_skipped: usize,
+    pub context: usize,
+    pub sessions: usize,
+    pub skipped_observations: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2943,8 +2956,10 @@ pub fn import_memory(options: ImportOptions) -> Result<ImportReport> {
     }
 
     let mut observations = 0;
+    let mut skipped_observations = 0;
     for observation in &bundle.observations {
         if !entity_exists_in_tx(&tx, &observation.entity_id)? {
+            skipped_observations += 1;
             continue;
         }
         tx.execute(
@@ -3013,6 +3028,24 @@ pub fn import_memory(options: ImportOptions) -> Result<ImportReport> {
         decisions += 1;
     }
 
+    // Second pass: wire up decision supersession now that every decision exists
+    // (superseded_by is a self-referential FK).
+    for decision in &bundle.decisions {
+        if let Some(superseded_by) = decision.superseded_by.as_deref() {
+            let target_exists: i64 = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM decisions WHERE id = ?1)",
+                [superseded_by],
+                |row| row.get(0),
+            )?;
+            if target_exists == 1 {
+                tx.execute(
+                    "UPDATE decisions SET superseded_by = ?1 WHERE id = ?2",
+                    params![superseded_by, decision.id],
+                )?;
+            }
+        }
+    }
+
     let mut state = 0;
     for item in &bundle.state {
         tx.execute(
@@ -3073,6 +3106,105 @@ pub fn import_memory(options: ImportOptions) -> Result<ImportReport> {
         relations += 1;
     }
 
+    let mut context = 0;
+    for item in &bundle.context {
+        tx.execute(
+            "
+            INSERT INTO context (id, key, title, content, category, scope, version, checksum)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(key) DO UPDATE SET
+                title = excluded.title,
+                content = excluded.content,
+                category = excluded.category,
+                scope = excluded.scope,
+                version = excluded.version,
+                checksum = excluded.checksum,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            ",
+            params![
+                new_ulid(),
+                item.key,
+                item.title,
+                item.content,
+                item.category,
+                item.scope,
+                item.version,
+                checksum(&item.content)
+            ],
+        )?;
+        enqueue_embedding_job(
+            &tx,
+            "context",
+            &item.key,
+            &item.scope,
+            &format!("{} {}", item.title, item.content),
+        )?;
+        context += 1;
+    }
+
+    let mut sessions = 0;
+    for session in &bundle.sessions {
+        // parent_session is a self-FK; set it in a second pass below.
+        tx.execute(
+            "
+            INSERT INTO sessions
+                (id, session_type, project, scope, status, goal, summary,
+                 accomplishments, remaining, files_changed, decisions_made,
+                 entities_touched, handoff_context, parent_session, child_session,
+                 started_at, ended_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?15, ?16)
+            ON CONFLICT(id) DO UPDATE SET
+                session_type = excluded.session_type,
+                status = excluded.status,
+                scope = excluded.scope,
+                goal = excluded.goal,
+                summary = excluded.summary,
+                accomplishments = excluded.accomplishments,
+                remaining = excluded.remaining,
+                files_changed = excluded.files_changed,
+                decisions_made = excluded.decisions_made,
+                entities_touched = excluded.entities_touched,
+                handoff_context = excluded.handoff_context,
+                child_session = excluded.child_session,
+                ended_at = excluded.ended_at
+            ",
+            params![
+                session.id,
+                session.session_type,
+                project.project,
+                session.scope,
+                session.status,
+                session.goal,
+                session.summary,
+                serde_json::to_string(&session.accomplishments)?,
+                serde_json::to_string(&session.remaining)?,
+                serde_json::to_string(&session.files_changed)?,
+                serde_json::to_string(&session.decisions_made)?,
+                serde_json::to_string(&session.entities_touched)?,
+                session.handoff_context,
+                session.child_session,
+                session.started_at,
+                session.ended_at
+            ],
+        )?;
+        sessions += 1;
+    }
+    for session in &bundle.sessions {
+        if let Some(parent) = session.parent_session.as_deref() {
+            let parent_exists: i64 = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                [parent],
+                |row| row.get(0),
+            )?;
+            if parent_exists == 1 {
+                tx.execute(
+                    "UPDATE sessions SET parent_session = ?1 WHERE id = ?2",
+                    params![parent, session.id],
+                )?;
+            }
+        }
+    }
+
     tx.execute(
         "
         INSERT INTO events (id, event_type, source_session, target_type, target_id, scope, summary)
@@ -3099,8 +3231,9 @@ pub fn import_memory(options: ImportOptions) -> Result<ImportReport> {
         observations,
         decisions,
         state,
-        context_skipped: bundle.context.len(),
-        sessions_skipped: bundle.sessions.len(),
+        context,
+        sessions,
+        skipped_observations,
     })
 }
 
@@ -7440,7 +7573,7 @@ fn export_decisions(
     query_scoped_rows(
         connection,
         "
-        SELECT id, title, status, scope, reasoning
+        SELECT id, title, status, scope, reasoning, superseded_by
         FROM decisions
         WHERE scope IN ({scopes})
         ORDER BY created_at ASC, id ASC
@@ -7453,6 +7586,7 @@ fn export_decisions(
                 status: row.get(2)?,
                 scope: row.get(3)?,
                 reasoning: row.get(4)?,
+                superseded_by: row.get(5)?,
             })
         },
     )
@@ -7472,17 +7606,26 @@ fn export_state(connection: &Connection, scope_chain: &[String]) -> Result<Vec<S
     )
 }
 
-fn export_context(connection: &Connection, scope_chain: &[String]) -> Result<Vec<ContextSummary>> {
+fn export_context(connection: &Connection, scope_chain: &[String]) -> Result<Vec<ExportContext>> {
     query_scoped_rows(
         connection,
         "
-        SELECT key, title, category, scope, version
+        SELECT key, title, category, scope, version, content
         FROM context
         WHERE scope IN ({scopes})
         ORDER BY updated_at ASC, key ASC
         ",
         scope_chain,
-        context_summary_from_row,
+        |row| {
+            Ok(ExportContext {
+                key: row.get(0)?,
+                title: row.get(1)?,
+                category: row.get(2)?,
+                scope: row.get(3)?,
+                version: row.get(4)?,
+                content: row.get(5)?,
+            })
+        },
     )
 }
 
@@ -9577,5 +9720,102 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(db_mode, 0o600, "project database should be owner-only");
+    }
+
+    #[test]
+    fn export_import_round_trips_context_sessions_and_supersession() {
+        let (temp, home, source_dir) = setup_project();
+        start_codex(home.clone(), source_dir.clone());
+        handoff_session(HandoffOptions {
+            project_name: None,
+            start_dir: source_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            session_id: None,
+        })
+        .unwrap();
+        add_context(AddContextOptions {
+            project_name: None,
+            start_dir: source_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            key: "auth-guide".to_owned(),
+            title: "Auth Guide".to_owned(),
+            category: "guide".to_owned(),
+            scope: "example-project/core".to_owned(),
+            content: "Rotating refresh tokens prevent replay.".to_owned(),
+        })
+        .unwrap();
+        let first = log_decision(LogDecisionOptions {
+            project_name: None,
+            start_dir: source_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            title: "Use rollback journal".to_owned(),
+            reasoning: Some("initial".to_owned()),
+            alternatives: vec![],
+            tags: vec![],
+            scope: "example-project/core".to_owned(),
+            supersedes: None,
+        })
+        .unwrap();
+        log_decision(LogDecisionOptions {
+            project_name: None,
+            start_dir: source_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            title: "Use WAL".to_owned(),
+            reasoning: Some("better concurrency".to_owned()),
+            alternatives: vec![],
+            tags: vec![],
+            scope: "example-project/core".to_owned(),
+            supersedes: Some(first.decision_id.clone()),
+        })
+        .unwrap();
+
+        let bundle = export_memory(ExportOptions {
+            project_name: None,
+            start_dir: source_dir,
+            grafiki_home: Some(home.clone()),
+            scope: "example-project/core".to_owned(),
+        })
+        .unwrap();
+        assert!(bundle.context.iter().any(|c| c.content.contains("Rotating")));
+        assert!(bundle.sessions.len() >= 2);
+        assert!(bundle.decisions.iter().any(|d| d.superseded_by.is_some()));
+
+        let target_dir = temp.path().join("target-project");
+        init_project(InitOptions {
+            project_name: None,
+            project_dir: target_dir.clone(),
+            grafiki_home: Some(home.clone()),
+        })
+        .unwrap();
+        let report = import_memory(ImportOptions {
+            project_name: None,
+            start_dir: target_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            bundle,
+        })
+        .unwrap();
+        assert!(report.context >= 1, "context must be imported");
+        assert!(report.sessions >= 2, "sessions must be imported");
+
+        // Re-export from the target project to confirm a faithful round-trip.
+        let round = export_memory(ExportOptions {
+            project_name: None,
+            start_dir: target_dir,
+            grafiki_home: Some(home),
+            scope: "example-project/core".to_owned(),
+        })
+        .unwrap();
+        assert!(
+            round.context.iter().any(|c| c.content.contains("Rotating")),
+            "context content must survive the round-trip"
+        );
+        assert!(
+            round.sessions.len() >= 2,
+            "sessions must survive the round-trip"
+        );
+        assert!(
+            round.decisions.iter().any(|d| d.superseded_by.is_some()),
+            "decision supersession must survive the round-trip"
+        );
     }
 }
