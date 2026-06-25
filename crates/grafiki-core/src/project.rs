@@ -179,6 +179,7 @@ pub fn init_project(options: InitOptions) -> Result<InitReport> {
         None => grafiki_home()?,
     };
     fs::create_dir_all(&grafiki_home)?;
+    crate::db::restrict_dir_permissions(&grafiki_home);
 
     let marker_path = project_dir.join(".grafiki");
     let created_marker = write_marker_if_needed(&marker_path, &project)?;

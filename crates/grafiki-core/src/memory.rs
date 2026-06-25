@@ -2745,6 +2745,9 @@ pub fn process_embedding_jobs(
     let provider = configured_embedding_provider()?;
     let limit = options.limit.clamp(1, 500);
     let enqueued = if options.rebuild && !scope_chain.is_empty() {
+        // An explicit rebuild revives previously-failed jobs so they are not
+        // permanent dead-letters; the user asked to retry.
+        requeue_failed_embedding_jobs(&connection, &scope_chain)?;
         enqueue_embeddable_records(&mut connection, &scope_chain)?
     } else {
         0
@@ -3250,12 +3253,17 @@ pub fn approve_candidate(options: ApproveCandidateOptions) -> Result<CandidateMu
         options.grafiki_home.clone(),
     )?;
 
-    let (_project, connection) = resolve_and_open(
+    let (_project, mut connection) = resolve_and_open(
         options.project_name,
         options.start_dir,
         options.grafiki_home,
     )?;
-    connection.execute(
+    // Flip the candidate status and promote its evidence atomically so a failure
+    // between the two cannot leave evidence pointing at a not-yet-approved
+    // candidate. (The trusted record was created above; the pending-status guard
+    // makes re-approval a no-op, preventing duplicates on the common retry path.)
+    let tx = connection.transaction()?;
+    tx.execute(
         "
         UPDATE extraction_candidates
         SET status = 'approved',
@@ -3266,12 +3274,8 @@ pub fn approve_candidate(options: ApproveCandidateOptions) -> Result<CandidateMu
         ",
         params![&trusted_record_type, &trusted_record_id, &options.id],
     )?;
-    promote_candidate_evidence(
-        &connection,
-        &options.id,
-        &trusted_record_type,
-        &trusted_record_id,
-    )?;
+    promote_candidate_evidence(&tx, &options.id, &trusted_record_type, &trusted_record_id)?;
+    tx.commit()?;
     let candidate = load_extraction_candidate(&connection, &options.id)?;
     Ok(CandidateMutationReport {
         candidate,
@@ -5944,6 +5948,28 @@ fn enqueue_embeddable_records(
     }
     tx.commit()?;
     Ok(enqueued)
+}
+
+/// Revive failed embedding jobs in scope back to pending so a `rebuild` retries
+/// them instead of leaving them as permanent dead-letters.
+fn requeue_failed_embedding_jobs(connection: &Connection, scope_chain: &[String]) -> Result<usize> {
+    if scope_chain.is_empty() {
+        return Ok(0);
+    }
+    let sql = scoped_query(
+        "
+        UPDATE embedding_jobs
+        SET status = 'pending', error = NULL
+        WHERE status = 'failed' AND scope IN ({scopes})
+        ",
+        scope_chain.len(),
+    );
+    let params: Vec<&dyn rusqlite::ToSql> = scope_chain
+        .iter()
+        .map(|scope| scope as &dyn rusqlite::ToSql)
+        .collect();
+    let count = connection.execute(&sql, params.as_slice())?;
+    Ok(count)
 }
 
 fn pending_embedding_jobs(
@@ -9487,5 +9513,69 @@ mod tests {
             "rationale secret must be redacted before persistence"
         );
         assert!(dump.contains("REDACTED"));
+    }
+
+    #[test]
+    fn rebuild_revives_failed_embedding_jobs() {
+        let (_temp, home, project_dir) = setup_project();
+        save_entity(SaveEntityOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            name: "Auth Service".to_owned(),
+            entity_type: "service".to_owned(),
+            observe: Some("JWT refresh uses rotating tokens".to_owned()),
+            category: "architecture".to_owned(),
+            scope: "example-project/core".to_owned(),
+            relate: None,
+        })
+        .unwrap();
+
+        {
+            let (_project, connection) =
+                resolve_and_open(None, project_dir.clone(), Some(home.clone())).unwrap();
+            let affected = connection
+                .execute(
+                    "UPDATE embedding_jobs SET status = 'failed', error = 'boom'",
+                    [],
+                )
+                .unwrap();
+            assert!(affected > 0, "expected an embedding job to fail");
+        }
+
+        process_embedding_jobs(ProcessEmbeddingsOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            scope: "example-project/core".to_owned(),
+            limit: 10,
+            rebuild: true,
+        })
+        .unwrap();
+
+        let (_project, connection) = resolve_and_open(None, project_dir, Some(home)).unwrap();
+        let failed: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM embedding_jobs WHERE status = 'failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed, 0, "rebuild must revive previously-failed jobs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_and_db_have_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, home, _project_dir) = setup_project();
+        let home_mode = std::fs::metadata(&home).unwrap().permissions().mode() & 0o777;
+        assert_eq!(home_mode, 0o700, "grafiki home should be owner-only");
+        let db_mode = std::fs::metadata(home.join("example-project.db"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(db_mode, 0o600, "project database should be owner-only");
     }
 }
