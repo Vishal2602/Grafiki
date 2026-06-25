@@ -817,6 +817,7 @@ function MemoryPane(props: {
             snapshot={props.snapshot}
             startDir={props.projectRoot}
             reduceMotion={props.reduceMotion}
+            active={props.active}
             onSelectResult={props.onSelectResult}
             onOpenResult={props.onOpenResult}
             onMemoryChanged={props.onMemoryChanged}
@@ -1740,6 +1741,7 @@ function CandidatesPane(props: {
   snapshot: ProjectSnapshot | null;
   startDir: string;
   reduceMotion: boolean;
+  active: boolean;
   onSelectResult: (result: SearchResult) => void;
   onOpenResult: (result: SearchResult) => void;
   onMemoryChanged: () => Promise<ProjectSnapshot>;
@@ -1812,6 +1814,12 @@ function CandidatesPane(props: {
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
+      // Only the active pane handles global candidate shortcuts; otherwise
+      // pressing `a`/`r` while reading another pane would silently mutate
+      // trusted memory.
+      if (!props.active) {
+        return;
+      }
       const target = event.target as HTMLElement | null;
       if (
         target?.closest("input, textarea, select, button") ||
@@ -1847,7 +1855,7 @@ function CandidatesPane(props: {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [busyId, editingId, focusedCandidateId, selectedIds, visibleCandidates]);
+  }, [props.active, busyId, editingId, focusedCandidateId, selectedIds, visibleCandidates]);
 
   async function approve(candidate: ExtractionCandidate) {
     setBusyId(candidate.id);

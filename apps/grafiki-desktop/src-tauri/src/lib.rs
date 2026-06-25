@@ -2480,7 +2480,9 @@ fn is_ignored_workspace_path(root: &Path, path: &Path) -> bool {
 fn parse_git_status(status_text: &str) -> GitStatusSummary {
     let mut summary = GitStatusSummary::default();
     for line in status_text.lines() {
-        if line.len() < 3 {
+        // Porcelain v1 lines are `XY<space>PATH`; bytes 0..3 are ASCII. Guard the
+        // slice boundaries defensively so unexpected output can never panic.
+        if line.len() < 3 || !line.is_char_boundary(2) || !line.is_char_boundary(3) {
             continue;
         }
         let status = &line[..2];

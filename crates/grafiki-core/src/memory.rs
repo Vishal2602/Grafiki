@@ -3118,6 +3118,15 @@ pub fn propose_candidate(options: ProposeCandidateOptions) -> Result<CandidateMu
         options.grafiki_home,
     )?;
     let id = new_ulid();
+    // Redact secrets before persistence. This is the central trust boundary for
+    // directly-proposed candidates (MCP propose, auto-capture, and `grafiki init`
+    // memory import all route through here), mirroring ingest_capture_event.
+    let mut payload = options.payload;
+    redact_json_value(&mut payload);
+    let rationale = options.rationale.map(|mut value| {
+        redact_sensitive_text(&mut value);
+        value
+    });
     connection.execute(
         "
         INSERT INTO extraction_candidates
@@ -3129,10 +3138,10 @@ pub fn propose_candidate(options: ProposeCandidateOptions) -> Result<CandidateMu
             source_type,
             options.source,
             record_type,
-            serde_json::to_string(&options.payload)?,
+            serde_json::to_string(&payload)?,
             scope.as_str(),
             confidence,
-            options.rationale
+            rationale
         ],
     )?;
     insert_candidate_evidence(&connection, &id, &options.evidence)?;
@@ -3516,6 +3525,7 @@ pub fn ingest_capture_event(options: IngestCaptureEventOptions) -> Result<Captur
     };
 
     let id = new_ulid();
+    let mut title = options.title;
     let mut text = options.text;
     let mut payload = options
         .payload
@@ -3526,6 +3536,11 @@ pub fn ingest_capture_event(options: IngestCaptureEventOptions) -> Result<Captur
         .map(|metadata| serde_json::to_string(&metadata))
         .transpose()?;
     let mut redacted = options.redacted;
+    if let Some(value) = title.as_mut() {
+        if redact_sensitive_text(value) {
+            redacted = true;
+        }
+    }
     if let Some(value) = text.as_mut() {
         if redact_sensitive_text(value) {
             redacted = true;
@@ -3572,7 +3587,7 @@ pub fn ingest_capture_event(options: IngestCaptureEventOptions) -> Result<Captur
                 capture_id,
                 source_type,
                 options.source,
-                options.title,
+                title,
                 text,
                 payload,
                 metadata,
@@ -3589,7 +3604,7 @@ pub fn ingest_capture_event(options: IngestCaptureEventOptions) -> Result<Captur
                 capture_id,
                 source_type,
                 options.source,
-                options.title,
+                title,
                 text,
                 payload,
                 metadata,
@@ -5589,20 +5604,22 @@ fn evidence_from_capture_event(event: &CaptureEvent) -> EvidenceInput {
 }
 
 fn compact_capture_text(text: &str) -> String {
-    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.len() > 360 {
-        format!("{}...", &compact[..360])
-    } else {
-        compact
-    }
+    compact_excerpt(text, 360)
 }
 
 fn compact_excerpt(text: &str, limit: usize) -> String {
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.len() > limit {
-        format!("{}...", &compact[..limit])
+    truncate_with_ellipsis(&compact, limit)
+}
+
+/// Truncate `text` to at most `max_chars` characters, never splitting a
+/// multibyte character, appending an ellipsis when truncation occurred.
+fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
+    if text.chars().count() > max_chars {
+        let truncated: String = text.chars().take(max_chars).collect();
+        format!("{truncated}...")
     } else {
-        compact
+        text.to_owned()
     }
 }
 
@@ -5616,6 +5633,29 @@ fn redact_sensitive_text(text: &mut String) -> bool {
         *text = redacted;
     }
     changed
+}
+
+/// Recursively redact secrets from every string value in a JSON document,
+/// preserving structure. Used for candidate payloads before persistence.
+fn redact_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            let mut owned = std::mem::take(text);
+            redact_sensitive_text(&mut owned);
+            *text = owned;
+        }
+        serde_json::Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_json_value(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (_key, item) in map.iter_mut() {
+                redact_json_value(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn redact_private_key_blocks(input: &str) -> String {
@@ -5683,27 +5723,74 @@ fn redact_assignment_like_secrets(input: &str) -> String {
     }
 }
 
+/// Redact known secret token formats while preserving the original whitespace
+/// structure byte-for-byte. Only actual secret substitutions change the text,
+/// so secret-free input round-trips unchanged (and is not flagged sensitive).
 fn redact_token_prefixes(input: &str) -> String {
-    input
-        .split_whitespace()
-        .map(|token| {
-            let trimmed = token
-                .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_');
-            let replacement = if trimmed.starts_with("sk-") && trimmed.len() >= 20 {
-                Some("[REDACTED_OPENAI_KEY]")
-            } else if trimmed.starts_with("ghp_") || trimmed.starts_with("github_pat_") {
-                Some("[REDACTED_GITHUB_TOKEN]")
-            } else if trimmed.starts_with("AKIA") && trimmed.len() >= 16 {
-                Some("[REDACTED_AWS_KEY]")
-            } else if looks_like_jwt(trimmed) {
-                Some("[REDACTED_JWT]")
-            } else {
-                None
-            };
-            replacement.unwrap_or(token).to_owned()
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut output = String::with_capacity(input.len());
+    let mut token = String::new();
+    for ch in input.chars() {
+        if ch.is_whitespace() {
+            if !token.is_empty() {
+                output.push_str(&redact_single_token(&token));
+                token.clear();
+            }
+            output.push(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    if !token.is_empty() {
+        output.push_str(&redact_single_token(&token));
+    }
+    output
+}
+
+fn redact_single_token(token: &str) -> String {
+    let trimmed =
+        token.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_');
+    if trimmed.is_empty() {
+        return token.to_owned();
+    }
+    let replacement = if trimmed.starts_with("sk-ant-") {
+        Some("[REDACTED_ANTHROPIC_KEY]")
+    } else if trimmed.starts_with("sk-") && trimmed.len() >= 20 {
+        Some("[REDACTED_OPENAI_KEY]")
+    } else if trimmed.starts_with("sk_live_")
+        || trimmed.starts_with("sk_test_")
+        || trimmed.starts_with("pk_live_")
+        || trimmed.starts_with("rk_live_")
+    {
+        Some("[REDACTED_STRIPE_KEY]")
+    } else if trimmed.starts_with("ghp_")
+        || trimmed.starts_with("gho_")
+        || trimmed.starts_with("ghu_")
+        || trimmed.starts_with("ghs_")
+        || trimmed.starts_with("ghr_")
+        || trimmed.starts_with("github_pat_")
+    {
+        Some("[REDACTED_GITHUB_TOKEN]")
+    } else if trimmed.starts_with("glpat-") {
+        Some("[REDACTED_GITLAB_TOKEN]")
+    } else if trimmed.starts_with("xoxb-")
+        || trimmed.starts_with("xoxp-")
+        || trimmed.starts_with("xoxa-")
+        || trimmed.starts_with("xapp-")
+    {
+        Some("[REDACTED_SLACK_TOKEN]")
+    } else if trimmed.starts_with("AKIA") && trimmed.len() >= 16 {
+        Some("[REDACTED_AWS_KEY]")
+    } else if trimmed.starts_with("AIza") && trimmed.len() >= 20 {
+        Some("[REDACTED_GOOGLE_KEY]")
+    } else if looks_like_jwt(trimmed) {
+        Some("[REDACTED_JWT]")
+    } else {
+        None
+    };
+    match replacement {
+        Some(label) => token.replace(trimmed, label),
+        None => token.to_owned(),
+    }
 }
 
 fn looks_like_jwt(token: &str) -> bool {
@@ -6870,7 +6957,7 @@ fn search_observations(
         FROM observations_fts f
         JOIN observations o ON o.rowid = f.rowid
         JOIN entities e ON e.id = o.entity_id
-        WHERE observations_fts MATCH ? AND e.scope IN ({scopes})
+        WHERE observations_fts MATCH ? AND o.valid_to IS NULL AND e.scope IN ({scopes})
         ORDER BY rank
         LIMIT ?
         ",
@@ -9246,5 +9333,159 @@ mod tests {
             .iter()
             .any(|result| result.snippet.contains("rotating tokens")));
         assert_eq!(graph.relations.len(), 1);
+    }
+
+    #[test]
+    fn soft_deleted_observation_absent_from_search() {
+        let (_temp, home, project_dir) = setup_project();
+
+        save_entity(SaveEntityOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            name: "Auth Service".to_owned(),
+            entity_type: "service".to_owned(),
+            observe: Some("JWT refresh uses rotating tokens".to_owned()),
+            category: "architecture".to_owned(),
+            scope: "example-project/core".to_owned(),
+            relate: None,
+        })
+        .unwrap();
+
+        let search_for = |query: &str| {
+            search_memory(SearchMemoryOptions {
+                project_name: None,
+                start_dir: project_dir.clone(),
+                grafiki_home: Some(home.clone()),
+                query: query.to_owned(),
+                record_type: "all".to_owned(),
+                mode: SearchMode::Keyword,
+                scope: "example-project/core".to_owned(),
+                limit: 10,
+            })
+            .unwrap()
+        };
+
+        assert!(
+            search_for("rotating")
+                .results
+                .iter()
+                .any(|result| result.record_type == "observation"),
+            "observation should be findable before deletion"
+        );
+
+        let observation_id = list_observations(ObservationListOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            scope: "example-project/core".to_owned(),
+            category: None,
+        })
+        .unwrap()[0]
+            .id
+            .clone();
+
+        delete_observation(DeleteObservationOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: observation_id,
+        })
+        .unwrap();
+
+        assert!(
+            !search_for("rotating")
+                .results
+                .iter()
+                .any(|result| result.record_type == "observation"),
+            "soft-deleted observation must not appear in keyword search/ask"
+        );
+    }
+
+    #[test]
+    fn redaction_preserves_whitespace_for_clean_text() {
+        let original =
+            "line one\nline two with  double  spaces\n\ttabbed line\nno secrets here at all\n";
+        let mut text = original.to_owned();
+        let changed = super::redact_sensitive_text(&mut text);
+        assert!(!changed, "secret-free text must not be flagged as redacted");
+        assert_eq!(
+            text, original,
+            "secret-free text must round-trip byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn redaction_covers_known_token_formats() {
+        let mut text = String::from(
+            "openai sk-ABCDEFGHIJKLMNOPQRSTUVWX\ngithub ghp_ABCDEFGHIJKLMNOPQRST\ngitlab glpat-ABCDEFGHIJKL\nslack xoxb-111-222-abcdefghij\naws AKIAIOSFODNN7EXAMPLE\ngoogle AIzaSyABCDEFGHIJKLMNOPQRSTU\nanthropic sk-ant-api03-ABCDEFGHIJKL",
+        );
+        let changed = super::redact_sensitive_text(&mut text);
+        assert!(changed);
+        for leaked in [
+            "sk-ABCDEFGHIJKLMNOPQRSTUVWX",
+            "ghp_ABCDEFGHIJKLMNOPQRST",
+            "glpat-ABCDEFGHIJKL",
+            "xoxb-111-222-abcdefghij",
+            "AKIAIOSFODNN7EXAMPLE",
+            "AIzaSyABCDEFGHIJKLMNOPQRSTU",
+            "sk-ant-api03-ABCDEFGHIJKL",
+        ] {
+            assert!(!text.contains(leaked), "token must be redacted: {leaked}");
+        }
+        assert!(text.contains("[REDACTED_GITHUB_TOKEN]"));
+        assert!(text.contains("[REDACTED_ANTHROPIC_KEY]"));
+        // Newline structure is preserved (no whitespace collapse).
+        assert_eq!(text.lines().count(), 7);
+    }
+
+    #[test]
+    fn compact_excerpt_handles_multibyte_without_panic() {
+        let text = "日本語のテキストです ".repeat(50);
+        let out = super::compact_excerpt(&text, 10);
+        assert!(out.ends_with("..."));
+        assert_eq!(out.chars().count(), 13);
+    }
+
+    #[test]
+    fn proposed_candidate_payload_and_rationale_are_redacted() {
+        let (_temp, home, project_dir) = setup_project();
+        propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "agent".to_owned(),
+            source: Some("test".to_owned()),
+            record_type: "observation".to_owned(),
+            payload: serde_json::json!({
+                "name": "Auth Service",
+                "content": "the key is sk-ABCDEFGHIJKLMNOPQRSTUVWX do not share"
+            }),
+            scope: "example-project/core".to_owned(),
+            confidence: 0.6,
+            rationale: Some("token ghp_ABCDEFGHIJKLMNOPQRST seen in logs".to_owned()),
+            evidence: Vec::new(),
+        })
+        .unwrap();
+
+        let candidates = list_candidates(ListCandidatesOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            status: Some("pending".to_owned()),
+            scope: "example-project/core".to_owned(),
+            limit: 20,
+        })
+        .unwrap();
+        let dump = serde_json::to_string(&candidates).unwrap();
+        assert!(
+            !dump.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWX"),
+            "payload secret must be redacted before persistence"
+        );
+        assert!(
+            !dump.contains("ghp_ABCDEFGHIJKLMNOPQRST"),
+            "rationale secret must be redacted before persistence"
+        );
+        assert!(dump.contains("REDACTED"));
     }
 }
