@@ -298,6 +298,18 @@ fn parse_transcript_file(
     path: &Path,
     limit: usize,
 ) -> Result<Vec<ParsedTranscriptEvent>> {
+    // Guard against loading a pathologically large file into memory.
+    const MAX_TRANSCRIPT_BYTES: u64 = 128 * 1024 * 1024;
+    if let Ok(metadata) = path.metadata() {
+        if metadata.len() > MAX_TRANSCRIPT_BYTES {
+            eprintln!(
+                "Skipping oversized transcript ({} bytes): {}",
+                metadata.len(),
+                path.display()
+            );
+            return Ok(Vec::new());
+        }
+    }
     let raw = fs::read_to_string(path)?;
     if raw.trim().is_empty() {
         return Ok(Vec::new());
@@ -327,7 +339,11 @@ fn parse_jsonl_transcript(
         if events.len() >= limit {
             break;
         }
-        let value: Value = serde_json::from_str(line)?;
+        // Tolerate a malformed line rather than discarding the entire transcript
+        // file (agent logs occasionally contain partial/truncated lines).
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         if let Some(event) = parse_json_value_event(agent, &value) {
             events.push(event);
         }

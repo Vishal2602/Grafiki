@@ -98,6 +98,12 @@ pub enum GrafikiError {
 
     #[error("Project not initialized: {0}. Run 'grafiki init' first.")]
     ProjectNotInitialized(String),
+
+    #[error(
+        "Database schema version {found} is newer than this Grafiki build supports ({supported}). \
+         Upgrade Grafiki to open this project."
+    )]
+    SchemaVersionTooNew { found: i64, supported: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, GrafikiError>;

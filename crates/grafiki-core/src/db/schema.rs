@@ -1,26 +1,72 @@
 use rusqlite::Connection;
 
+use crate::error::GrafikiError;
 use crate::Result;
 
 pub const INITIAL_SCHEMA_VERSION: i64 = 1;
+/// The newest schema version this build knows how to produce. Bump this and add
+/// a `Migration` entry whenever the schema changes.
+pub const LATEST_SCHEMA_VERSION: i64 = 1;
 
+struct Migration {
+    version: i64,
+    description: &'static str,
+    sql: &'static str,
+}
+
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    description: "initial core schema with sessions, graph, decisions, state, context, events, and FTS",
+    sql: INITIAL_SCHEMA,
+}];
+
+/// Bring a database up to LATEST_SCHEMA_VERSION by applying every migration step
+/// newer than its current version, each in its own transaction. Runs on every
+/// open, but the already-current path is a cheap version check. Refuses to touch
+/// a database created by a newer Grafiki build.
 pub fn initialize_schema(connection: &mut Connection) -> Result<()> {
-    let transaction = connection.transaction()?;
+    let current = current_schema_version(connection)?;
+    if current > LATEST_SCHEMA_VERSION {
+        return Err(GrafikiError::SchemaVersionTooNew {
+            found: current,
+            supported: LATEST_SCHEMA_VERSION,
+        });
+    }
+    if current == LATEST_SCHEMA_VERSION {
+        return Ok(());
+    }
 
-    transaction.execute_batch(INITIAL_SCHEMA)?;
-    transaction.execute(
-        "
-        INSERT OR IGNORE INTO schema_version (version, description)
-        VALUES (?1, ?2)
-        ",
-        (
-            INITIAL_SCHEMA_VERSION,
-            "initial core schema with sessions, graph, decisions, state, context, events, and FTS",
-        ),
-    )?;
-
-    transaction.commit()?;
+    for migration in MIGRATIONS.iter().filter(|m| m.version > current) {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(migration.sql)?;
+        transaction.execute(
+            "
+            INSERT OR IGNORE INTO schema_version (version, description)
+            VALUES (?1, ?2)
+            ",
+            (migration.version, migration.description),
+        )?;
+        transaction.commit()?;
+    }
     Ok(())
+}
+
+/// Current schema version, or 0 if the database has not been initialized yet.
+fn current_schema_version(connection: &Connection) -> Result<i64> {
+    let has_table: i64 = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_table == 0 {
+        return Ok(0);
+    }
+    let version: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(version)
 }
 
 const INITIAL_SCHEMA: &str = r#"
@@ -481,6 +527,33 @@ mod tests {
             .unwrap();
 
         assert_eq!(version, 1);
+    }
+
+    #[test]
+    fn migration_runner_is_idempotent_and_refuses_newer_versions() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&mut connection).unwrap();
+        // Re-running is a cheap no-op (already at the latest version).
+        initialize_schema(&mut connection).unwrap();
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, super::LATEST_SCHEMA_VERSION);
+
+        // A database written by a newer build must be refused, not silently used.
+        connection
+            .execute(
+                "INSERT INTO schema_version (version, description) VALUES (?1, 'future')",
+                [super::LATEST_SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        let err = initialize_schema(&mut connection).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::GrafikiError::SchemaVersionTooNew { .. }
+        ));
     }
 
     #[test]
