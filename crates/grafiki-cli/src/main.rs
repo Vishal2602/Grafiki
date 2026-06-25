@@ -5951,11 +5951,17 @@ fn serve_http(
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) =
-                    handle_http_stream(stream, project.clone(), path.clone(), token.clone())
-                {
-                    eprintln!("HTTP request failed: {error}");
-                }
+                // Handle each connection on its own thread so one slow/stalled
+                // client cannot block the whole API (slowloris). Each handler
+                // opens its own SQLite connection, which is safe under WAL.
+                let project = project.clone();
+                let path = path.clone();
+                let token = token.clone();
+                thread::spawn(move || {
+                    if let Err(error) = handle_http_stream(stream, project, path, token) {
+                        eprintln!("HTTP request failed: {error}");
+                    }
+                });
             }
             Err(error) => eprintln!("HTTP connection failed: {error}"),
         }
@@ -5990,14 +5996,23 @@ fn handle_http_stream(
     base_path: PathBuf,
     token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let request = parse_http_request(&stream)?;
-    let response =
-        match route_http_request(&request, base_project.clone(), base_path.clone(), token) {
+    // Bound how long a single client can hold a worker thread.
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(15)))?;
+    let response = match parse_http_request(&stream) {
+        Ok(request) => match route_http_request(&request, base_project, base_path, token) {
             Ok(response) => response,
             Err(error) => {
-                HttpResponse::json(500, serde_json::json!({ "error": error.to_string() }))
+                // Log details server-side; never leak internals to the client.
+                eprintln!("HTTP handler error: {error}");
+                HttpResponse::json(500, serde_json::json!({ "error": "internal error" }))
             }
-        };
+        },
+        Err(error) => {
+            eprintln!("HTTP request parse error: {error}");
+            HttpResponse::json(400, serde_json::json!({ "error": "invalid request" }))
+        }
+    };
     write_http_response(&mut stream, response)?;
     Ok(())
 }
@@ -6028,6 +6043,12 @@ fn parse_http_request(stream: &TcpStream) -> Result<HttpRequest, Box<dyn std::er
         }
     }
 
+    // Cap body size so an attacker-controlled Content-Length cannot trigger an
+    // unbounded allocation (OOM). 16 MiB is far above any legitimate request.
+    const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+    if content_length > MAX_BODY_BYTES {
+        return Err("request body exceeds 16MiB limit".into());
+    }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body)?;
@@ -6052,6 +6073,19 @@ fn parse_http_target(target: &str) -> (String, HashMap<String, String>) {
     (percent_decode(path), query)
 }
 
+/// Constant-time comparison so token verification does not leak the secret via
+/// response timing. (Length is allowed to differ early, as is standard.)
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 fn http_authorized(request: &HttpRequest, token: Option<&str>) -> bool {
     let Some(expected) = token.filter(|token| !token.is_empty()) else {
         return true;
@@ -6059,7 +6093,7 @@ fn http_authorized(request: &HttpRequest, token: Option<&str>) -> bool {
     if request
         .query
         .get("token")
-        .map(|token| token == expected)
+        .map(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
         .unwrap_or(false)
     {
         return true;
@@ -6067,7 +6101,7 @@ fn http_authorized(request: &HttpRequest, token: Option<&str>) -> bool {
     if request
         .headers
         .get("x-grafiki-token")
-        .map(|token| token == expected)
+        .map(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
         .unwrap_or(false)
     {
         return true;
@@ -6076,7 +6110,7 @@ fn http_authorized(request: &HttpRequest, token: Option<&str>) -> bool {
         .headers
         .get("authorization")
         .and_then(|header| header.strip_prefix("Bearer "))
-        .map(|token| token == expected)
+        .map(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
         .unwrap_or(false)
 }
 
@@ -6086,7 +6120,11 @@ fn route_http_request(
     base_path: PathBuf,
     token: Option<String>,
 ) -> Result<HttpResponse, Box<dyn std::error::Error>> {
-    if !request.path.ends_with("/health") && !http_authorized(request, token.as_deref()) {
+    // Only an explicit allowlist of routes is public. Using ends_with("/health")
+    // here previously let "/api/context/health", "/api/memory/<t>/health" etc.
+    // bypass the token check and return real data.
+    let is_public = matches!(request.path.as_str(), "/" | "/health" | "/api/health");
+    if !is_public && !http_authorized(request, token.as_deref()) {
         return Ok(HttpResponse::json(
             401,
             serde_json::json!({ "error": "Unauthorized" }),
@@ -7521,7 +7559,36 @@ fn run_mcp(project: Option<String>, path: PathBuf) -> Result<(), Box<dyn std::er
             }
         };
 
-        if let Some(response) = handle_mcp_message(message, project.clone(), path.clone())? {
+        let response = match message {
+            // JSON-RPC 2.0 batch: process each member, return an array of the
+            // responses that warrant one (notifications produce none).
+            serde_json::Value::Array(items) => {
+                if items.is_empty() {
+                    Some(mcp_error(
+                        serde_json::Value::Null,
+                        -32600,
+                        "Invalid Request: empty batch",
+                    ))
+                } else {
+                    let mut responses = Vec::new();
+                    for item in items {
+                        if let Some(resp) =
+                            handle_mcp_message(item, project.clone(), path.clone())?
+                        {
+                            responses.push(resp);
+                        }
+                    }
+                    if responses.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::Value::Array(responses))
+                    }
+                }
+            }
+            other => handle_mcp_message(other, project.clone(), path.clone())?,
+        };
+
+        if let Some(response) = response {
             writeln!(stdout, "{response}")?;
             stdout.flush()?;
         }
@@ -7562,7 +7629,16 @@ fn handle_mcp_message(
         "tools/list" => mcp_result(id, serde_json::json!({ "tools": mcp_tools() })),
         "tools/call" => match handle_mcp_tool_call(&message, project, path) {
             Ok(result) => mcp_result(id, result),
-            Err(error) => mcp_error(id, -32603, &error.to_string()),
+            // Per MCP spec, tool execution failures are reported as a successful
+            // result with isError=true (so the agent sees the message), not as a
+            // JSON-RPC protocol error.
+            Err(error) => mcp_result(
+                id,
+                serde_json::json!({
+                    "content": [{ "type": "text", "text": format!("Error: {error}") }],
+                    "isError": true
+                }),
+            ),
         },
         _ => mcp_error(id, -32601, "Method not found"),
     };
