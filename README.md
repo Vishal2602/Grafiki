@@ -30,6 +30,18 @@ Grafiki answers with trusted project memory and evidence links back to capture e
 - Automatically extracted knowledge is proposed as candidates first; the user approves or rejects it.
 - Agent questions are logged locally so you can see what the agent asked and what memory it received.
 
+## Install
+
+See [docs/INSTALL.md](docs/INSTALL.md) for the full guide. The short version:
+
+```bash
+brew tap <owner>/grafiki
+brew install grafiki            # the `grafiki` CLI + MCP server
+brew install --cask grafiki     # optional desktop app (macOS)
+```
+
+Released binaries include real semantic search (`fastembed` + `sqlite-vec`).
+
 ## Quickstart
 
 ```bash

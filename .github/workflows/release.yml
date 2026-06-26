@@ -1,0 +1,78 @@
+name: Release
+
+# Tag a release to build and publish artifacts:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # Real semantic search ships only in release builds: the fastembed + sqlite-vec
+  # features are compiled in here, so the published binaries embed for real while
+  # day-to-day dev builds stay lightweight.
+  cli:
+    name: CLI (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+      - name: Build CLI (with real embeddings)
+        run: cargo build --release -p grafiki-cli --features fastembed,sqlite-vec --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf "dist/grafiki-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" grafiki
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/grafiki-${{ matrix.target }}.tar.gz
+
+  desktop:
+    name: Desktop DMG (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: apps/grafiki-desktop/.nvmrc
+      - name: Build frontend
+        working-directory: apps/grafiki-desktop
+        run: |
+          npm ci
+          npm run build
+      - name: Prepare CLI sidecar (release, with embeddings)
+        run: |
+          cargo build --release -p grafiki-cli --features fastembed,sqlite-vec
+          bash scripts/prepare_desktop_sidecar.sh release
+      - name: Build, sign, and notarize the app
+        working-directory: apps/grafiki-desktop
+        # Signing + notarization activate automatically when these secrets are
+        # configured (see docs/PRODUCTION_RELEASE.md). Until then this produces an
+        # unsigned .app/.dmg (Gatekeeper will warn; install via Homebrew or the
+        # documented "Open Anyway" step).
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
+        run: npm run tauri build
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/bundle/dmg/*.dmg
