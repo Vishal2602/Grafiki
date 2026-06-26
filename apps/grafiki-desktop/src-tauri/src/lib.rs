@@ -2076,7 +2076,47 @@ fn capture_memory(request: CaptureRequest) -> Result<CaptureResponse, String> {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+fn crash_log_dir() -> Option<PathBuf> {
+    let home = env::var_os("GRAFIKI_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".grafiki")))?;
+    Some(home.join("logs"))
+}
+
+/// Append a bounded record of any panic to ~/.grafiki/logs/desktop-crash.log so
+/// a crashing desktop build leaves a trace, while keeping the still-default
+/// behavior afterward. The payload is truncated to bound accidental data.
+fn install_panic_logger() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(dir) = crash_log_dir() {
+            let _ = fs::create_dir_all(&dir);
+            let location = info
+                .location()
+                .map(|loc| format!("{}:{}", loc.file(), loc.line()))
+                .unwrap_or_else(|| "unknown".to_owned());
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|value| value.to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            let payload: String = payload.chars().take(500).collect();
+            if let Ok(mut file) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("desktop-crash.log"))
+            {
+                use std::io::Write;
+                let _ = writeln!(file, "[panic] {location} {payload}");
+            }
+        }
+        default_hook(info);
+    }));
+}
+
 pub fn run() {
+    install_panic_logger();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![

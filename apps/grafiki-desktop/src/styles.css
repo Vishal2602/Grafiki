@@ -1,5 +1,20 @@
+.preview-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 9999;
+  padding: 6px 14px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: #5a3a00;
+  background: #ffd8a8;
+  border-bottom: 1px solid #e0a85a;
+}
+
 :root {
-  color-scheme: light;
+  color-scheme: light dark;
   --paper: #f6f4ee;
   --paper-strong: #ffffff;
   --rail: #fbfaf7;
@@ -23,8 +38,46 @@
     sans-serif;
 }
 
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #16181c;
+    --paper-strong: #1e2127;
+    --rail: #14161a;
+    --ink: #e8e6e0;
+    --ink-soft: #b3b8bf;
+    --ink-mute: #7b828b;
+    --line: #2c2f36;
+    --line-strong: #3a3e46;
+    --accent: #ff7a33;
+    --accent-soft: #2a1b10;
+    --teal: #2bb3a3;
+    --warn: #e0a13a;
+    --warning-soft: #2a2310;
+    --good: #3fae6b;
+    --shadow: rgba(0, 0, 0, 0.45);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 * {
   box-sizing: border-box;
+}
+
+/* Restore a visible focus ring for keyboard navigation (the app is keyboard-first). */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
 }
 
 html,

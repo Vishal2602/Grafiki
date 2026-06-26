@@ -48,6 +48,11 @@ import type {
 
 const hasTauri = () => "__TAURI_INTERNALS__" in window;
 
+/// True when running outside the Tauri shell (e.g. a plain browser), where the
+/// API returns mock data and mutations are not persisted. The UI surfaces this
+/// so demos/QA cannot mistake preview behavior for a working backend.
+export const isPreviewMode = () => !hasTauri();
+
 export async function getProjectSnapshot(input: { startDir?: string; scope?: string } = {}): Promise<ProjectSnapshot> {
   if (!hasTauri()) return mockSnapshot;
 

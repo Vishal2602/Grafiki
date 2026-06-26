@@ -76,6 +76,7 @@ import {
   updateCaptureConfig,
   stopAutomaticCapture,
   summarizeAutomaticCapture,
+  isPreviewMode,
 } from "./api";
 import {
   decodeLayoutFromHash,
@@ -513,6 +514,11 @@ export default function App() {
         animate={{ opacity: 1 }}
         transition={transition.quick}
       >
+      {isPreviewMode() ? (
+        <div className="preview-banner" role="status">
+          Preview mode — no Grafiki backend connected. Changes shown here are not saved.
+        </div>
+      ) : null}
       <Rail
         activeKind={activePane?.kind ?? "overview"}
         onOpen={(kind) => switchPrimaryPane(kind)}
@@ -1164,6 +1170,18 @@ function SearchPane(props: {
           ))}
         </AnimatePresence>
       </motion.section>
+
+      {!searching && query.trim() && results.length === 0 ? (
+        <section className="notice compact">
+          <SearchIcon size={16} />
+          <span>
+            No matches for &ldquo;{query.trim()}&rdquo;.
+            {mode !== "keyword" && !semanticAvailable
+              ? " Semantic search has no index yet — click Rebuild to enable semantic matches."
+              : ""}
+          </span>
+        </section>
+      ) : null}
     </div>
   );
 }
