@@ -386,14 +386,12 @@ fn mcp_search_tool_round_trip() {
         let stdin = child.stdin.as_mut().unwrap();
         writeln!(
             stdin,
-            "{}",
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{{}}}}"
         )
         .unwrap();
         writeln!(
             stdin,
-            "{}",
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"grafiki_search","arguments":{"query":"rotating","scope":"mcp/core"}}}"#
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"grafiki_search\",\"arguments\":{{\"query\":\"rotating\",\"scope\":\"mcp/core\"}}}}}}"
         )
         .unwrap();
     }
@@ -456,50 +454,42 @@ fn mcp_handoff_tool_round_trip() {
         let stdin = child.stdin.as_mut().unwrap();
         writeln!(
             stdin,
-            "{}",
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{{}}}}"
         )
         .unwrap();
         writeln!(
             stdin,
-            "{}",
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"grafiki_start","arguments":{"goal":"Prepare MCP handoff","scope":"mcp-handoff/core"}}}"#
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"grafiki_start\",\"arguments\":{{\"goal\":\"Prepare MCP handoff\",\"scope\":\"mcp-handoff/core\"}}}}}}"
         )
         .unwrap();
         writeln!(
             stdin,
-            "{}",
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"grafiki_handoff","arguments":{}}}"#
+            "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{{\"name\":\"grafiki_handoff\",\"arguments\":{{}}}}}}"
         )
         .unwrap();
         writeln!(
             stdin,
-            "{}",
-            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"grafiki_update_record","arguments":{"type":"context","id":"backend-note","content":"MCP updated context detail."}}}"#
+            "{{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{{\"name\":\"grafiki_update_record\",\"arguments\":{{\"type\":\"context\",\"id\":\"backend-note\",\"content\":\"MCP updated context detail.\"}}}}}}"
         )
         .unwrap();
         writeln!(
             stdin,
-            "{}",
-            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"grafiki_record","arguments":{"type":"context","id":"backend-note","scope":"mcp-handoff/core"}}}"#
+            "{{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{{\"name\":\"grafiki_record\",\"arguments\":{{\"type\":\"context\",\"id\":\"backend-note\",\"scope\":\"mcp-handoff/core\"}}}}}}"
         )
         .unwrap();
         writeln!(
             stdin,
-            "{}",
-            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"grafiki_delete_record","arguments":{"type":"context","id":"backend-note"}}}"#
+            "{{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{{\"name\":\"grafiki_delete_record\",\"arguments\":{{\"type\":\"context\",\"id\":\"backend-note\"}}}}}}"
         )
         .unwrap();
         writeln!(
             stdin,
-            "{}",
-            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"grafiki_candidate_propose","arguments":{"type":"state","source_type":"mcp-test","source":"thread-1","scope":"mcp-handoff/core","confidence":0.7,"payload":{"key":"candidate-work","title":"Review MCP candidate"}}}}"#
+            "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{{\"name\":\"grafiki_candidate_propose\",\"arguments\":{{\"type\":\"state\",\"source_type\":\"mcp-test\",\"source\":\"thread-1\",\"scope\":\"mcp-handoff/core\",\"confidence\":0.7,\"payload\":{{\"key\":\"candidate-work\",\"title\":\"Review MCP candidate\"}}}}}}}}"
         )
         .unwrap();
         writeln!(
             stdin,
-            "{}",
-            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"grafiki_candidate_list","arguments":{"status":"pending","scope":"mcp-handoff/core"}}}"#
+            "{{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{{\"name\":\"grafiki_candidate_list\",\"arguments\":{{\"status\":\"pending\",\"scope\":\"mcp-handoff/core\"}}}}}}"
         )
         .unwrap();
     }

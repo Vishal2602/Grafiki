@@ -1,3 +1,11 @@
+// See grafiki-core/src/lib.rs: allow a few intentional, pre-existing API shapes
+// so `clippy -D warnings` stays green in CI.
+#![allow(
+    clippy::too_many_arguments,
+    clippy::ptr_arg,
+    clippy::large_enum_variant
+)]
+
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -5098,7 +5106,7 @@ fn export_bundle_to_html(bundle: &grafiki_core::ExportBundle) -> String {
     html.push_str("  <div class=\"meta\">\n");
     html.push_str(&format!(
         "    <span class=\"pill\">Scope: {}</span>\n",
-        escape_xml(&display_scope(&bundle.scope))
+        escape_xml(display_scope(&bundle.scope))
     ));
     html.push_str("    <span class=\"pill\">Local-first memory snapshot</span>\n");
     html.push_str("  </div>\n</header>\n<main>\n");
@@ -5124,7 +5132,7 @@ fn export_bundle_to_html(bundle: &grafiki_core::ExportBundle) -> String {
             escape_xml(&entity.id),
             escape_xml(&entity.name),
             escape_xml(&entity.entity_type),
-            escape_xml(&display_scope(&entity.scope))
+            escape_xml(display_scope(&entity.scope))
         ));
     }
     html.push_str("      </tbody>\n    </table>\n  </section>\n");
@@ -5150,7 +5158,7 @@ fn export_bundle_to_html(bundle: &grafiki_core::ExportBundle) -> String {
             escape_xml(&observation.entity_id),
             escape_xml(&observation.category),
             escape_xml(&observation.content),
-            escape_xml(&display_scope(&observation.scope))
+            escape_xml(display_scope(&observation.scope))
         ));
     }
     html.push_str("      </tbody>\n    </table>\n  </section>\n");
@@ -5163,7 +5171,7 @@ fn export_bundle_to_html(bundle: &grafiki_core::ExportBundle) -> String {
             escape_xml(&decision.id),
             escape_xml(&decision.title),
             escape_xml(&decision.status),
-            escape_xml(&display_scope(&decision.scope))
+            escape_xml(display_scope(&decision.scope))
         ));
     }
     html.push_str("      </tbody>\n    </table>\n  </section>\n");
@@ -7574,8 +7582,7 @@ fn run_mcp(project: Option<String>, path: PathBuf) -> Result<(), Box<dyn std::er
                 } else {
                     let mut responses = Vec::new();
                     for item in items {
-                        if let Some(resp) =
-                            handle_mcp_message(item, project.clone(), path.clone())?
+                        if let Some(resp) = handle_mcp_message(item, project.clone(), path.clone())?
                         {
                             responses.push(resp);
                         }

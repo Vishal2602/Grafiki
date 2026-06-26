@@ -6698,7 +6698,7 @@ fn search_json_vector_memory(
         if embedding.len() != query_embedding.len() {
             continue;
         }
-        let score = cosine_similarity(&query_embedding, &embedding);
+        let score = cosine_similarity(query_embedding, &embedding);
         if score <= 0.0 {
             continue;
         }
@@ -9776,7 +9776,10 @@ mod tests {
             scope: "example-project/core".to_owned(),
         })
         .unwrap();
-        assert!(bundle.context.iter().any(|c| c.content.contains("Rotating")));
+        assert!(bundle
+            .context
+            .iter()
+            .any(|c| c.content.contains("Rotating")));
         assert!(bundle.sessions.len() >= 2);
         assert!(bundle.decisions.iter().any(|d| d.superseded_by.is_some()));
 

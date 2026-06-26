@@ -16,7 +16,8 @@ struct Migration {
 
 const MIGRATIONS: &[Migration] = &[Migration {
     version: 1,
-    description: "initial core schema with sessions, graph, decisions, state, context, events, and FTS",
+    description:
+        "initial core schema with sessions, graph, decisions, state, context, events, and FTS",
     sql: INITIAL_SCHEMA,
 }];
 

@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main, production-hardening]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint (fmt, clippy, tsc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the version + components (rustfmt, clippy).
+      - name: Rustfmt
+        run: cargo fmt --all --check
+      - name: Clippy (core + cli)
+        run: cargo clippy -p grafiki-core -p grafiki-cli --all-targets -- -D warnings
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: apps/grafiki-desktop/.nvmrc
+          cache: npm
+          cache-dependency-path: apps/grafiki-desktop/package-lock.json
+      - name: Install web deps
+        working-directory: apps/grafiki-desktop
+        run: npm ci
+      - name: Typecheck frontend
+        working-directory: apps/grafiki-desktop
+        run: npx tsc --noEmit
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
+      # Test the library + CLI (the desktop crate is exercised in the desktop job).
+      - name: Test core + cli
+        run: cargo test -p grafiki-core -p grafiki-cli
+      # Ensure the optional embedding features still compile (no model download).
+      - name: Build with embedding features
+        run: cargo build -p grafiki-core -p grafiki-cli --features fastembed,sqlite-vec
+
+  smoke:
+    name: Smoke (end-to-end CLI/HTTP/MCP)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: apps/grafiki-desktop/.nvmrc
+      # tauri-build expects the frontend dist to exist when the workspace builds.
+      - name: Build frontend
+        working-directory: apps/grafiki-desktop
+        run: |
+          npm ci
+          npm run build
+      - name: Run smoke suite
+        run: bash scripts/smoke.sh
+
+  desktop-build:
+    name: Desktop build (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: apps/grafiki-desktop/.nvmrc
+      - name: Build frontend
+        working-directory: apps/grafiki-desktop
+        run: |
+          npm ci
+          npm run build
+      - name: Build desktop crate
+        run: cargo build -p grafiki-desktop
+
+  supply-chain:
+    name: Supply chain audit
+    runs-on: ubuntu-latest
+    # Informational: a newly-published advisory should surface but not block merges.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: apps/grafiki-desktop/.nvmrc
+      - name: npm audit
+        working-directory: apps/grafiki-desktop
+        run: npm audit --audit-level=high
