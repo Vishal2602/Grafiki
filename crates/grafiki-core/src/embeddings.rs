@@ -102,6 +102,9 @@ impl FastEmbedProvider {
 }
 
 /// Stable, per-user cache directory for the fastembed model (under GRAFIKI_HOME).
+/// Note: if the `HF_HOME` env var is set, fastembed/hf-hub honor it over this
+/// cache_dir, so the model may resolve elsewhere; unset HF_HOME (or point it at
+/// this directory) for a fully pinned location.
 #[cfg(feature = "fastembed")]
 fn fastembed_cache_dir() -> Result<std::path::PathBuf> {
     let dir = crate::project::grafiki_home()?
@@ -211,8 +214,9 @@ pub fn prefetch_embedding_model() -> Result<String> {
     #[cfg(feature = "fastembed")]
     {
         let cache_dir = fastembed_cache_dir()?;
+        // try_new performs the model download into the cache; the embed call then
+        // verifies the model can actually run inference.
         let provider = FastEmbedProvider::try_new()?;
-        // One embed forces the full model download/extract.
         provider.embed("warm up the embedding model")?;
         Ok(cache_dir.display().to_string())
     }

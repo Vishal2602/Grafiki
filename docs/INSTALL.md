@@ -19,10 +19,12 @@ airgapped/offline machines, pre-download it while online:
 grafiki embeddings prefetch
 ```
 
-If the model can't be loaded offline, Grafiki falls back to the deterministic
-provider and `grafiki embeddings status` explains how to pre-download it. The
-deterministic provider (`GRAFIKI_EMBEDDING_PROVIDER=deterministic`) needs no model
-and works fully offline.
+In `auto` mode (`GRAFIKI_EMBEDDING_PROVIDER=auto`), if the model can't be loaded
+Grafiki falls back to the deterministic provider and `embeddings status` notes how
+to pre-download it. The deterministic provider
+(`GRAFIKI_EMBEDDING_PROVIDER=deterministic`, the default) needs no model and works
+fully offline. Note: if `HF_HOME` is set in your environment it overrides the cache
+location above — unset it (or point it at the same directory) to keep the model pinned.
 
 ## CLI
 

@@ -1836,8 +1836,9 @@ function CandidatesPane(props: {
     function onKeyDown(event: KeyboardEvent) {
       // Only the active pane handles global candidate shortcuts; otherwise
       // pressing `a`/`r` while reading another pane would silently mutate
-      // trusted memory.
-      if (!props.active) {
+      // trusted memory. Also ignore shortcuts while a prompt modal is open,
+      // otherwise a keystroke could act on the candidate hidden behind it.
+      if (!props.active || promptModal) {
         return;
       }
       const target = event.target as HTMLElement | null;
@@ -1875,7 +1876,7 @@ function CandidatesPane(props: {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [props.active, busyId, editingId, focusedCandidateId, selectedIds, visibleCandidates]);
+  }, [props.active, promptModal, busyId, editingId, focusedCandidateId, selectedIds, visibleCandidates]);
 
   async function approve(candidate: ExtractionCandidate) {
     setBusyId(candidate.id);
@@ -3156,7 +3157,7 @@ function SettingsPane(props: {
     setError(null);
     try {
       const result = await startDaemon({
-        startDir: draftRoot,
+        startDir: draftRoot || props.projectRoot || snapshot?.start_dir || "",
         host: daemonHost,
         port: daemonPort,
         token: daemonToken,
@@ -3177,7 +3178,9 @@ function SettingsPane(props: {
     setMessage(null);
     setError(null);
     try {
-      const result = await stopDaemon({ startDir: draftRoot });
+      const result = await stopDaemon({
+        startDir: draftRoot || props.projectRoot || snapshot?.start_dir || "",
+      });
       setMessage(result.message);
       await refreshDaemonStatus();
     } catch (daemonError) {
@@ -4441,6 +4444,15 @@ function PromptModal(props: { config: PromptConfig; reduceMotion: boolean; onClo
   const setField = (name: string, value: string) =>
     setValues((current) => ({ ...current, [name]: value }));
   const submit = () => config.onSubmit(values);
+
+  // Escape closes the modal regardless of where focus is (not just inside it).
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (event.key === "Escape") props.onClose();
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [props]);
 
   return (
     <motion.div

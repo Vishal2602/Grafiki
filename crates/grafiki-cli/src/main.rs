@@ -3623,7 +3623,11 @@ fn watch_files_capture(
             redacted: false,
             captured_at: None,
         })?;
-        events.push(report.event);
+        // Skip unchanged files that were already captured (deduplicated) so the
+        // count and message reflect only genuinely new snapshots.
+        if !report.deduplicated {
+            events.push(report.event);
+        }
     }
     stop_capture_session(StopCaptureOptions {
         project_name: options.project_name.clone(),
@@ -3647,6 +3651,7 @@ fn watch_files_capture(
         None
     };
 
+    let captured_any = !events.is_empty();
     Ok(FileWatchCaptureReport {
         project: options.project_name,
         scope: options.scope,
@@ -3654,7 +3659,11 @@ fn watch_files_capture(
         files_seen: events.len(),
         events,
         candidates,
-        message: "File changes captured into raw events.".to_owned(),
+        message: if captured_any {
+            "File changes captured into raw events.".to_owned()
+        } else {
+            "No new file changes captured.".to_owned()
+        },
     })
 }
 
@@ -3712,7 +3721,7 @@ fn capture_git_summary(
         redaction_profile: Some("default".to_owned()),
     })?;
     let capture_id = capture.capture.id;
-    let event = ingest_capture_event(IngestCaptureEventOptions {
+    let event_report = ingest_capture_event(IngestCaptureEventOptions {
         project_name: options.project_name.clone(),
         start_dir: options.start_dir.clone(),
         grafiki_home: None,
@@ -3739,8 +3748,9 @@ fn capture_git_summary(
         privacy_level: Some("internal".to_owned()),
         redacted: false,
         captured_at: None,
-    })?
-    .event;
+    })?;
+    let deduplicated = event_report.deduplicated;
+    let event = event_report.event;
     stop_capture_session(StopCaptureOptions {
         project_name: options.project_name.clone(),
         start_dir: options.start_dir.clone(),
@@ -3792,7 +3802,11 @@ fn capture_git_summary(
             .to_owned(),
         event: Some(event),
         candidates,
-        message: "Git working-tree snapshot captured into raw events.".to_owned(),
+        message: if deduplicated {
+            "Git working tree unchanged since the last snapshot; nothing new captured.".to_owned()
+        } else {
+            "Git working-tree snapshot captured into raw events.".to_owned()
+        },
     })
 }
 
