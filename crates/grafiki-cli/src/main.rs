@@ -5642,8 +5642,10 @@ fn daemon_start(
     if allow_non_local {
         command.arg("--allow-non-local");
     }
+    // Pass the token via env, not argv, so it never appears in the process table.
+    // `serve` reads it through `#[arg(long, env = "GRAFIKI_HTTP_TOKEN")]`.
     if let Some(token) = &token {
-        command.arg("--token").arg(token);
+        command.env("GRAFIKI_HTTP_TOKEN", token);
     }
     let child = command.spawn()?;
     let pid = child.id();

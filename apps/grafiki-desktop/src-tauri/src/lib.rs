@@ -1,9 +1,13 @@
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
+    sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use tauri::State;
 
 use grafiki_core::{
     add_context, approve_candidate, bulk_review_candidates, delete_context, delete_decision,
@@ -241,6 +245,8 @@ struct DaemonStatusResponse {
     log_path: String,
     cli_path: Option<String>,
     cli_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
     message: String,
 }
 
@@ -256,6 +262,8 @@ struct DaemonStartResponse {
     pid_path: String,
     log_path: String,
     cli_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
     message: String,
 }
 
@@ -1768,6 +1776,7 @@ fn process_project_embeddings(
 #[tauri::command]
 fn get_daemon_status(
     request: Option<DaemonControlRequest>,
+    tokens: State<DaemonTokens>,
 ) -> Result<DaemonStatusResponse, String> {
     let request = request.unwrap_or(DaemonControlRequest {
         start_dir: None,
@@ -1789,6 +1798,7 @@ fn get_daemon_status(
             log_path: String::new(),
             cli_path: None,
             cli_available: false,
+            token: None,
             message: "Grafiki CLI was not found. Rebuild the desktop debug app to refresh daemon support.".to_owned(),
         });
     };
@@ -1806,6 +1816,14 @@ fn get_daemon_status(
     )?;
     let status: CliDaemonStatus =
         serde_json::from_str(&output).map_err(|error| error.to_string())?;
+    // Report the token only if this desktop session started the daemon (we never
+    // persist it). A daemon started elsewhere / in a prior session shows none.
+    let token = if status.running {
+        let key = display_path(&start_dir);
+        tokens.0.lock().ok().and_then(|map| map.get(&key).cloned())
+    } else {
+        None
+    };
     Ok(DaemonStatusResponse {
         project: status.project.clone(),
         running: status.running,
@@ -1817,6 +1835,7 @@ fn get_daemon_status(
         log_path: display_path(&status.log_path),
         cli_path: Some(display_path(&cli_path)),
         cli_available: true,
+        token,
         message: if status.running {
             "Daemon is running.".to_owned()
         } else {
@@ -1826,7 +1845,10 @@ fn get_daemon_status(
 }
 
 #[tauri::command]
-fn start_daemon(request: DaemonControlRequest) -> Result<DaemonStartResponse, String> {
+fn start_daemon(
+    request: DaemonControlRequest,
+    tokens: State<DaemonTokens>,
+) -> Result<DaemonStartResponse, String> {
     let start_dir = resolve_start_dir(request.start_dir);
     let cli_path = find_grafiki_cli().ok_or_else(|| {
         "Grafiki CLI was not found. Rebuild the desktop debug app first.".to_owned()
@@ -1838,7 +1860,7 @@ fn start_daemon(request: DaemonControlRequest) -> Result<DaemonStartResponse, St
     let port = request.port.unwrap_or(9700);
     let port_text = port.to_string();
     let start_dir_text = display_path(&start_dir);
-    let mut args = vec![
+    let args = vec![
         "daemon",
         "start",
         "--path",
@@ -1850,15 +1872,26 @@ fn start_daemon(request: DaemonControlRequest) -> Result<DaemonStartResponse, St
         "--format",
         "json",
     ];
-    let token = clean_optional(request.token);
-    if let Some(token) = token.as_deref() {
-        args.push("--token");
-        args.push(token);
-    }
+    // Use a caller-supplied token verbatim, otherwise mint a strong one so the
+    // local API is never unauthenticated by default. Passed via env (not argv) so
+    // it does not leak into the process table.
+    let token = clean_optional(request.token).unwrap_or_else(generate_daemon_token);
 
-    let output = run_grafiki_cli_json(&cli_path, &args)?;
+    let output = run_grafiki_cli_json_env(&cli_path, &args, &[("GRAFIKI_HTTP_TOKEN", &token)])?;
     let report: CliDaemonStart =
         serde_json::from_str(&output).map_err(|error| error.to_string())?;
+
+    let key = display_path(&start_dir);
+    let effective_token = if report.already_running {
+        // The running daemon keeps its original token; only report what we know.
+        tokens.0.lock().ok().and_then(|map| map.get(&key).cloned())
+    } else {
+        if let Ok(mut map) = tokens.0.lock() {
+            map.insert(key, token.clone());
+        }
+        Some(token)
+    };
+
     Ok(DaemonStartResponse {
         project: report.project,
         running: report.running,
@@ -1870,6 +1903,7 @@ fn start_daemon(request: DaemonControlRequest) -> Result<DaemonStartResponse, St
         pid_path: display_path(&report.pid_path),
         log_path: display_path(&report.log_path),
         cli_path: display_path(&cli_path),
+        token: effective_token,
         message: if report.already_running {
             "Daemon was already running.".to_owned()
         } else {
@@ -1879,7 +1913,10 @@ fn start_daemon(request: DaemonControlRequest) -> Result<DaemonStartResponse, St
 }
 
 #[tauri::command]
-fn stop_daemon(request: Option<DaemonControlRequest>) -> Result<DaemonStopResponse, String> {
+fn stop_daemon(
+    request: Option<DaemonControlRequest>,
+    tokens: State<DaemonTokens>,
+) -> Result<DaemonStopResponse, String> {
     let request = request.unwrap_or(DaemonControlRequest {
         start_dir: None,
         host: None,
@@ -1887,6 +1924,9 @@ fn stop_daemon(request: Option<DaemonControlRequest>) -> Result<DaemonStopRespon
         token: None,
     });
     let start_dir = resolve_start_dir(request.start_dir);
+    if let Ok(mut map) = tokens.0.lock() {
+        map.remove(&display_path(&start_dir));
+    }
     let cli_path = find_grafiki_cli().ok_or_else(|| {
         "Grafiki CLI was not found. Rebuild the desktop debug app first.".to_owned()
     })?;
@@ -2118,6 +2158,7 @@ pub fn run() {
     install_panic_logger();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(DaemonTokens::default())
         .invoke_handler(tauri::generate_handler![
             get_project_snapshot,
             initialize_project,
@@ -2229,10 +2270,35 @@ fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
+/// Per-session store of the HTTP token the desktop generated for each project's
+/// daemon, keyed by resolved start_dir. Lets the status command report the active
+/// token without persisting the secret to disk.
+#[derive(Default)]
+struct DaemonTokens(Mutex<HashMap<String, String>>);
+
+/// A cryptographically strong 256-bit token (64 lowercase hex chars), backed by
+/// the OS CSPRNG. Used to authenticate external agents hitting the local daemon.
+fn generate_daemon_token() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("OS RNG unavailable");
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn run_grafiki_cli_json(cli_path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = ProcessCommand::new(cli_path)
-        .args(args)
-        .stdin(Stdio::null())
+    run_grafiki_cli_json_env(cli_path, args, &[])
+}
+
+fn run_grafiki_cli_json_env(
+    cli_path: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<String, String> {
+    let mut command = ProcessCommand::new(cli_path);
+    command.args(args).stdin(Stdio::null());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command
         .output()
         .map_err(|error| format!("Failed to run {}: {error}", cli_path.display()))?;
     if !output.status.success() {
@@ -2779,5 +2845,19 @@ fn slug_key(title: &str, prefix: &str) -> String {
         prefix.to_owned()
     } else {
         slug
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_daemon_token;
+
+    #[test]
+    fn daemon_token_is_strong_and_unique() {
+        let a = generate_daemon_token();
+        let b = generate_daemon_token();
+        assert_eq!(a.len(), 64, "256-bit token = 64 hex chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "tokens must not repeat");
     }
 }

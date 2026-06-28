@@ -557,6 +557,7 @@ export interface DaemonStatus {
   log_path: string;
   cli_path?: string | null;
   cli_available: boolean;
+  token?: string | null;
   message: string;
 }
 
@@ -571,6 +572,7 @@ export interface DaemonStartResult {
   pid_path: string;
   log_path: string;
   cli_path: string;
+  token?: string | null;
   message: string;
 }
 

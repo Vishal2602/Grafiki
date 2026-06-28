@@ -3084,6 +3084,8 @@ function SettingsPane(props: {
         port: daemonPort,
         token: daemonToken,
       });
+      // Surface the auto-generated token so the user can give it to external agents.
+      if (result.token) setDaemonToken(result.token);
       setMessage(`${result.message} ${result.url}`);
       await refreshDaemonStatus();
     } catch (daemonError) {
@@ -3337,9 +3339,25 @@ function SettingsPane(props: {
             <input
               value={daemonToken}
               onChange={(event) => setDaemonToken(event.target.value)}
-              placeholder="optional for local daemon"
+              placeholder="auto-generated on Start"
             />
           </label>
+          {daemonToken ? (
+            <p className="daemon-token-hint">
+              External agents authenticate with this token (header{" "}
+              <code>X-Grafiki-Token</code>).{" "}
+              <button
+                className="link-button"
+                type="button"
+                onClick={() => {
+                  void navigator.clipboard?.writeText(daemonToken);
+                  setMessage("Daemon token copied to clipboard.");
+                }}
+              >
+                Copy
+              </button>
+            </p>
+          ) : null}
           <div className="maintenance-actions">
             <button
               className="button secondary"
