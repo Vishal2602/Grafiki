@@ -789,6 +789,8 @@ pub struct CaptureSessionReport {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CaptureEventReport {
     pub event: CaptureEvent,
+    #[serde(default)]
+    pub deduplicated: bool,
     pub message: String,
 }
 
@@ -3698,6 +3700,30 @@ pub fn ingest_capture_event(options: IngestCaptureEventOptions) -> Result<Captur
     } else {
         privacy_level
     };
+    // Per-source-type, scope-wide dedup: re-imported transcript/file/git/ide
+    // snapshots with identical content are not re-inserted, but legitimately
+    // repeated terminal/manual/agent events always are.
+    let content_hash = capture_content_hash(
+        &source_type,
+        options.source.as_deref(),
+        title.as_deref(),
+        text.as_deref(),
+        payload.as_deref(),
+        metadata.as_deref(),
+    );
+    if is_dedup_source_type(&source_type) {
+        if let Some(existing_id) =
+            find_duplicate_capture_event(&connection, scope.as_str(), &source_type, &content_hash)?
+        {
+            let event = load_capture_event(&connection, &existing_id)?;
+            return Ok(CaptureEventReport {
+                event,
+                deduplicated: true,
+                message: "Capture event already ingested; skipped duplicate.".to_owned(),
+            });
+        }
+    }
+
     let captured_at = options
         .captured_at
         .filter(|value| !value.trim().is_empty())
@@ -3705,14 +3731,14 @@ pub fn ingest_capture_event(options: IngestCaptureEventOptions) -> Result<Captur
     let captured_at_sql = if captured_at == "now" {
         "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')".to_owned()
     } else {
-        "?12".to_owned()
+        "?13".to_owned()
     };
     let sql = format!(
         "
         INSERT INTO capture_events
             (id, capture_session, source_type, source, title, text, payload, metadata,
-             privacy_level, redacted, scope, captured_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, {captured_at_sql})
+             privacy_level, redacted, scope, content_hash, captured_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, {captured_at_sql})
         "
     );
 
@@ -3730,7 +3756,8 @@ pub fn ingest_capture_event(options: IngestCaptureEventOptions) -> Result<Captur
                 metadata,
                 privacy_level,
                 if redacted { 1 } else { 0 },
-                scope.as_str()
+                scope.as_str(),
+                content_hash
             ],
         )?;
     } else {
@@ -3748,6 +3775,7 @@ pub fn ingest_capture_event(options: IngestCaptureEventOptions) -> Result<Captur
                 privacy_level,
                 if redacted { 1 } else { 0 },
                 scope.as_str(),
+                content_hash,
                 captured_at
             ],
         )?;
@@ -3756,8 +3784,60 @@ pub fn ingest_capture_event(options: IngestCaptureEventOptions) -> Result<Captur
     let event = load_capture_event(&connection, &id)?;
     Ok(CaptureEventReport {
         event,
+        deduplicated: false,
         message: "Capture event ingested.".to_owned(),
     })
+}
+
+/// Source types whose re-ingest is idempotent (re-imports / re-snapshots should
+/// not duplicate). Terminal/manual/agent/system/etc. are intentionally excluded
+/// because identical content there is a legitimate repeat (e.g. running the same
+/// command twice).
+fn is_dedup_source_type(source_type: &str) -> bool {
+    matches!(source_type, "transcript" | "file" | "git" | "ide")
+}
+
+/// Deterministic content hash for dedup (excludes captured_at). Computed after
+/// redaction so a re-import hashes identically.
+fn capture_content_hash(
+    source_type: &str,
+    source: Option<&str>,
+    title: Option<&str>,
+    text: Option<&str>,
+    payload: Option<&str>,
+    metadata: Option<&str>,
+) -> String {
+    let combined = format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        source_type,
+        source.unwrap_or(""),
+        title.unwrap_or(""),
+        text.unwrap_or(""),
+        payload.unwrap_or(""),
+        metadata.unwrap_or(""),
+    );
+    checksum(&combined)
+}
+
+fn find_duplicate_capture_event(
+    connection: &Connection,
+    scope: &str,
+    source_type: &str,
+    content_hash: &str,
+) -> Result<Option<String>> {
+    connection
+        .query_row(
+            "
+            SELECT id FROM capture_events
+            WHERE scope = ?1 AND source_type = ?2 AND content_hash = ?3
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            ",
+            params![scope, source_type, content_hash],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
 }
 
 pub fn list_capture_events(options: ListCaptureEventsOptions) -> Result<Vec<CaptureEvent>> {

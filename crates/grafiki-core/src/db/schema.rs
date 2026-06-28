@@ -6,7 +6,7 @@ use crate::Result;
 pub const INITIAL_SCHEMA_VERSION: i64 = 1;
 /// The newest schema version this build knows how to produce. Bump this and add
 /// a `Migration` entry whenever the schema changes.
-pub const LATEST_SCHEMA_VERSION: i64 = 1;
+pub const LATEST_SCHEMA_VERSION: i64 = 2;
 
 struct Migration {
     version: i64,
@@ -14,12 +14,27 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    description:
-        "initial core schema with sessions, graph, decisions, state, context, events, and FTS",
-    sql: INITIAL_SCHEMA,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description:
+            "initial core schema with sessions, graph, decisions, state, context, events, and FTS",
+        sql: INITIAL_SCHEMA,
+    },
+    Migration {
+        version: 2,
+        description: "capture_events.content_hash for per-source-type re-ingest dedup",
+        sql: MIGRATION_V2_CAPTURE_DEDUP,
+    },
+];
+
+// SQLite ADD COLUMN cannot be NOT NULL without a constant default, so content_hash
+// is nullable; legacy rows stay NULL and never match the dedup equality check.
+const MIGRATION_V2_CAPTURE_DEDUP: &str = r#"
+ALTER TABLE capture_events ADD COLUMN content_hash TEXT;
+CREATE INDEX IF NOT EXISTS idx_capture_dedup
+    ON capture_events(scope, source_type, content_hash);
+"#;
 
 /// Bring a database up to LATEST_SCHEMA_VERSION by applying every migration step
 /// newer than its current version, each in its own transaction. Runs on every
@@ -524,10 +539,29 @@ mod tests {
         initialize_schema(&mut connection).unwrap();
 
         let version: i64 = connection
-            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
             .unwrap();
 
-        assert_eq!(version, 1);
+        assert_eq!(version, super::LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_v2_adds_capture_content_hash() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&mut connection).unwrap();
+        let has_column: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('capture_events') WHERE name = 'content_hash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            has_column, 1,
+            "v2 migration must add capture_events.content_hash"
+        );
     }
 
     #[test]

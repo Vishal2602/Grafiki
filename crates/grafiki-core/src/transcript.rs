@@ -75,6 +75,7 @@ pub fn import_agent_transcripts(
     let mut files_scanned = 0usize;
     let mut files_imported = 0usize;
     let mut events_imported = 0usize;
+    let mut events_deduplicated = 0usize;
     let mut sources = Vec::new();
 
     for file in files {
@@ -104,7 +105,7 @@ pub fn import_agent_transcripts(
 
         let mut imported_for_file = 0usize;
         for (index, event) in parsed.into_iter().enumerate() {
-            ingest_capture_event(IngestCaptureEventOptions {
+            let report = ingest_capture_event(IngestCaptureEventOptions {
                 project_name: options.project_name.clone(),
                 start_dir: options.start_dir.clone(),
                 grafiki_home: options.grafiki_home.clone(),
@@ -126,6 +127,12 @@ pub fn import_agent_transcripts(
                 redacted: false,
                 captured_at: event.timestamp,
             })?;
+            // A re-import of the same transcript is deduplicated; don't count it
+            // or spend the limit budget on it.
+            if report.deduplicated {
+                events_deduplicated += 1;
+                continue;
+            }
             imported_for_file += 1;
             events_imported += 1;
             remaining = remaining.saturating_sub(1);
@@ -165,7 +172,15 @@ pub fn import_agent_transcripts(
     };
 
     let message = if events_imported == 0 {
-        format!("No {agent} transcript events were imported.")
+        if events_deduplicated > 0 {
+            format!("No new {agent} transcript events ({events_deduplicated} already imported).")
+        } else {
+            format!("No {agent} transcript events were imported.")
+        }
+    } else if events_deduplicated > 0 {
+        format!(
+            "Imported {events_imported} {agent} transcript events into raw capture ({events_deduplicated} duplicates skipped)."
+        )
     } else {
         format!("Imported {events_imported} {agent} transcript events into raw capture.")
     };
@@ -626,7 +641,10 @@ fn truncate_event_text(text: &str) -> String {
 mod tests {
     use std::fs;
 
-    use crate::memory::{list_capture_events, ListCaptureEventsOptions};
+    use crate::memory::{
+        ingest_capture_event, list_capture_events, IngestCaptureEventOptions,
+        ListCaptureEventsOptions,
+    };
     use crate::project::{init_project, InitOptions};
 
     use super::{import_agent_transcripts, ImportAgentTranscriptsOptions};
@@ -717,5 +735,125 @@ mod tests {
 
         assert_eq!(report.events_imported, 2);
         assert!(report.candidates.is_none());
+    }
+
+    #[test]
+    fn reimporting_same_transcript_is_deduplicated() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project_dir = temp.path().join("project");
+        init_project(InitOptions {
+            project_name: Some("project".to_owned()),
+            project_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+        })
+        .unwrap();
+        let transcript = temp.path().join("codex.jsonl");
+        fs::write(
+            &transcript,
+            r#"{"timestamp":"2026-05-31T00:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"Why Postgres?"}}
+{"timestamp":"2026-05-31T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"For transactional integrity."}}
+"#,
+        )
+        .unwrap();
+
+        let make_opts = || ImportAgentTranscriptsOptions {
+            project_name: Some("project".to_owned()),
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            agent: "codex".to_owned(),
+            input: Some(transcript.clone()),
+            scope: "project/core".to_owned(),
+            limit: 20,
+            summarize: false,
+        };
+
+        let first = import_agent_transcripts(make_opts()).unwrap();
+        assert_eq!(first.events_imported, 2);
+
+        // Re-import the identical file (a new capture session each time) -> no dupes.
+        let second = import_agent_transcripts(make_opts()).unwrap();
+        assert_eq!(
+            second.events_imported, 0,
+            "re-import must not duplicate events"
+        );
+
+        let events = list_capture_events(ListCaptureEventsOptions {
+            project_name: Some("project".to_owned()),
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            capture_id: None,
+            source_type: Some("transcript".to_owned()),
+            scope: "project/core".to_owned(),
+            limit: 50,
+        })
+        .unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "scope-wide transcript events must stay at 2 after re-import"
+        );
+    }
+
+    #[test]
+    fn capture_dedup_is_per_source_type() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project_dir = temp.path().join("project");
+        init_project(InitOptions {
+            project_name: Some("project".to_owned()),
+            project_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+        })
+        .unwrap();
+
+        let ingest = |source_type: &str, text: &str| {
+            ingest_capture_event(IngestCaptureEventOptions {
+                project_name: Some("project".to_owned()),
+                start_dir: project_dir.clone(),
+                grafiki_home: Some(home.clone()),
+                capture_id: None,
+                scope: "project/core".to_owned(),
+                source_type: source_type.to_owned(),
+                source: Some("src".to_owned()),
+                title: Some("T".to_owned()),
+                text: Some(text.to_owned()),
+                payload: None,
+                metadata: None,
+                privacy_level: Some("internal".to_owned()),
+                redacted: false,
+                captured_at: None,
+            })
+            .unwrap()
+        };
+
+        // transcript: identical content is deduplicated.
+        assert!(!ingest("transcript", "same body").deduplicated);
+        assert!(
+            ingest("transcript", "same body").deduplicated,
+            "identical transcript event must be deduplicated"
+        );
+        // terminal: identical content is a legitimate repeat, never deduplicated.
+        assert!(!ingest("terminal", "cargo test").deduplicated);
+        assert!(
+            !ingest("terminal", "cargo test").deduplicated,
+            "repeated terminal command must NOT be deduplicated"
+        );
+
+        let count = |source_type: &str| {
+            list_capture_events(ListCaptureEventsOptions {
+                project_name: Some("project".to_owned()),
+                start_dir: project_dir.clone(),
+                grafiki_home: Some(home.clone()),
+                capture_id: None,
+                source_type: Some(source_type.to_owned()),
+                scope: "project/core".to_owned(),
+                limit: 50,
+            })
+            .unwrap()
+            .len()
+        };
+        assert_eq!(count("transcript"), 1);
+        assert_eq!(count("terminal"), 2);
     }
 }
