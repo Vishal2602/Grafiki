@@ -80,14 +80,35 @@ pub struct FastEmbedProvider {
 #[cfg(feature = "fastembed")]
 impl FastEmbedProvider {
     pub fn try_new() -> Result<Self> {
+        // Pin the model cache to a stable per-user directory under GRAFIKI_HOME
+        // instead of fastembed's CWD-relative default, so first run is
+        // deterministic and a pre-warmed cache can be shipped/located reliably.
+        let cache_dir = fastembed_cache_dir()?;
         let options = fastembed::InitOptions::new(fastembed::EmbeddingModel::AllMiniLML6V2)
+            .with_cache_dir(cache_dir.clone())
             .with_show_download_progress(false);
-        let model = fastembed::TextEmbedding::try_new(options)
-            .map_err(|error| GrafikiError::Embedding(error.to_string()))?;
+        let model = fastembed::TextEmbedding::try_new(options).map_err(|error| {
+            GrafikiError::Embedding(format!(
+                "could not load the fastembed MiniLM model from {}: {error}. \
+                 If you are offline, run `grafiki embeddings prefetch` on a networked machine to \
+                 pre-download it, or set GRAFIKI_EMBEDDING_PROVIDER=deterministic for offline use.",
+                cache_dir.display()
+            ))
+        })?;
         Ok(Self {
             model: Mutex::new(model),
         })
     }
+}
+
+/// Stable, per-user cache directory for the fastembed model (under GRAFIKI_HOME).
+#[cfg(feature = "fastembed")]
+fn fastembed_cache_dir() -> Result<std::path::PathBuf> {
+    let dir = crate::project::grafiki_home()?
+        .join("models")
+        .join("fastembed");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 #[cfg(feature = "fastembed")]
@@ -184,6 +205,25 @@ pub fn configured_embedding_provider() -> Result<RuntimeEmbeddingProvider> {
     }
 }
 
+/// Force the fastembed model into the pinned cache so later runs work offline.
+/// Returns the resolved cache directory on success.
+pub fn prefetch_embedding_model() -> Result<String> {
+    #[cfg(feature = "fastembed")]
+    {
+        let cache_dir = fastembed_cache_dir()?;
+        let provider = FastEmbedProvider::try_new()?;
+        // One embed forces the full model download/extract.
+        provider.embed("warm up the embedding model")?;
+        Ok(cache_dir.display().to_string())
+    }
+    #[cfg(not(feature = "fastembed"))]
+    {
+        Err(GrafikiError::Embedding(
+            "embeddings prefetch requires building with the `fastembed` feature".to_owned(),
+        ))
+    }
+}
+
 pub fn configured_embedding_provider_summary() -> EmbeddingProviderSummary {
     let requested =
         env::var("GRAFIKI_EMBEDDING_PROVIDER").unwrap_or_else(|_| "deterministic".to_owned());
@@ -247,7 +287,9 @@ fn auto_embedding_provider_summary() -> EmbeddingProviderSummary {
             "sentence-transformers/all-MiniLM-L6-v2",
             Some(384),
             Some(
-                "auto prefers fastembed and falls back to deterministic if model initialization fails"
+                "auto uses fastembed when its model is available and falls back to deterministic \
+                 otherwise. Run `grafiki embeddings prefetch` to pre-download the model for \
+                 offline use."
                     .to_owned(),
             ),
         );

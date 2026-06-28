@@ -1133,6 +1133,12 @@ enum EmbeddingsCommand {
         #[arg(long, value_enum, default_value_t = OutputFormat::Plain)]
         format: OutputFormat,
     },
+
+    /// Pre-download the semantic-search model into the local cache for offline use.
+    Prefetch {
+        #[arg(long, value_enum, default_value_t = OutputFormat::Plain)]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2319,6 +2325,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     rebuild: true,
                 })?;
                 print_process_embeddings_report(&report, format)?;
+            }
+            EmbeddingsCommand::Prefetch { format } => {
+                let cache_dir = grafiki_core::embeddings::prefetch_embedding_model()?;
+                match format {
+                    OutputFormat::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "ready",
+                            "cache_dir": cache_dir,
+                        })
+                    ),
+                    _ => println!("Embedding model ready. Cache: {cache_dir}"),
+                }
             }
         },
         Command::Serve {

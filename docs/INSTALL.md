@@ -9,6 +9,21 @@ console on top of it.
 > deterministic embedding provider instead — run with `--features fastembed,sqlite-vec`
 > (or set `GRAFIKI_EMBEDDING_PROVIDER=fastembed`) for real embeddings.
 
+### Semantic-search model (offline)
+
+Real semantic search uses the MiniLM model, cached at `~/.grafiki/models/fastembed`
+(or `$GRAFIKI_HOME/models/fastembed`). It downloads automatically on first use. For
+airgapped/offline machines, pre-download it while online:
+
+```bash
+grafiki embeddings prefetch
+```
+
+If the model can't be loaded offline, Grafiki falls back to the deterministic
+provider and `grafiki embeddings status` explains how to pre-download it. The
+deterministic provider (`GRAFIKI_EMBEDDING_PROVIDER=deterministic`) needs no model
+and works fully offline.
+
 ## CLI
 
 ### Homebrew (recommended)
