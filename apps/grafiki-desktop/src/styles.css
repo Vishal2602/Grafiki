@@ -5,6 +5,35 @@
   word-break: break-all;
 }
 
+.prompt-modal {
+  width: min(520px, 92vw);
+}
+
+.prompt-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 6px 0 14px;
+}
+
+.prompt-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.prompt-fields textarea {
+  min-height: 84px;
+  resize: vertical;
+}
+
+.prompt-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .link-button {
   background: none;
   border: none;

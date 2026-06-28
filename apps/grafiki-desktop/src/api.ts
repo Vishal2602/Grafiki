@@ -1,4 +1,4 @@
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open, save, confirm as tauriConfirm } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentTranscriptImportInput,
@@ -52,6 +52,23 @@ const hasTauri = () => "__TAURI_INTERNALS__" in window;
 /// API returns mock data and mutations are not persisted. The UI surfaces this
 /// so demos/QA cannot mistake preview behavior for a working backend.
 export const isPreviewMode = () => !hasTauri();
+
+/// A reliable yes/no confirmation. Uses the Tauri dialog plugin inside the app
+/// (window.confirm can be suppressed by the webview) and falls back to
+/// window.confirm in browser preview. Returns true when the user confirms.
+export async function confirmDialog(
+  message: string,
+  opts?: { title?: string; kind?: "info" | "warning" | "error"; okLabel?: string },
+): Promise<boolean> {
+  if (!hasTauri()) {
+    return window.confirm(message);
+  }
+  return tauriConfirm(message, {
+    title: opts?.title ?? "Grafiki",
+    kind: opts?.kind ?? "warning",
+    okLabel: opts?.okLabel,
+  });
+}
 
 export async function getProjectSnapshot(input: { startDir?: string; scope?: string } = {}): Promise<ProjectSnapshot> {
   if (!hasTauri()) return mockSnapshot;

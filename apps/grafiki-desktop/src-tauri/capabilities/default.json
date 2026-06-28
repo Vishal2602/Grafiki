@@ -3,5 +3,10 @@
   "identifier": "main-capability",
   "description": "Default permissions for the main Grafiki desktop window.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-save"]
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-message"
+  ]
 }

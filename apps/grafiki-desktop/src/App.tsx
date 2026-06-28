@@ -77,6 +77,7 @@ import {
   stopAutomaticCapture,
   summarizeAutomaticCapture,
   isPreviewMode,
+  confirmDialog,
 } from "./api";
 import {
   decodeLayoutFromHash,
@@ -1398,7 +1399,7 @@ function SessionsPane(props: {
 
   async function endSelected(session: SessionLogItem) {
     if (busy) return;
-    if (!window.confirm(`End session "${session.goal || session.id}" as completed?`)) return;
+    if (!(await confirmDialog(`End session "${session.goal || session.id}" as completed?`, { okLabel: "End" }))) return;
     setBusy(true);
     setMessage(null);
     setError(null);
@@ -1431,7 +1432,7 @@ function SessionsPane(props: {
 
   async function handoffSelected(session: SessionLogItem) {
     if (busy) return;
-    if (!window.confirm(`Create a handoff from "${session.goal || session.id}"?`)) return;
+    if (!(await confirmDialog(`Create a handoff from "${session.goal || session.id}"?`, { kind: "info", okLabel: "Create" }))) return;
     setBusy(true);
     setMessage(null);
     setError(null);
@@ -1694,7 +1695,7 @@ function DecisionsPane(props: {
   }, [props.startDir, props.snapshot]);
 
   async function remove(decision: DecisionItem) {
-    if (!window.confirm(`Delete decision "${decision.title}"?`)) return;
+    if (!(await confirmDialog(`Delete decision "${decision.title}"?`, { okLabel: "Delete" }))) return;
     setMessage(null);
     setError(null);
     try {
@@ -1776,6 +1777,7 @@ function CandidatesPane(props: {
   const [minConfidence, setMinConfidence] = useState("0");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editPayload, setEditPayload] = useState("");
+  const [promptModal, setPromptModal] = useState<PromptConfig | null>(null);
   const [editScope, setEditScope] = useState("");
   const [editConfidence, setEditConfidence] = useState("0.5");
   const [editRationale, setEditRationale] = useState("");
@@ -1893,9 +1895,27 @@ function CandidatesPane(props: {
     }
   }
 
-  async function reject(candidate: ExtractionCandidate) {
-    const rationale = window.prompt("Reject rationale", candidate.rationale ?? "");
-    if (rationale === null) return;
+  function reject(candidate: ExtractionCandidate) {
+    setPromptModal({
+      title: "Reject candidate",
+      submitLabel: "Reject",
+      fields: [
+        {
+          name: "rationale",
+          label: "Reject rationale",
+          type: "textarea",
+          defaultValue: candidate.rationale ?? "",
+          placeholder: "Why is this being rejected?",
+        },
+      ],
+      onSubmit: (values) => {
+        setPromptModal(null);
+        void performReject(candidate, values.rationale ?? "");
+      },
+    });
+  }
+
+  async function performReject(candidate: ExtractionCandidate, rationale: string) {
     setBusyId(candidate.id);
     setMessage(null);
     setError(null);
@@ -1982,17 +2002,34 @@ function CandidatesPane(props: {
     }
   }
 
-  async function bulkReview(action: "approve" | "reject", ids = selectedIds) {
+  function bulkReview(action: "approve" | "reject", ids = selectedIds) {
     if (!ids.length) {
       setMessage("Select at least one pending candidate.");
       return;
     }
-    const rationale =
-      action === "reject"
-        ? window.prompt("Reject rationale", "Bulk review cleanup") ?? null
-        : "";
-    if (rationale === null) return;
+    if (action === "reject") {
+      setPromptModal({
+        title: `Reject ${ids.length} candidate${ids.length === 1 ? "" : "s"}`,
+        submitLabel: "Reject",
+        fields: [
+          {
+            name: "rationale",
+            label: "Reject rationale",
+            type: "textarea",
+            defaultValue: "Bulk review cleanup",
+          },
+        ],
+        onSubmit: (values) => {
+          setPromptModal(null);
+          void performBulk(action, ids, values.rationale ?? "");
+        },
+      });
+      return;
+    }
+    void performBulk(action, ids, "");
+  }
 
+  async function performBulk(action: "approve" | "reject", ids: string[], rationale: string) {
     setBusyId("bulk");
     setMessage(null);
     setError(null);
@@ -2127,15 +2164,46 @@ function CandidatesPane(props: {
     }
   }
 
-  async function importTranscript() {
-    const agentInput = window.prompt("Agent transcript", "codex")?.trim().toLowerCase();
-    if (!agentInput) return;
-    if (!["codex", "claude-code", "cursor", "generic"].includes(agentInput)) {
-      setError("Agent must be codex, claude-code, cursor, or generic.");
-      return;
-    }
-    const inputPath = window.prompt("Transcript file or folder", "") ?? "";
+  function importTranscript() {
+    setPromptModal({
+      title: "Import transcript",
+      submitLabel: "Import",
+      fields: [
+        {
+          name: "agent",
+          label: "Agent",
+          type: "select",
+          defaultValue: "codex",
+          options: [
+            { value: "codex", label: "Codex" },
+            { value: "claude-code", label: "Claude Code" },
+            { value: "cursor", label: "Cursor" },
+            { value: "generic", label: "Generic" },
+          ],
+        },
+        {
+          name: "path",
+          label: "Transcript file or folder (blank = default location)",
+          type: "text",
+          placeholder: "/path/to/transcript or leave blank",
+        },
+      ],
+      onSubmit: (values) => {
+        setPromptModal(null);
+        const agent = (values.agent ?? "").trim().toLowerCase();
+        if (!["codex", "claude-code", "cursor", "generic"].includes(agent)) {
+          setError("Agent must be codex, claude-code, cursor, or generic.");
+          return;
+        }
+        void performImport(agent as AgentTranscriptImportInput["agent"], (values.path ?? "").trim());
+      },
+    });
+  }
 
+  async function performImport(
+    agent: AgentTranscriptImportInput["agent"],
+    inputPath: string,
+  ) {
     setCapturing(true);
     setMessage(null);
     setError(null);
@@ -2143,8 +2211,8 @@ function CandidatesPane(props: {
       const result = await importAgentTranscripts({
         startDir: props.startDir,
         scope,
-        agent: agentInput as AgentTranscriptImportInput["agent"],
-        input: inputPath.trim(),
+        agent,
+        input: inputPath,
         limit: 200,
         summarize: true,
       });
@@ -2182,6 +2250,15 @@ function CandidatesPane(props: {
 
   return (
     <div className="view-stack">
+      <AnimatePresence>
+        {promptModal ? (
+          <PromptModal
+            config={promptModal}
+            reduceMotion={props.reduceMotion}
+            onClose={() => setPromptModal(null)}
+          />
+        ) : null}
+      </AnimatePresence>
       <MemoryListHeader
         title="Memory Review"
         icon={ShieldQuestion}
@@ -2530,7 +2607,7 @@ function RelationsPane(props: {
   }, [props.startDir, props.snapshot, filter]);
 
   async function remove(relation: GraphRelation) {
-    if (!window.confirm(`Remove relation "${relation.from_entity} ${relation.relation} ${relation.to_entity}"?`)) return;
+    if (!(await confirmDialog(`Remove relation "${relation.from_entity} ${relation.relation} ${relation.to_entity}"?`, { okLabel: "Remove" }))) return;
     setMessage(null);
     setError(null);
     try {
@@ -2640,7 +2717,7 @@ function StatePane(props: {
   }, [props.startDir, props.snapshot]);
 
   async function remove(item: StateItem) {
-    if (!window.confirm(`Delete state item "${item.title}"?`)) return;
+    if (!(await confirmDialog(`Delete state item "${item.title}"?`, { okLabel: "Delete" }))) return;
     setMessage(null);
     setError(null);
     try {
@@ -2818,7 +2895,7 @@ function ContextPane(props: {
   }, [props.startDir, props.snapshot]);
 
   async function remove(document: ContextSummary) {
-    if (!window.confirm(`Delete context "${document.title}"?`)) return;
+    if (!(await confirmDialog(`Delete context "${document.title}"?`, { okLabel: "Delete" }))) return;
     setMessage(null);
     setError(null);
     try {
@@ -3571,7 +3648,7 @@ function DetailPane(props: {
 
   async function removeRecord() {
     if (!detail || busy) return;
-    if (!window.confirm(`Delete ${recordType} "${title}"?`)) return;
+    if (!(await confirmDialog(`Delete ${recordType} "${title}"?`, { okLabel: "Delete" }))) return;
     setBusy(true);
     setMessage(null);
     setActionError(null);
@@ -4332,6 +4409,114 @@ function Launcher(props: {
             );
           })}
         </div>
+      </motion.section>
+    </motion.div>
+  );
+}
+
+type PromptField = {
+  name: string;
+  label: string;
+  type: "text" | "textarea" | "select";
+  options?: { value: string; label: string }[];
+  defaultValue?: string;
+  placeholder?: string;
+};
+
+type PromptConfig = {
+  title: string;
+  fields: PromptField[];
+  submitLabel?: string;
+  onSubmit: (values: Record<string, string>) => void;
+};
+
+// In-app replacement for window.prompt (which the Tauri webview can suppress).
+// Collects one or more text/textarea/select values; Cancel/Escape/backdrop close
+// without submitting.
+function PromptModal(props: { config: PromptConfig; reduceMotion: boolean; onClose: () => void }) {
+  const { config } = props;
+  const [values, setValues] = useState<Record<string, string>>(() =>
+    Object.fromEntries(config.fields.map((field) => [field.name, field.defaultValue ?? ""])),
+  );
+  const setField = (name: string, value: string) =>
+    setValues((current) => ({ ...current, [name]: value }));
+  const submit = () => config.onSubmit(values);
+
+  return (
+    <motion.div
+      className="overlay"
+      role="presentation"
+      onMouseDown={props.onClose}
+      initial={props.reduceMotion ? false : { opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={props.reduceMotion ? undefined : { opacity: 0 }}
+      transition={transition.quick}
+    >
+      <motion.section
+        className="launcher prompt-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={config.title}
+        onMouseDown={(event) => event.stopPropagation()}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") props.onClose();
+        }}
+        initial={props.reduceMotion ? false : { opacity: 0, y: 12, scale: 0.985 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        exit={props.reduceMotion ? undefined : { opacity: 0, y: 8, scale: 0.985 }}
+        transition={transition.modal}
+      >
+        <header>
+          <strong>{config.title}</strong>
+          <motion.button onClick={props.onClose} {...pressMotion(props.reduceMotion)}>
+            <X size={16} />
+          </motion.button>
+        </header>
+        <div className="prompt-fields">
+          {config.fields.map((field, index) => (
+            <label key={field.name}>
+              <span>{field.label}</span>
+              {field.type === "textarea" ? (
+                <textarea
+                  autoFocus={index === 0}
+                  value={values[field.name]}
+                  placeholder={field.placeholder}
+                  onChange={(event) => setField(field.name, event.target.value)}
+                />
+              ) : field.type === "select" ? (
+                <select
+                  autoFocus={index === 0}
+                  value={values[field.name]}
+                  onChange={(event) => setField(field.name, event.target.value)}
+                >
+                  {field.options?.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  autoFocus={index === 0}
+                  value={values[field.name]}
+                  placeholder={field.placeholder}
+                  onChange={(event) => setField(field.name, event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") submit();
+                  }}
+                />
+              )}
+            </label>
+          ))}
+        </div>
+        <footer className="prompt-actions">
+          <button className="button secondary" onClick={props.onClose}>
+            Cancel
+          </button>
+          <button className="button primary" onClick={submit}>
+            {config.submitLabel ?? "Submit"}
+          </button>
+        </footer>
       </motion.section>
     </motion.div>
   );
