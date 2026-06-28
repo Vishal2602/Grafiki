@@ -4,29 +4,31 @@ Tracks the remaining work after the 9 production-hardening milestones (M1–M5, 
 Distribution) landed on branch `production-hardening`. Current state: builds, 56
 tests pass, fmt + clippy `-D warnings` clean, smoke green, frontend + desktop build.
 
+> **Status (Section A complete):** A1–A5 done, adversarially reviewed, and committed on `production-hardening` (C11 token-hygiene also landed with A4). Each verified: tests + fmt + clippy -D warnings + smoke + frontend/desktop build.
+
 Effort key: **S** ≈ <½ day · **M** ≈ ½–2 days · **L** ≈ multi-day.
 
 ---
 
 ## A. Blocks "fully works" (functional gaps a real user hits)
 
-- [ ] **A1 — Replace `window.prompt`/`confirm` in the desktop UI.** Tauri's webview can
+- [x] **A1 — Replace `window.prompt`/`confirm` in the desktop UI.** Tauri's webview can
   suppress them, so reject / delete / import-with-rationale silently no-op. Use the
   Tauri dialog plugin or in-app modals. `apps/grafiki-desktop/src/App.tsx` (reject ~L1871,
   and other prompt/confirm sites). **M**
-- [ ] **A2 — Capture-event dedup on re-ingest.** Re-running `capture import-transcripts`
+- [x] **A2 — Capture-event dedup on re-ingest.** Re-running `capture import-transcripts`
   / re-ingest duplicates everything. Add a `content_hash` column (migration **v2** — runner
   exists in `db/schema.rs`) + `INSERT OR IGNORE`; dedup transcripts/file snapshots by content,
   but still allow legitimately-repeated terminal commands (per-source-type policy). `memory.rs`
   `ingest_capture_event`. **M**
-- [ ] **A3 — Offline-first embedding model.** Release builds ship `fastembed`, which downloads
+- [x] **A3 — Offline-first embedding model.** Release builds ship `fastembed`, which downloads
   MiniLM at runtime on first use → first run offline/airgapped fails. Bundle/vendor the ONNX
   model, or show a clear "downloading model…" state + offline error. `embeddings.rs` + release
   workflow. **M**
-- [ ] **A4 — Desktop daemon auth token.** The app launches the local daemon with an empty token
+- [x] **A4 — Desktop daemon auth token.** The app launches the local daemon with an empty token
   (unauthenticated). Generate a random token on launch and thread it through. `lib.rs` (~L1854),
   `api.ts` (~L1070). **S**
-- [ ] **A5 — Finish desktop delete/update coverage.** Some record types still return "not
+- [x] **A5 — Finish desktop delete/update coverage.** Some record types still return "not
   available in the desktop alpha". Wire every type the CLI/MCP can edit/delete to the UI.
   `lib.rs` delete/update commands. **S–M** (verify against current code)
 
@@ -47,7 +49,7 @@ Effort key: **S** ≈ <½ day · **M** ≈ ½–2 days · **L** ≈ multi-day.
 
 ## C. Hardening leftovers (P1, not user-visible)
 
-- [ ] **C11 — HTTP token hygiene.** Daemon passes `--token` via argv (visible in `ps`) and accepts
+- [x] **C11 — HTTP token hygiene.** Daemon passes `--token` via argv (visible in `ps`) and accepts
   `?token=`; move to env/stdin and drop the query param. `main.rs`. **S**
 - [ ] **C12 — Embedding housekeeping.** Delete orphan `vec0` rows on record delete; prune stale
   vectors on provider/dimension switch; reuse the ONNX provider in the daemon worker instead of
