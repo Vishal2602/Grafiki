@@ -1526,9 +1526,10 @@ fn delete_memory_record(request: DeleteRecordRequest) -> Result<DeleteRecordResp
                 message: "Relation removed.".to_owned(),
             })
         }
-        _ => Err(format!(
-            "Deleting {record_type} records is not available in the desktop alpha yet."
-        )),
+        // Sessions are intentionally non-deletable (matches the CLI/MCP contract);
+        // the UI hides the Delete affordance for sessions, so this is a backstop.
+        "session" => Err("Session records can be updated but not deleted.".to_owned()),
+        other => Err(format!("Unsupported memory record type: {other}")),
     }
 }
 
@@ -1696,9 +1697,7 @@ fn update_memory_record(request: UpdateRecordRequest) -> Result<UpdateRecordResp
                 message: "Session updated.".to_owned(),
             })
         }
-        _ => Err(format!(
-            "Editing {record_type} records is not available in the desktop alpha yet."
-        )),
+        other => Err(format!("Unsupported memory record type: {other}")),
     }
 }
 
