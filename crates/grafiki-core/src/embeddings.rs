@@ -114,6 +114,33 @@ fn fastembed_cache_dir() -> Result<std::path::PathBuf> {
     Ok(dir)
 }
 
+/// H4: rerank `documents` against `query` with a local cross-encoder
+/// (BAAI/bge-reranker-base via fastembed). Returns `(original_index, score)` for
+/// every document. Requires the `fastembed` feature and the reranker model
+/// (downloaded to the pinned cache on first use). A cross-encoder scores the
+/// (query, doc) pair jointly, so it can reorder a fused candidate list more
+/// precisely than the bag-of-signals RRF that produced it.
+#[cfg(feature = "fastembed")]
+pub fn rerank_documents(query: &str, documents: &[String]) -> Result<Vec<(usize, f32)>> {
+    use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
+    if documents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cache_dir = fastembed_cache_dir()?;
+    let mut model = TextRerank::try_new(
+        RerankInitOptions::new(RerankerModel::BGERerankerBase)
+            .with_cache_dir(cache_dir)
+            .with_show_download_progress(false),
+    )
+    .map_err(|error| GrafikiError::Embedding(format!("reranker init failed: {error}")))?;
+    // `rerank` requires query and documents to share an element type; pass &[&str].
+    let refs: Vec<&str> = documents.iter().map(|s| s.as_str()).collect();
+    let results = model
+        .rerank(query, &refs, false, None)
+        .map_err(|error| GrafikiError::Embedding(format!("rerank failed: {error}")))?;
+    Ok(results.into_iter().map(|r| (r.index, r.score)).collect())
+}
+
 #[cfg(feature = "fastembed")]
 impl EmbeddingProvider for FastEmbedProvider {
     fn provider_name(&self) -> &'static str {

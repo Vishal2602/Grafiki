@@ -283,6 +283,9 @@ pub enum SearchMode {
     /// graph, seeded from the lexical/dense hits, fused into the RRF. Helps
     /// multi-hop / relational queries (H3).
     Graph,
+    /// Hybrid fusion, then a local cross-encoder reranker (bge-reranker) over the
+    /// top-N candidates for a more precise final ordering (H4). Requires the model.
+    Rerank,
 }
 
 impl SearchMode {
@@ -292,6 +295,7 @@ impl SearchMode {
             "semantic" => Ok(Self::Semantic),
             "hybrid" => Ok(Self::Hybrid),
             "graph" => Ok(Self::Graph),
+            "rerank" => Ok(Self::Rerank),
             _ => Err(GrafikiError::InvalidSearchMode(raw.to_owned())),
         }
     }
@@ -2219,7 +2223,10 @@ pub fn search_memory(options: SearchMemoryOptions) -> Result<SearchReport> {
     )?;
     let limit = options.limit.clamp(1, 100);
     let record_type = options.record_type.as_str();
-    let candidate_limit = if matches!(options.mode, SearchMode::Hybrid | SearchMode::Graph) {
+    let candidate_limit = if matches!(
+        options.mode,
+        SearchMode::Hybrid | SearchMode::Graph | SearchMode::Rerank
+    ) {
         limit.saturating_mul(3).max(limit).min(100)
     } else {
         limit
@@ -2330,6 +2337,30 @@ pub fn search_memory(options: SearchMemoryOptions) -> Result<SearchReport> {
                 ),
                 fallback,
             )
+        }
+        // Rerank: fuse keyword + semantic, then a cross-encoder reorders the wide
+        // candidate pool down to `limit`. The reranker needs the model; without it
+        // (or on error) the fused order is returned with a surfaced note.
+        SearchMode::Rerank => {
+            let fused = hybrid_search_results(
+                &options.query,
+                keyword_results,
+                semantic_results,
+                Vec::new(),
+                candidate_limit,
+            );
+            let (reranked, rerank_note) = rerank_results(&options.query, fused, limit);
+            let fallback = rerank_note.or_else(|| {
+                if semantic_available {
+                    None
+                } else {
+                    Some(
+                        "Rerank used keyword candidates only (no semantic vectors yet)."
+                            .to_owned(),
+                    )
+                }
+            });
+            (reranked, fallback)
         }
     };
 
@@ -2599,6 +2630,7 @@ fn search_mode_label(mode: SearchMode) -> &'static str {
         SearchMode::Semantic => "semantic",
         SearchMode::Hybrid => "hybrid",
         SearchMode::Graph => "graph",
+        SearchMode::Rerank => "rerank",
     }
 }
 
@@ -7363,6 +7395,62 @@ fn graph_search_results(
         }
     }
     Ok(out)
+}
+
+/// H4: reorder a fused candidate list with the local cross-encoder reranker (when
+/// the model is available), truncating to `limit`. Returns the (possibly
+/// reordered) results plus an optional fallback note when reranking did not run.
+fn rerank_results(
+    query: &str,
+    candidates: Vec<SearchResult>,
+    limit: usize,
+) -> (Vec<SearchResult>, Option<String>) {
+    #[cfg(feature = "fastembed")]
+    {
+        if candidates.is_empty() {
+            return (candidates, None);
+        }
+        let docs: Vec<String> = candidates
+            .iter()
+            .map(|r| format!("{} {}", r.title, r.snippet))
+            .collect();
+        match crate::embeddings::rerank_documents(query, &docs) {
+            Ok(scored) => {
+                let mut out = Vec::with_capacity(scored.len().min(limit));
+                for (index, score) in scored.into_iter().take(limit) {
+                    if let Some(result) = candidates.get(index) {
+                        let mut result = result.clone();
+                        result.score = Some(round_search_score(score as f64));
+                        out.push(result);
+                    }
+                }
+                (out, None)
+            }
+            Err(error) => {
+                let mut fused = candidates;
+                fused.truncate(limit);
+                (
+                    fused,
+                    Some(format!(
+                        "Reranking unavailable ({error}); returned fused results."
+                    )),
+                )
+            }
+        }
+    }
+    #[cfg(not(feature = "fastembed"))]
+    {
+        let _ = query;
+        let mut fused = candidates;
+        fused.truncate(limit);
+        (
+            fused,
+            Some(
+                "Reranking requires building with the `fastembed` feature; returned fused results."
+                    .to_owned(),
+            ),
+        )
+    }
 }
 
 fn hybrid_search_results(
