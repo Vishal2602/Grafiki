@@ -1,0 +1,18 @@
+{"doc_id":"ent-auth","record_type":"entity","payload":{"name":"Auth Service","entity_type":"service","category":"architecture"}}
+{"doc_id":"ent-db","record_type":"entity","payload":{"name":"Postgres Database","entity_type":"service","category":"architecture"}}
+{"doc_id":"ent-redis","record_type":"entity","payload":{"name":"Redis Cache","entity_type":"service","category":"architecture"}}
+{"doc_id":"ent-fastembed","record_type":"entity","payload":{"name":"fastembed Embeddings","entity_type":"library","category":"dependency"}}
+{"doc_id":"ent-mcp","record_type":"entity","payload":{"name":"MCP Server","entity_type":"tool","category":"architecture"}}
+{"doc_id":"obs-jwt","record_type":"observation","payload":{"name":"Auth Service","entity_type":"service","category":"architecture","text":"JWT refresh tokens rotate every 15 minutes and are stored hashed, never in plaintext"}}
+{"doc_id":"obs-rrf","record_type":"observation","payload":{"name":"Search Ranking","entity_type":"concept","category":"pattern","text":"Hybrid search fuses FTS5 lexical hits and dense vector matches using reciprocal rank fusion"}}
+{"doc_id":"obs-sqlite","record_type":"observation","payload":{"name":"Storage Engine","entity_type":"concept","category":"architecture","text":"The knowledge graph is persisted in a single SQLite database with bitemporal valid_from and valid_to columns for soft deletes and full history"}}
+{"doc_id":"obs-redact","record_type":"observation","payload":{"name":"Redaction","entity_type":"concept","category":"gotcha","text":"Captured text is scrubbed for API keys and private keys before any candidate is stored"}}
+{"doc_id":"obs-embed","record_type":"observation","payload":{"name":"Embeddings","entity_type":"concept","category":"dependency","text":"Dense vectors use the all-MiniLM-L6-v2 model producing 384 dimensional embeddings"}}
+{"doc_id":"obs-mcp","record_type":"observation","payload":{"name":"MCP Server","entity_type":"tool","category":"architecture","text":"The MCP server exposes grafiki tools over stdio for coding agents like Claude"}}
+{"doc_id":"dec-sqlite","record_type":"decision","payload":{"title":"Use SQLite as the single local store","reasoning":"Local-first, zero-config, and supports bitemporal soft deletes without running a server"}}
+{"doc_id":"dec-rrf","record_type":"decision","payload":{"title":"Adopt reciprocal rank fusion for hybrid retrieval","reasoning":"Combines lexical and semantic rankings without fragile score normalization"}}
+{"doc_id":"dec-candidate","record_type":"decision","payload":{"title":"Gate all writes behind a candidate review queue","reasoning":"Keep extracted memory untrusted until a human approves it"}}
+{"doc_id":"dec-tauri","record_type":"decision","payload":{"title":"Build the desktop app with Tauri v2 and React","reasoning":"Native webview, small binaries, and reuse of the Rust backend"}}
+{"doc_id":"ctx-onboarding","record_type":"context","payload":{"title":"Onboarding guide","category":"onboarding","content":"New contributors run cargo build then scripts/smoke.sh to verify the CLI, HTTP daemon and MCP server"}}
+{"doc_id":"ctx-arch","record_type":"context","payload":{"title":"Architecture overview","category":"architecture","content":"Grafiki is a Rust workspace with a grafiki-core library, a grafiki-cli binary and a Tauri desktop app sharing one SQLite knowledge graph"}}
+{"doc_id":"ctx-security","record_type":"context","payload":{"title":"Security model","category":"reference","content":"The HTTP daemon binds to localhost only and requires a bearer token, and secrets are redacted at capture time"}}

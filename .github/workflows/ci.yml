@@ -53,9 +53,11 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
-      # Test the library + CLI (the desktop crate is exercised in the desktop job).
-      - name: Test core + cli
-        run: cargo test -p grafiki-core -p grafiki-cli
+      # Test the library + CLI + eval harness (the desktop crate is exercised in
+      # the desktop job). grafiki-eval's tests include the pytrec_eval metric
+      # oracle and the deterministic keyword-retrieval + redaction regression.
+      - name: Test core + cli + eval
+        run: cargo test -p grafiki-core -p grafiki-cli -p grafiki-eval
       # Cache the ort (ONNX Runtime) binary the `ort` crate downloads at build time.
       - name: Cache ONNX Runtime (ort)
         uses: actions/cache@v4
@@ -79,6 +81,29 @@ jobs:
           done
           echo "::error::embedding-features build failed after 3 attempts"
           exit 1
+
+  eval-gate:
+    name: Eval gate (retrieval + redaction, deterministic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-ubuntu-latest-${{ hashFiles('Cargo.lock') }}
+      # Deterministic, model-free: keyword retrieval + redaction over the bundled
+      # fixtures, gated on the committed baseline. Any secret leak, a precision
+      # drop, or an nDCG@10 regression beyond tolerance fails the build.
+      - name: Retrieval + redaction regression gate
+        run: |
+          cargo run -p grafiki-eval -- run \
+            --arm all --mode keyword \
+            --baseline crates/grafiki-eval/fixtures/baselines/baseline.json \
+            --fail-on-regression --format md
 
   smoke:
     name: Smoke (end-to-end CLI/HTTP/MCP)

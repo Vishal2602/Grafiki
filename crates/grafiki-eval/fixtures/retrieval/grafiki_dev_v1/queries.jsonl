@@ -1,0 +1,12 @@
+{"_id":"q1","text":"how are JWT refresh tokens handled"}
+{"_id":"q2","text":"what database does the project use for storage"}
+{"_id":"q3","text":"how does hybrid search ranking work"}
+{"_id":"q4","text":"how are secrets and API keys protected"}
+{"_id":"q5","text":"which embedding model is used"}
+{"_id":"q6","text":"how do new contributors get started"}
+{"_id":"q7","text":"what is the overall system architecture"}
+{"_id":"q8","text":"why keep extracted memory untrusted before approval"}
+{"_id":"q9","text":"how do coding agents connect to grafiki"}
+{"_id":"q10","text":"how is the desktop app built"}
+{"_id":"q11","text":"is data stored with history and soft deletes"}
+{"_id":"q12","text":"does the local daemon require authentication"}

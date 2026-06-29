@@ -1,0 +1,5 @@
+{
+  "name": "grafiki_dev_v1",
+  "version": "1.0.0",
+  "description": "Hand-authored Grafiki-native retrieval gold set (BEIR triple): a dev team's memory across entity/observation/decision/context records, with graded (0/1/2) judgments. Self-contained and offline; the seeder rebuilds the frozen store from corpus_seed.jsonl each run."
+}

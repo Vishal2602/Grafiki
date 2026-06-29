@@ -1,0 +1,13 @@
+{
+  "redaction": {
+    "max_leaks": 0,
+    "min_precision": 0.8571,
+    "min_recall": 1.0
+  },
+  "retrieval": {
+    "ndcg@10": 0.6948,
+    "primary_mode": "keyword",
+    "recall@10": 0.8333,
+    "tolerance": 0.05
+  }
+}

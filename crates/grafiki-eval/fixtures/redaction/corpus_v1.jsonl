@@ -1,0 +1,32 @@
+# Redaction eval corpus v1 — synthetic, leak-safe (NEVER paste a real key).
+# Format-secrets are stored split across the "assemble" array so no contiguous
+# secret-shaped string ever lands in the repo (keeps GitHub secret-scanning /
+# push-protection quiet); the loader concatenates the fragments at load time
+# into the in-memory text. "template" substitutes the assembled value for {S};
+# "secret_type" marks it as a planted secret (else it is a benign decoy).
+# Two cases (context = false-positive-*) are deliberate over-redaction exposers
+# that quantify known gaps. Lines starting with '#' are ignored.
+{"template":"export ANTHROPIC_API_KEY={S}","assemble":["sk-ant-","api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"],"secret_type":"anthropic","benign":false,"context":"env"}
+{"template":"Use this key {S} for testing","assemble":["sk-","proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"],"secret_type":"openai","benign":false,"context":"transcript"}
+{"template":"Charge created with {S} today","assemble":["sk_live_","ABCDEFGHIJKLMNOP1234567890"],"secret_type":"stripe","benign":false,"context":"terminal"}
+{"template":"Token {S} was committed by mistake","assemble":["ghp_","ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"],"secret_type":"github","benign":false,"context":"git"}
+{"template":"Set CI variable {S} now","assemble":["glpat-","ABCDEFGHIJ1234567890"],"secret_type":"gitlab","benign":false,"context":"ci"}
+{"template":"Webhook bot token {S} here","assemble":["xoxb-","1234567890-ABCDEFGHIJKLMNOP"],"secret_type":"slack","benign":false,"context":"transcript"}
+{"template":"AWS access key {S} rotated last night","assemble":["AKIA","IOSFODNN7EXAMPLE"],"secret_type":"aws","benign":false,"context":"terminal"}
+{"template":"Maps key {S} today","assemble":["AIza","SyA1234567890ABCDEFGHIJKLMNOPQRS"],"secret_type":"google","benign":false,"context":"config"}
+{"template":"Authorization Bearer {S} received","assemble":["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",".","eyJzdWIiOiIxMjM0NTY3ODkwIn0",".","SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"],"secret_type":"jwt","benign":false,"context":"transcript"}
+{"text":"database:\n  password: hunter2supersecretvalue","gold_secrets":[{"literal":"hunter2supersecretvalue","type":"password"}],"benign":false,"context":"config"}
+{"json_payload":{"client_secret":"abcdef1234567890clientsecretvalue","client_id":"public-123"},"gold_secrets":[{"literal":"abcdef1234567890clientsecretvalue","type":"client_secret"}],"benign":false,"context":"json"}
+{"assemble":["-----BEGIN RSA PRIVATE ","KEY-----\n","MIIEowIBAAKCAQEAxQ2bP9notarealkeybodyline\n","AAAABBBBCCCCDDDD\n","-----END RSA PRIVATE ","KEY-----"],"gold_secrets":[{"literal":"MIIEowIBAAKCAQEAxQ2bP9notarealkeybodyline","type":"private_key"}],"benign":false,"context":"file"}
+{"text":"Merged commit 9f1c2ab3d4e5f60718293a4b5c6d7e8f90123456 into main","gold_secrets":[],"benign":true,"context":"git"}
+{"text":"Request id 550e8400-e29b-41d4-a716-446655440000 completed","gold_secrets":[],"benign":true,"context":"log"}
+{"text":"Cache entry dGhpcyBpcyBub3QgYSBzZWNyZXQ stored","gold_secrets":[],"benign":true,"context":"log"}
+{"text":"See src/main.rs and the ~/.grafiki/models directory for details","gold_secrets":[],"benign":true,"context":"transcript"}
+{"text":"The sk-abc flag and sdk config are enabled","gold_secrets":[],"benign":true,"context":"transcript"}
+{"text":"The AKIAshort and makian words appear here","gold_secrets":[],"benign":true,"context":"transcript"}
+{"text":"Build eyJhbGciOiJ.eyJzdWIiOiJ has two parts","gold_secrets":[],"benign":true,"context":"log"}
+{"text":"Digest e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 verified","gold_secrets":[],"benign":true,"context":"log"}
+{"text":"The secret sauce is thorough testing","gold_secrets":[],"benign":true,"context":"transcript"}
+{"text":"AIzaShort12 is just a label","gold_secrets":[],"benign":true,"context":"transcript"}
+{"text":"My secret: I really like clean code","gold_secrets":[],"benign":true,"context":"false-positive-secret-colon"}
+{"template":"Internal label {S} used in a test fixture","assemble":["AKIA","NOTAREALKEY12345"],"benign":true,"context":"false-positive-akia-prefix"}

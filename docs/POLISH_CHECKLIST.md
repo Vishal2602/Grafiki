@@ -81,11 +81,17 @@ the `relations` table).
 
 ### E-High leverage
 
-- [ ] **H1 — Evaluation harness (there is none today; prerequisite for all of E).** A
-  `grafiki-eval` crate that replays LongMemEval/LoCoMo conversations through
-  capture→candidate→trusted and scores `grafiki_ask`, plus a BEIR-style retrieval
-  gold set (nDCG@10/recall@k) for FTS5+RRF, a SecretBench run for the redactor, and
-  a SWE-bench-derived "does memory lift resolved-rate" test. **L**
+- [~] **H1 — Evaluation harness (prerequisite for all of E).** **v1 LANDED** as the
+  `crates/grafiki-eval` crate (design in [EVAL_DESIGN.md](EVAL_DESIGN.md)): TREC/BEIR-grade
+  IR metrics (linear-gain nDCG@k / Recall@k / MRR / MAP / Success / Judged) **proven against
+  `pytrec_eval` to 1e-9** (`tests/metrics_oracle.rs`); **Arm A** retrieval (keyword/semantic/
+  hybrid, paired permutation + Holm) over a hand-authored Grafiki-native BEIR triple; **Arm C**
+  redaction P/R/F1/F2 + leak gate over a synthetic, leak-safe corpus; bootstrap CIs; provenance;
+  `results.json` + `report.md`; and a deterministic, model-free **CI eval-gate** (keyword + redaction
+  vs a committed `baseline.json`). First run already surfaced a real gap: entity keyword search uses
+  `name LIKE %query%` not FTS, so entities are unretrievable by NL queries ([memory.rs:7184](../crates/grafiki-core/src/memory.rs#L7184)).
+  **Remaining (v1.5/v2/v3):** Arm B memory-QA replay (capture→candidate→trusted→ask, needs MiniLM);
+  judged LongMemEval/LoCoMo + external BEIR/SecretBench adapters; SWE-bench memory-lift A/B. **L**
 - [ ] **H2 — Automated conflict / contradiction resolution.** On a new candidate, find
   semantically-related trusted facts; on contradiction, set the older row's
   `valid_to = new.valid_from` (reuse bitemporal supersession) **via the candidate

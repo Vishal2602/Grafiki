@@ -5855,6 +5855,23 @@ fn truncate_with_ellipsis(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Public eval/test seam over the redaction trust boundary.
+///
+/// Runs the same substitution redactor used on the ingest path
+/// ([`redact_sensitive_text`]) and returns the redacted text together with a
+/// flag indicating whether any redaction fired. This lets the `grafiki-eval`
+/// harness (and tests) score the redactor directly — input→output diff —
+/// without round-tripping a record through the capture/ingest pipeline.
+///
+/// The redactor *substitutes* secrets with `[REDACTED_…]` markers rather than
+/// emitting spans, so callers measuring precision/recall should diff `input`
+/// against the returned string.
+pub fn redact_text(input: &str) -> (String, bool) {
+    let mut text = input.to_string();
+    let changed = redact_sensitive_text(&mut text);
+    (text, changed)
+}
+
 fn redact_sensitive_text(text: &mut String) -> bool {
     let original = text.clone();
     let mut redacted = redact_assignment_like_secrets(&original);

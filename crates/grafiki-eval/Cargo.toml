@@ -1,0 +1,31 @@
+[package]
+name = "grafiki-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Evaluation harness for Grafiki: TREC/BEIR-grade retrieval, redaction, and memory-QA metrics."
+
+[[bin]]
+name = "grafiki-eval"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+grafiki-core = { path = "../grafiki-core" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[features]
+# Default v1 is self-contained, offline, deterministic (keyword retrieval +
+# redaction, no model download). The `fastembed` feature unlocks the
+# semantic/hybrid retrieval arms and the memory-QA loop, which need the local
+# MiniLM model (downloaded on first use) — run on demand / nightly, not in the
+# fast PR gate.
+default = []
+fastembed = ["grafiki-core/fastembed"]
+sqlite-vec = ["grafiki-core/sqlite-vec"]
+
+[dev-dependencies]
+tempfile.workspace = true

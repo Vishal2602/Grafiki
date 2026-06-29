@@ -27,7 +27,7 @@ pub use memory::{
     import_memory, ingest_capture_event, list_agent_queries, list_candidates, list_capture_events,
     list_context, list_decisions, list_entities, list_events, list_observations, list_relations,
     list_sessions, list_state, log_decision, process_embedding_jobs, propose_candidate,
-    propose_capture_candidates, reject_candidate, save_entity, search_memory,
+    propose_capture_candidates, redact_text, reject_candidate, save_entity, search_memory,
     start_capture_session, stop_capture_session, update_context, update_decision, update_entity,
     update_observation, update_relation, update_session, upsert_state, AddContextOptions,
     AgentMemoryBriefing, AgentQueryLogItem, ApproveCandidateOptions, AskMemoryOptions,

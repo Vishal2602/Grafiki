@@ -2,6 +2,7 @@
 members = [
     "crates/grafiki-core",
     "crates/grafiki-cli",
+    "crates/grafiki-eval",
     "apps/grafiki-desktop/src-tauri",
 ]
 resolver = "2"
