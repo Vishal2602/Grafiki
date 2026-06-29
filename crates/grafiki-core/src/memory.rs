@@ -5624,6 +5624,84 @@ fn scoped_capture_sessions(
     Ok(sessions)
 }
 
+/// H2: close the validity window of a prior observation that a newly-approved
+/// observation supersedes, when metadata arbitration says the new fact wins.
+///
+/// The old row's `valid_to` is set to the **new fact's `valid_from`** (the
+/// bitemporal "abutting windows" rule), so point-in-time queries before the cut
+/// still return the old fact. A no-op (returns `None`) when the target is missing/
+/// already invalidated, or when arbitration (source-priority → recency →
+/// confidence) does not put the incoming fact strictly ahead — e.g. a low-trust
+/// auto-extraction must not silently overwrite a human-confirmed fact.
+fn apply_observation_supersession(
+    project_name: Option<String>,
+    start_dir: PathBuf,
+    grafiki_home: Option<PathBuf>,
+    old_id: &str,
+    new_id: &str,
+    candidate: &ExtractionCandidate,
+) -> Result<Option<crate::conflict::ArbitrationBasis>> {
+    let (_project, mut connection) = resolve_and_open(project_name, start_dir, grafiki_home)?;
+
+    let old: Option<(String, Option<String>, f64, String)> = connection
+        .query_row(
+            "
+            SELECT o.valid_from, o.source, o.confidence, e.scope
+            FROM observations o
+            JOIN entities e ON e.id = o.entity_id
+            WHERE o.id = ?1 AND o.valid_to IS NULL
+            ",
+            [old_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((old_valid_from, old_source, old_confidence, old_scope)) = old else {
+        return Ok(None);
+    };
+
+    let new_valid_from: String = connection.query_row(
+        "SELECT valid_from FROM observations WHERE id = ?1",
+        [new_id],
+        |row| row.get(0),
+    )?;
+
+    let trusted = crate::conflict::FactMeta {
+        valid_from: old_valid_from,
+        source_type: old_source.unwrap_or_default(),
+        confidence: old_confidence,
+    };
+    let incoming = crate::conflict::FactMeta {
+        valid_from: new_valid_from.clone(),
+        source_type: candidate.source_type.clone(),
+        confidence: candidate.confidence,
+    };
+    let (winner, basis) = crate::conflict::arbitrate(&trusted, &incoming);
+    if winner != crate::conflict::Winner::Incoming {
+        return Ok(None);
+    }
+
+    let tx = connection.transaction()?;
+    tx.execute(
+        "UPDATE observations SET valid_to = ?1 WHERE id = ?2 AND valid_to IS NULL",
+        params![new_valid_from, old_id],
+    )?;
+    delete_embedding_records(&tx, "observation", old_id)?;
+    tx.execute(
+        "
+        INSERT INTO events (id, event_type, source_session, target_type, target_id, scope, summary)
+        VALUES (?1, 'observation_invalidated', NULL, 'observation', ?2, ?3, ?4)
+        ",
+        params![
+            new_ulid(),
+            old_id,
+            old_scope,
+            format!("Superseded by observation {new_id} (basis={basis:?})")
+        ],
+    )?;
+    tx.commit()?;
+    Ok(Some(basis))
+}
+
 fn approve_candidate_payload(
     candidate: &ExtractionCandidate,
     project_name: Option<String>,
@@ -5652,10 +5730,11 @@ fn approve_candidate_payload(
         "observation" => {
             let name = candidate_payload_string(payload, &["entity_name", "name", "title"])?;
             let content = candidate_payload_string(payload, &["content", "observe"])?;
+            let supersedes = candidate_payload_optional_string(payload, &["supersedes"]);
             let report = save_entity(SaveEntityOptions {
-                project_name,
-                start_dir,
-                grafiki_home,
+                project_name: project_name.clone(),
+                start_dir: start_dir.clone(),
+                grafiki_home: grafiki_home.clone(),
                 name,
                 entity_type: candidate_payload_optional_string(payload, &["entity_type"])
                     .unwrap_or_else(|| "concept".to_owned()),
@@ -5670,6 +5749,20 @@ fn approve_candidate_payload(
                     "approved observation did not create an observation".to_owned(),
                 )
             })?;
+            // H2: if this observation supersedes a prior trusted one, close the
+            // older fact's validity window — arbitrated on metadata (a higher-trust
+            // fact is not silently overwritten). Observations are append-only, so
+            // this supersession primitive did not exist before.
+            if let Some(old_id) = supersedes {
+                apply_observation_supersession(
+                    project_name,
+                    start_dir,
+                    grafiki_home,
+                    &old_id,
+                    &observation_id,
+                    candidate,
+                )?;
+            }
             Ok(("observation".to_owned(), observation_id))
         }
         "decision" => {
@@ -9043,6 +9136,99 @@ mod tests {
         assert_eq!(
             rejected.candidate.rationale.as_deref(),
             Some("Too ambiguous.")
+        );
+    }
+
+    #[test]
+    fn observation_candidate_supersedes_prior_observation() {
+        let (_temp, home, project_dir) = setup_project();
+        let scope = "example-project/core";
+
+        // Old fact.
+        let old = save_entity(SaveEntityOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            name: "Deploy Target".to_owned(),
+            entity_type: "service".to_owned(),
+            observe: Some("We deploy to AWS us-east-1".to_owned()),
+            category: "architecture".to_owned(),
+            scope: scope.to_owned(),
+            relate: None,
+        })
+        .unwrap();
+        let old_obs = old.observation_id.expect("old observation id");
+
+        // valid_from is second-precision; ensure the superseding fact is strictly
+        // newer so recency arbitration applies.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "connector:test".to_owned(),
+            source: None,
+            record_type: "observation".to_owned(),
+            payload: serde_json::json!({
+                "entity_name": "Deploy Target",
+                "content": "We deploy to GCP europe-west1",
+                "category": "architecture",
+                "supersedes": old_obs,
+            }),
+            scope: scope.to_owned(),
+            confidence: 0.9,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+
+        approve_candidate(ApproveCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: proposed.candidate.id.clone(),
+        })
+        .unwrap();
+
+        // New fact surfaced.
+        let search_new = search_memory(SearchMemoryOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            query: "europe-west1".to_owned(),
+            record_type: "all".to_owned(),
+            mode: SearchMode::Keyword,
+            scope: scope.to_owned(),
+            limit: 10,
+        })
+        .unwrap();
+        assert!(
+            search_new
+                .results
+                .iter()
+                .any(|r| r.snippet.contains("europe-west1")),
+            "new observation should be retrievable"
+        );
+
+        // Stale fact suppressed (valid_to set → excluded from search).
+        let search_stale = search_memory(SearchMemoryOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            query: "us-east-1".to_owned(),
+            record_type: "all".to_owned(),
+            mode: SearchMode::Keyword,
+            scope: scope.to_owned(),
+            limit: 10,
+        })
+        .unwrap();
+        assert!(
+            !search_stale
+                .results
+                .iter()
+                .any(|r| r.snippet.contains("us-east-1")),
+            "stale observation must be suppressed after supersession"
         );
     }
 
