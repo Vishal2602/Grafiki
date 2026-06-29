@@ -6,7 +6,7 @@ use crate::Result;
 pub const INITIAL_SCHEMA_VERSION: i64 = 1;
 /// The newest schema version this build knows how to produce. Bump this and add
 /// a `Migration` entry whenever the schema changes.
-pub const LATEST_SCHEMA_VERSION: i64 = 2;
+pub const LATEST_SCHEMA_VERSION: i64 = 3;
 
 struct Migration {
     version: i64,
@@ -26,7 +26,45 @@ const MIGRATIONS: &[Migration] = &[
         description: "capture_events.content_hash for per-source-type re-ingest dedup",
         sql: MIGRATION_V2_CAPTURE_DEDUP,
     },
+    Migration {
+        version: 3,
+        description: "entities_fts FTS5 index + sync triggers for tokenized entity search",
+        sql: MIGRATION_V3_ENTITY_FTS,
+    },
 ];
+
+// Entities were searched with `name LIKE '%<whole query>%'`, which never matches
+// a natural-language query — so entities were effectively unretrievable. Give
+// them the same external-content FTS5 treatment the other record types already
+// have, and backfill any existing rows with the FTS5 'rebuild' command.
+const MIGRATION_V3_ENTITY_FTS: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
+    name,
+    entity_type,
+    content='entities',
+    content_rowid='rowid',
+    tokenize='porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS entities_ai AFTER INSERT ON entities BEGIN
+    INSERT INTO entities_fts(rowid, name, entity_type)
+    VALUES (new.rowid, new.name, new.entity_type);
+END;
+
+CREATE TRIGGER IF NOT EXISTS entities_ad AFTER DELETE ON entities BEGIN
+    INSERT INTO entities_fts(entities_fts, rowid, name, entity_type)
+    VALUES ('delete', old.rowid, old.name, old.entity_type);
+END;
+
+CREATE TRIGGER IF NOT EXISTS entities_au AFTER UPDATE ON entities BEGIN
+    INSERT INTO entities_fts(entities_fts, rowid, name, entity_type)
+    VALUES ('delete', old.rowid, old.name, old.entity_type);
+    INSERT INTO entities_fts(rowid, name, entity_type)
+    VALUES (new.rowid, new.name, new.entity_type);
+END;
+
+INSERT INTO entities_fts(entities_fts) VALUES('rebuild');
+"#;
 
 // SQLite ADD COLUMN cannot be NOT NULL without a constant default, so content_hash
 // is nullable; legacy rows stay NULL and never match the dedup equality check.
@@ -744,5 +782,57 @@ mod tests {
             .unwrap();
 
         assert_eq!(matches, 1);
+    }
+
+    #[test]
+    fn entities_fts_indexes_and_backfills() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        // Pre-create at v1 so the v3 migration must backfill an existing row.
+        connection
+            .execute_batch(super::INITIAL_SCHEMA)
+            .and_then(|_| {
+                connection.execute(
+                    "INSERT INTO schema_version (version, description) VALUES (1, 'test')",
+                    [],
+                )
+            })
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO entities (id, name, entity_type) VALUES ('pg', 'Postgres Database', 'service')",
+                [],
+            )
+            .unwrap();
+
+        initialize_schema(&mut connection).unwrap();
+
+        // Backfilled row is matchable by a token in its name...
+        let backfilled: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM entities_fts WHERE entities_fts MATCH 'database'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            backfilled, 1,
+            "v3 migration must backfill existing entities"
+        );
+
+        // ...and the insert trigger keeps new rows in sync.
+        connection
+            .execute(
+                "INSERT INTO entities (id, name, entity_type) VALUES ('redis', 'Redis Cache', 'service')",
+                [],
+            )
+            .unwrap();
+        let inserted: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM entities_fts WHERE entities_fts MATCH 'cache'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inserted, 1, "entities_ai trigger must index new entities");
     }
 }

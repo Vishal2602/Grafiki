@@ -6721,10 +6721,10 @@ fn search_keyword_memory(
 ) -> Result<Vec<SearchResult>> {
     let mut results = Vec::new();
     let fts_query = fts5_terms_query(query);
-    if matches!(record_type, "all" | "entities") {
-        results.extend(search_entities(connection, query, scope_chain, limit)?);
-    }
     if let Some(fts_query) = fts_query.as_deref() {
+        if matches!(record_type, "all" | "entities") {
+            results.extend(search_entities(connection, fts_query, scope_chain, limit)?);
+        }
         if matches!(record_type, "all" | "observations") {
             results.extend(search_observations(
                 connection,
@@ -7208,29 +7208,22 @@ fn search_entities(
     scope_chain: &[String],
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
-    let pattern = format!("%{}%", query.trim());
+    // FTS5 over name + entity_type, mirroring the other record types. `query` is
+    // the already-sanitized FTS terms query (see `fts5_terms_query`), so a
+    // natural-language query matches by token instead of a useless full-string
+    // LIKE.
     let sql = scoped_query(
         "
-        SELECT id, name, entity_type, scope
-        FROM entities
-        WHERE scope IN ({scopes}) AND (id LIKE ? OR name LIKE ? OR entity_type LIKE ?)
-        ORDER BY updated_at DESC
+        SELECT e.id, e.name, e.entity_type, e.scope
+        FROM entities_fts f
+        JOIN entities e ON e.rowid = f.rowid
+        WHERE entities_fts MATCH ? AND e.scope IN ({scopes})
+        ORDER BY rank
         LIMIT ?
         ",
         scope_chain.len(),
     );
-    let mut params: Vec<&dyn rusqlite::ToSql> = scope_chain
-        .iter()
-        .map(|scope| scope as &dyn rusqlite::ToSql)
-        .collect();
-    let limit = limit as i64;
-    params.push(&pattern);
-    params.push(&pattern);
-    params.push(&pattern);
-    params.push(&limit);
-
-    let mut statement = connection.prepare(&sql)?;
-    let rows = statement.query_map(params.as_slice(), |row| {
+    query_search_rows(connection, &sql, query, scope_chain, limit, |row| {
         let id: String = row.get(0)?;
         let name: String = row.get(1)?;
         let entity_type: String = row.get(2)?;
@@ -7244,8 +7237,7 @@ fn search_entities(
             score: None,
             evidence: Vec::new(),
         })
-    })?;
-    collect_rows(rows)
+    })
 }
 
 fn search_observations(

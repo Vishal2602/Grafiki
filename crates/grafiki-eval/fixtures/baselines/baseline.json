@@ -5,9 +5,9 @@
     "min_recall": 1.0
   },
   "retrieval": {
-    "ndcg@10": 0.6948,
+    "ndcg@10": 0.6562,
     "primary_mode": "keyword",
-    "recall@10": 0.8333,
+    "recall@10": 0.8958,
     "tolerance": 0.05
   }
 }
