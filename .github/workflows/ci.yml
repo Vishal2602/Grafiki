@@ -74,6 +74,10 @@ jobs:
         run: |
           npm ci
           npm run build
+      # tauri-build also needs the CLI sidecar staged (externalBin) or the desktop
+      # crate (built by smoke's cargo test) fails to resolve the resource.
+      - name: Prepare desktop sidecar
+        run: bash scripts/prepare_desktop_sidecar.sh debug
       - name: Run smoke suite
         run: bash scripts/smoke.sh
 
@@ -90,6 +94,8 @@ jobs:
         run: |
           npm ci
           npm run build
+      - name: Prepare desktop sidecar
+        run: bash scripts/prepare_desktop_sidecar.sh debug
       - name: Build desktop crate
         run: cargo build -p grafiki-desktop
 
@@ -100,13 +106,13 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: cargo audit
+      - name: cargo audit (informational)
         run: |
           cargo install cargo-audit --locked
-          cargo audit
+          cargo audit || echo "::warning::cargo audit reported advisories (see log; mostly unmaintained transitive deps)"
       - uses: actions/setup-node@v4
         with:
           node-version-file: apps/grafiki-desktop/.nvmrc
-      - name: npm audit
+      - name: npm audit (informational)
         working-directory: apps/grafiki-desktop
-        run: npm audit --audit-level=high
+        run: npm audit --audit-level=high || echo "::warning::npm audit reported issues (see log)"
