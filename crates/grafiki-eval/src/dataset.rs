@@ -193,6 +193,17 @@ impl RetrievalDataset {
                 }
             }
         }
+        for rel in &self.relations {
+            for (role, doc) in [("from", &rel.from), ("to", &rel.to)] {
+                if !doc_ids.contains(doc.as_str()) {
+                    return Err(format!(
+                        "relation '{}' references unknown corpus doc '{doc}'",
+                        role
+                    )
+                    .into());
+                }
+            }
+        }
         Ok(())
     }
 }

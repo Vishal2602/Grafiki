@@ -2292,22 +2292,34 @@ pub fn search_memory(options: SearchMemoryOptions) -> Result<SearchReport> {
         // Graph: PPR over relations, seeded from the lexical/dense hits, fused with
         // keyword (+ semantic when available). Model-free with keyword seeds alone.
         SearchMode::Graph => {
-            let graph_results = graph_search_results(
+            // Best-effort, but never silent: a graph-arm error (e.g. the relations
+            // table missing before a migration) falls back to keyword/semantic with
+            // a surfaced message rather than a hidden empty arm.
+            let (graph_results, graph_error) = match graph_search_results(
                 &connection,
                 &scope_chain,
                 &keyword_results,
                 &semantic_results,
                 candidate_limit,
-            )
-            .unwrap_or_default();
-            let fallback = if semantic_available {
-                None
-            } else {
-                Some(
-                    "Graph search used keyword seeds only (no semantic vectors yet)."
-                        .to_owned(),
-                )
+            ) {
+                Ok(results) => (results, None),
+                Err(error) => (
+                    Vec::new(),
+                    Some(format!(
+                        "Graph arm unavailable ({error}); returned keyword/semantic results."
+                    )),
+                ),
             };
+            let fallback = graph_error.or_else(|| {
+                if semantic_available {
+                    None
+                } else {
+                    Some(
+                        "Graph search used keyword seeds only (no semantic vectors yet)."
+                            .to_owned(),
+                    )
+                }
+            });
             (
                 hybrid_search_results(
                     &options.query,
@@ -7303,6 +7315,11 @@ fn graph_search_results(
     });
 
     let mut out = Vec::new();
+    // Prepared once and reused across ranked entities (avoids re-compiling the SQL
+    // per iteration).
+    let mut obs_statement = connection.prepare(
+        "SELECT id, content FROM observations WHERE entity_id = ?1 AND valid_to IS NULL",
+    )?;
     for (entity_id, _score) in ranked {
         let entity: Option<(String, String, String)> = connection
             .query_row(
@@ -7326,10 +7343,7 @@ fn graph_search_results(
             score: None,
             evidence: Vec::new(),
         });
-        let mut statement = connection.prepare(
-            "SELECT id, content FROM observations WHERE entity_id = ?1 AND valid_to IS NULL",
-        )?;
-        let obs = statement.query_map([&entity_id], |row| {
+        let obs = obs_statement.query_map([&entity_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in obs {
