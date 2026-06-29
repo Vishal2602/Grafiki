@@ -8,6 +8,7 @@
     clippy::ptr_arg
 )]
 
+pub mod conflict;
 pub mod db;
 pub mod embeddings;
 pub mod error;
@@ -18,6 +19,10 @@ pub mod session;
 pub mod transcript;
 pub mod ulid;
 
+pub use conflict::{
+    arbitrate, attribute_cardinality, key_conflict, slot_conflict, temporal_relation,
+    ArbitrationBasis, Cardinality, ConflictVerdict, FactMeta, Slot, TemporalRelation, Winner,
+};
 pub use error::{GrafikiError, Result};
 pub use memory::{
     add_context, approve_candidate, ask_memory, bulk_review_candidates, delete_context,
