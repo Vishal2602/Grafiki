@@ -17,13 +17,20 @@ export function useModalDialog<T extends HTMLElement = HTMLElement>(
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
-  // Run once on mount: capture the trigger, focus into the panel, and bind the
-  // trap. Empty deps are intentional so the trigger is captured before focus
-  // moves into the modal (a changing onClose is read via the ref).
+  // Capture the triggering element during RENDER (before React commits the modal
+  // DOM and before any autoFocus runs in the commit phase) so focus can be
+  // restored to it on close. Reading document.activeElement here is a one-time
+  // snapshot, guarded so it only happens on the first render.
+  const triggerRef = useRef<HTMLElement | null>(null);
+  if (triggerRef.current === null) {
+    triggerRef.current = document.activeElement as HTMLElement | null;
+  }
+
+  // Run once on mount: focus into the panel and bind the trap.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     const panel = ref.current;
-    const trigger = document.activeElement as HTMLElement | null;
+    const trigger = triggerRef.current;
 
     const focusables = (): HTMLElement[] =>
       panel

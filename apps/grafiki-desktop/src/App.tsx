@@ -4361,7 +4361,6 @@ function CommandPalette(props: {
             onChange={(event) => setQuery(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter") submitSearch();
-              if (event.key === "Escape") props.onClose();
             }}
             placeholder={`Search commands or ${props.snapshot?.project?.project ?? "memory"}`}
             autoFocus
