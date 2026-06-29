@@ -7268,6 +7268,321 @@ fn sqlite_vec_table_name_parts(provider_name: &str, model_name: &str, dimension:
 /// retrievable records (each ranked entity contributes itself + its live
 /// observations). Returns an empty list when there are no seeds or no relations,
 /// so it is a safe no-op on corpora without a graph.
+/// Load the currently-valid relations subgraph whose endpoints are both in `scopes`,
+/// into an in-memory [`crate::graph::Graph`]. Shared by H3 graph-retrieval (passes the
+/// full scope chain) and H5 reflection (passes a single scope). The `ORDER BY` makes
+/// the row stream — and therefore the per-node adjacency lists — canonical, which is
+/// required for deterministic community detection (REFLECTION_DESIGN §0/C2).
+fn load_scope_subgraph(connection: &Connection, scopes: &[String]) -> Result<crate::graph::Graph> {
+    let placeholders = vec!["?"; scopes.len()].join(",");
+    let sql = format!(
+        "
+        SELECT r.from_entity, r.to_entity, r.weight
+        FROM relations r
+        JOIN entities ef ON ef.id = r.from_entity
+        JOIN entities et ON et.id = r.to_entity
+        WHERE r.valid_to IS NULL
+          AND ef.scope IN ({placeholders}) AND et.scope IN ({placeholders})
+        ORDER BY r.from_entity, r.to_entity, r.relation
+        "
+    );
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(scopes.len() * 2);
+    for scope in scopes {
+        params.push(scope);
+    }
+    for scope in scopes {
+        params.push(scope);
+    }
+    let mut graph = crate::graph::Graph::new();
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(params.as_slice(), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, f64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (from, to, weight) = row?;
+        graph.add_edge(&from, &to, weight);
+    }
+    Ok(graph)
+}
+
+/// H5 — detect entity communities in the in-scope relations graph, build a
+/// deterministic extractive summary of each, and propose each as a **pending**
+/// `context` candidate with provenance (`evidence_links`) and redaction. Never
+/// auto-approves. Idempotent: a membership/source-fact dedup key skips re-proposing an
+/// unchanged community. v1 is single-scope. See `docs/REFLECTION_DESIGN.md`.
+pub fn run_reflection(
+    options: crate::reflection::RunReflectionOptions,
+) -> Result<crate::reflection::ReflectionReport> {
+    use crate::reflection::{
+        build_summary, community_dedup_key, CommunityDetail, ReflectionReport, SourceObservation,
+    };
+
+    let min_size = options.min_community_size.max(1);
+    let max_size = options.max_community_size.max(min_size);
+    let max_obs = options.max_obs_per_summary.max(1);
+
+    let scope = Scope::new(&options.scope)?;
+    let (project, connection) = resolve_and_open(
+        options.project_name.clone(),
+        options.start_dir.clone(),
+        options.grafiki_home.clone(),
+    )?;
+
+    // v1 is single-scope (REFLECTION_DESIGN §0/C7): detect over exactly the run scope,
+    // so every member shares one scope and the candidate's scope is unambiguous.
+    let scopes = [scope.as_str().to_string()];
+    let graph = load_scope_subgraph(&connection, &scopes)?;
+    let communities = crate::graph::detect_communities(&graph);
+    let communities_detected = communities.len();
+
+    let scope_slug = {
+        let s = slugify(scope.as_str());
+        if s.is_empty() {
+            "root".to_string()
+        } else {
+            s
+        }
+    };
+
+    let mut details: Vec<CommunityDetail> = Vec::new();
+    let mut communities_summarized = 0usize;
+    let mut candidates_created = 0usize;
+    let mut skipped_existing = 0usize;
+    let mut skipped_too_large = 0usize;
+
+    let mut name_stmt =
+        connection.prepare("SELECT name FROM entities WHERE id = ?1 AND scope = ?2")?;
+    let mut obs_stmt = connection.prepare(
+        "SELECT id, content, category, confidence FROM observations \
+         WHERE entity_id = ?1 AND valid_to IS NULL ORDER BY id",
+    )?;
+
+    for community in &communities {
+        let size = community.members.len();
+        if size < min_size {
+            continue; // singleton / sub-theme: counted in `detected`, not summarizable
+        }
+        let member_ids = community.members.clone();
+        // Community cohesion Q_c (modularity contribution) — discounts loose communities
+        // in the proposed confidence (§4.4) and is reported per community.
+        let modularity = crate::graph::community_modularity(&graph, &member_ids);
+
+        // Too-large guard (C6): skip rather than emit a meaningless mega-summary.
+        if size > max_size {
+            details.push(CommunityDetail {
+                community_id: community.id,
+                member_entity_ids: member_ids.clone(),
+                member_entity_names: Vec::new(),
+                observation_count: 0,
+                modularity_contribution: modularity,
+                dedup_key: community_dedup_key(scope.as_str(), &member_ids, &[]),
+                candidate_id: None,
+                status: "skipped_too_large".to_string(),
+            });
+            skipped_too_large += 1;
+            continue;
+        }
+
+        // Within-community weighted degree per member = stable, local salience (C5):
+        // unaffected by edges/PPR elsewhere in the scope.
+        let member_set: std::collections::BTreeSet<&str> =
+            member_ids.iter().map(String::as_str).collect();
+        let salience = |member: &str| -> f64 {
+            graph
+                .neighbors(member)
+                .iter()
+                .filter(|(nbr, _)| member_set.contains(nbr.as_str()))
+                .map(|(_, w)| *w)
+                .sum()
+        };
+
+        // Load member names + their currently-valid observations, REDACTING each
+        // observation at the source (C1) so neither the summary nor the evidence
+        // excerpt can carry a secret that ingest failed to scrub.
+        let mut member_names: Vec<String> = Vec::with_capacity(size);
+        let mut observations: Vec<SourceObservation> = Vec::new();
+        for member in &member_ids {
+            let name: String = name_stmt
+                .query_row(params![member, scope.as_str()], |row| row.get(0))
+                .optional()?
+                .unwrap_or_else(|| member.clone());
+            member_names.push(name.clone());
+            let member_salience = salience(member);
+            let rows = obs_stmt.query_map([member], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (obs_id, content, category, confidence) = row?;
+                let (redacted, _) = redact_text(&content);
+                observations.push(SourceObservation {
+                    observation_id: obs_id,
+                    entity_id: member.clone(),
+                    entity_name: name.clone(),
+                    content: redacted,
+                    category,
+                    confidence,
+                    salience: member_salience,
+                });
+            }
+        }
+
+        if observations.is_empty() {
+            details.push(CommunityDetail {
+                community_id: community.id,
+                member_entity_ids: member_ids.clone(),
+                member_entity_names: member_names,
+                observation_count: 0,
+                modularity_contribution: modularity,
+                dedup_key: community_dedup_key(scope.as_str(), &member_ids, &[]),
+                candidate_id: None,
+                status: "skipped_no_observations".to_string(),
+            });
+            continue;
+        }
+
+        let draft = build_summary(
+            scope.as_str(),
+            &member_ids,
+            &member_names,
+            &observations,
+            max_obs,
+        );
+        let context_key = format!("reflection-{scope_slug}-{}", draft.dedup_key);
+
+        // Dedup. An approved `context` row with this key is an UNCONDITIONAL skip — even
+        // under `--force` — because `context.key` is UNIQUE and `add_context` is a plain
+        // INSERT, so re-approving a colliding key would error at approval (the unique
+        // constraint must be a backstop, never a crash path — §4.6). The
+        // extraction_candidates check (any status incl. `rejected`, so a human rejection
+        // is durable) is the part `--force` bypasses to re-propose a fresh review.
+        let context_hit: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM context WHERE key = ?1 LIMIT 1",
+                [&context_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let candidate_hit: Option<i64> = if options.force {
+            None
+        } else {
+            connection
+                .query_row(
+                    "SELECT 1 FROM extraction_candidates \
+                     WHERE scope = ?1 AND json_extract(payload, '$.dedup_key') = ?2 \
+                       AND status IN ('pending','approved','rejected') LIMIT 1",
+                    params![scope.as_str(), draft.dedup_key],
+                    |row| row.get(0),
+                )
+                .optional()?
+        };
+        if context_hit.is_some() || candidate_hit.is_some() {
+            details.push(CommunityDetail {
+                community_id: community.id,
+                member_entity_ids: member_ids.clone(),
+                member_entity_names: member_names,
+                observation_count: draft.kept.len(),
+                modularity_contribution: modularity,
+                dedup_key: draft.dedup_key,
+                candidate_id: None,
+                status: "skipped_existing".to_string(),
+            });
+            skipped_existing += 1;
+            continue;
+        }
+
+        // Confidence (§4.4): mean of ALL member-observation confidences (not just the
+        // kept representatives) discounted by community cohesion. `cohesion` maps the
+        // modularity contribution Q_c into [0.5, 1.0] (Q_ref = 0.3), so a loose community
+        // is discounted while a tight one is not. Deterministic (all store-derived).
+        let mean_conf =
+            observations.iter().map(|o| o.confidence).sum::<f64>() / observations.len() as f64;
+        let cohesion = 0.5 + 0.5 * (modularity / 0.3).clamp(0.0, 1.0);
+        let confidence = (mean_conf * cohesion).clamp(0.0, 1.0);
+
+        let payload = serde_json::json!({
+            "key": context_key,
+            "title": draft.title,
+            "category": "architecture",
+            "content": draft.content,
+            "members": member_ids.clone(),
+            "reflection_version": 1,
+            "dedup_key": draft.dedup_key,
+        });
+        // One evidence link per kept observation. The excerpt is the already-redacted
+        // content (C1) — `insert_candidate_evidence` only compacts, it does not redact.
+        let evidence: Vec<EvidenceInput> = draft
+            .kept
+            .iter()
+            .map(|o| EvidenceInput {
+                source_event_id: None,
+                source_type: "reflection".to_string(),
+                source: Some("reflection:louvain:v1".to_string()),
+                title: Some(o.entity_name.clone()),
+                excerpt: o.content.clone(),
+                uri: Some(format!("grafiki://observation/{}", o.observation_id)),
+                byte_start: None,
+                byte_end: None,
+                line_start: None,
+                line_end: None,
+                captured_at: None,
+            })
+            .collect();
+        let rationale = format!(
+            "Community reflection over {} entities (modularity contribution {modularity:.4}); \
+             {} source observations.",
+            member_ids.len(),
+            draft.kept.len()
+        );
+
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: options.project_name.clone(),
+            start_dir: options.start_dir.clone(),
+            grafiki_home: options.grafiki_home.clone(),
+            source_type: "reflection".to_string(),
+            source: Some("reflection:louvain:v1".to_string()),
+            record_type: "context".to_string(),
+            payload,
+            scope: scope.as_str().to_string(),
+            confidence,
+            rationale: Some(rationale),
+            evidence,
+        })?;
+
+        communities_summarized += 1;
+        candidates_created += 1;
+        details.push(CommunityDetail {
+            community_id: community.id,
+            member_entity_ids: member_ids,
+            member_entity_names: member_names,
+            observation_count: draft.kept.len(),
+            modularity_contribution: modularity,
+            dedup_key: draft.dedup_key,
+            candidate_id: Some(proposed.candidate.id),
+            status: "created".to_string(),
+        });
+    }
+
+    Ok(ReflectionReport {
+        project: project.project,
+        scope: scope.as_str().to_string(),
+        communities_detected,
+        communities_summarized,
+        candidates_created,
+        skipped_existing,
+        skipped_too_large,
+        details,
+    })
+}
+
 fn graph_search_results(
     connection: &Connection,
     scope_chain: &[String],
@@ -7276,7 +7591,7 @@ fn graph_search_results(
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
     use crate::graph::{
-        personalized_pagerank, Graph, DEFAULT_DAMPING, DEFAULT_MAX_ITERS, DEFAULT_TOLERANCE,
+        personalized_pagerank, DEFAULT_DAMPING, DEFAULT_MAX_ITERS, DEFAULT_TOLERANCE,
     };
 
     // 1. Seeds: entity ids from the prior arms, weighted by rank (earlier ⇒ stronger).
@@ -7299,39 +7614,7 @@ fn graph_search_results(
     }
 
     // 2. Load the in-scope, currently-valid relations subgraph (both endpoints in scope).
-    let placeholders = vec!["?"; scope_chain.len()].join(",");
-    let sql = format!(
-        "
-        SELECT r.from_entity, r.to_entity, r.weight
-        FROM relations r
-        JOIN entities ef ON ef.id = r.from_entity
-        JOIN entities et ON et.id = r.to_entity
-        WHERE r.valid_to IS NULL
-          AND ef.scope IN ({placeholders}) AND et.scope IN ({placeholders})
-        "
-    );
-    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(scope_chain.len() * 2);
-    for scope in scope_chain {
-        params.push(scope);
-    }
-    for scope in scope_chain {
-        params.push(scope);
-    }
-    let mut graph = Graph::new();
-    {
-        let mut statement = connection.prepare(&sql)?;
-        let rows = statement.query_map(params.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, f64>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (from, to, weight) = row?;
-            graph.add_edge(&from, &to, weight);
-        }
-    }
+    let graph = load_scope_subgraph(connection, scope_chain)?;
     // No graph, or no seed actually lands on a node → nothing to add.
     if graph.is_empty() || !seeds.keys().any(|s| graph.contains(s)) {
         return Ok(Vec::new());
@@ -8565,6 +8848,102 @@ mod tests {
         })
         .unwrap();
         (temp, home, project_dir)
+    }
+
+    #[test]
+    fn reflection_cohesion_confidence_and_force_respects_context_backstop() {
+        use super::run_reflection;
+        use crate::reflection::RunReflectionOptions;
+
+        let (_t, home, dir) = setup_project();
+        let scope = "core";
+        let save = |name: &str, ty: &str, text: &str, relate: Option<&str>| {
+            save_entity(SaveEntityOptions {
+                project_name: None,
+                start_dir: dir.clone(),
+                grafiki_home: Some(home.clone()),
+                name: name.to_string(),
+                entity_type: ty.to_string(),
+                observe: Some(text.to_string()),
+                category: "architecture".to_string(),
+                scope: scope.to_string(),
+                relate: relate.map(str::to_string),
+            })
+            .unwrap();
+        };
+        // A triangle (the whole graph) → one community whose modularity contribution is 0.
+        save("Auth Service", "service", "Auth throttles requests.", None);
+        save(
+            "JWT Library",
+            "library",
+            "Tokens rotate often.",
+            Some("auth-service:uses"),
+        );
+        save(
+            "Refresh Token Cache",
+            "module",
+            "Token reuse is rejected.",
+            Some("auth-service:uses"),
+        );
+        save(
+            "JWT Library",
+            "library",
+            "Tokens are stored hashed.",
+            Some("refresh-token-cache:uses"),
+        );
+
+        let opts = |force: bool| {
+            let mut o = RunReflectionOptions::new(scope, dir.clone());
+            o.grafiki_home = Some(home.clone());
+            o.force = force;
+            o
+        };
+
+        let first = run_reflection(opts(false)).unwrap();
+        assert_eq!(first.candidates_created, 1, "one community ⇒ one candidate");
+        let created = first
+            .details
+            .iter()
+            .find(|d| d.status == "created")
+            .unwrap();
+        let candidate_id = created.candidate_id.clone().unwrap();
+
+        // Cohesion discount: a whole-graph community has Q_c ≈ 0, so confidence is
+        // mean(obs confidence = 1.0) × cohesion(0.5) = 0.5 — NOT the un-discounted 1.0
+        // the old floor-only formula produced.
+        let pending = list_candidates(ListCandidatesOptions {
+            project_name: None,
+            start_dir: dir.clone(),
+            grafiki_home: Some(home.clone()),
+            status: Some("pending".to_string()),
+            scope: scope.to_string(),
+            limit: 50,
+        })
+        .unwrap();
+        let candidate = pending.iter().find(|c| c.id == candidate_id).unwrap();
+        assert!(
+            candidate.confidence <= 0.6,
+            "cohesion must discount a loosely-connected community: {}",
+            candidate.confidence
+        );
+
+        // Approve → a trusted `context` row with this key now exists.
+        approve_candidate(ApproveCandidateOptions {
+            project_name: None,
+            start_dir: dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: candidate_id,
+        })
+        .unwrap();
+
+        // --force bypasses the candidate-table dedup but MUST still honor the
+        // context.key backstop, so it proposes nothing that would collide at approval.
+        let forced = run_reflection(opts(true)).unwrap();
+        assert_eq!(
+            forced.candidates_created, 0,
+            "--force must not bypass the context.key existence backstop"
+        );
+        assert_eq!(forced.skipped_existing, 1);
     }
 
     fn start_codex(home: std::path::PathBuf, project_dir: std::path::PathBuf) -> String {

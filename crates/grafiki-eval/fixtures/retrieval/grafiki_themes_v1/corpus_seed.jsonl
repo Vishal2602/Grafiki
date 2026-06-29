@@ -1,0 +1,29 @@
+# grafiki_themes_v1 — Eval Arm E (reflection / consolidation).
+# Three disconnected clusters in the relations graph (auth, observability, storage).
+# `entity` docs anchor the relations (graph nodes); `observation` docs are the
+# gradeable partial facts (grade 1). The `context` docs are the EXPECTED community
+# summaries (grade 3) — they are NOT seeded by the Arm-E runner; run_reflection must
+# PRODUCE them, and the runner asserts the produced text byte-equals these.
+#
+# --- member entities (anchor relations / graph nodes) ---
+{"doc_id":"ent-auth-service","record_type":"entity","payload":{"name":"Auth Service","entity_type":"service","category":"architecture"}}
+{"doc_id":"ent-jwt-library","record_type":"entity","payload":{"name":"JWT Library","entity_type":"library","category":"architecture"}}
+{"doc_id":"ent-refresh-token-cache","record_type":"entity","payload":{"name":"Refresh Token Cache","entity_type":"module","category":"architecture"}}
+{"doc_id":"ent-metrics-collector","record_type":"entity","payload":{"name":"Metrics Collector","entity_type":"service","category":"architecture"}}
+{"doc_id":"ent-trace-exporter","record_type":"entity","payload":{"name":"Trace Exporter","entity_type":"service","category":"architecture"}}
+{"doc_id":"ent-log-pipeline","record_type":"entity","payload":{"name":"Log Pipeline","entity_type":"service","category":"architecture"}}
+{"doc_id":"ent-sqlite-store","record_type":"entity","payload":{"name":"SQLite Store","entity_type":"module","category":"architecture"}}
+{"doc_id":"ent-migration-runner","record_type":"entity","payload":{"name":"Migration Runner","entity_type":"tool","category":"architecture"}}
+# --- partial facts (grade 1) — one observation per member entity ---
+{"doc_id":"obs-auth-throttle","record_type":"observation","payload":{"name":"Auth Service","entity_type":"service","category":"architecture","text":"Authentication endpoints throttle requests per client to prevent brute force attacks."}}
+{"doc_id":"obs-jwt-rotate","record_type":"observation","payload":{"name":"JWT Library","entity_type":"library","category":"architecture","text":"JSON web tokens rotate every fifteen minutes and are stored hashed."}}
+{"doc_id":"obs-refresh-reuse","record_type":"observation","payload":{"name":"Refresh Token Cache","entity_type":"module","category":"architecture","text":"Refresh token reuse is rejected to stop session hijacking."}}
+{"doc_id":"obs-metrics-otel","record_type":"observation","payload":{"name":"Metrics Collector","entity_type":"service","category":"architecture","text":"Metrics are exported in OpenTelemetry format every ten seconds."}}
+{"doc_id":"obs-trace-sampling","record_type":"observation","payload":{"name":"Trace Exporter","entity_type":"service","category":"architecture","text":"Distributed traces are sampled at five percent to bound exporter overhead."}}
+{"doc_id":"obs-log-scrub","record_type":"observation","payload":{"name":"Log Pipeline","entity_type":"service","category":"architecture","text":"Logs are scrubbed of secrets before they leave the process."}}
+{"doc_id":"obs-sqlite-wal","record_type":"observation","payload":{"name":"SQLite Store","entity_type":"module","category":"architecture","text":"The store runs in write ahead log mode for concurrent reads during writes."}}
+{"doc_id":"obs-migration-versioned","record_type":"observation","payload":{"name":"Migration Runner","entity_type":"tool","category":"architecture","text":"Schema migrations are versioned and applied idempotently at startup."}}
+# --- expected community summaries (grade 3); produced by run_reflection, not seeded ---
+{"doc_id":"comm-auth","record_type":"context","payload":{"title":"Theme: Auth Service, JWT Library, Refresh Token Cache","category":"architecture","content":"Community theme across 3 entities: Auth Service, JWT Library, Refresh Token Cache.\n\nKey facts:\n- [Auth Service] Authentication endpoints throttle requests per client to prevent brute force attacks.\n- [JWT Library] JSON web tokens rotate every fifteen minutes and are stored hashed.\n- [Refresh Token Cache] Refresh token reuse is rejected to stop session hijacking.\n\nKeywords: attacks, authentication, brute, client, endpoints, every, fifteen, force, hashed, hijacking, json, minutes."}}
+{"doc_id":"comm-observability","record_type":"context","payload":{"title":"Theme: Log Pipeline, Metrics Collector, Trace Exporter","category":"architecture","content":"Community theme across 3 entities: Log Pipeline, Metrics Collector, Trace Exporter.\n\nKey facts:\n- [Log Pipeline] Logs are scrubbed of secrets before they leave the process.\n- [Metrics Collector] Metrics are exported in OpenTelemetry format every ten seconds.\n- [Trace Exporter] Distributed traces are sampled at five percent to bound exporter overhead.\n\nKeywords: bound, distributed, every, exported, exporter, five, format, leave, logs, metrics, opentelemetry, overhead."}}
+{"doc_id":"comm-storage","record_type":"context","payload":{"title":"Theme: Migration Runner, SQLite Store","category":"architecture","content":"Community theme across 2 entities: Migration Runner, SQLite Store.\n\nKey facts:\n- [Migration Runner] Schema migrations are versioned and applied idempotently at startup.\n- [SQLite Store] The store runs in write ahead log mode for concurrent reads during writes.\n\nKeywords: ahead, applied, concurrent, idempotently, log, migrations, mode, reads, runs, schema, startup, store."}}

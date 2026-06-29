@@ -1,0 +1,12 @@
+query-id	corpus-id	grade
+q-theme-auth	obs-auth-throttle	1
+q-theme-auth	obs-jwt-rotate	1
+q-theme-auth	obs-refresh-reuse	1
+q-theme-auth	comm-auth	3
+q-theme-observability	obs-metrics-otel	1
+q-theme-observability	obs-trace-sampling	1
+q-theme-observability	obs-log-scrub	1
+q-theme-observability	comm-observability	3
+q-theme-storage	obs-sqlite-wal	1
+q-theme-storage	obs-migration-versioned	1
+q-theme-storage	comm-storage	3

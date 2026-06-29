@@ -1,0 +1,8 @@
+# Three disconnected cliques → exactly three communities (auth, observability, storage).
+{"from":"ent-auth-service","to":"ent-jwt-library","relation":"uses"}
+{"from":"ent-jwt-library","to":"ent-refresh-token-cache","relation":"depends_on"}
+{"from":"ent-auth-service","to":"ent-refresh-token-cache","relation":"uses"}
+{"from":"ent-metrics-collector","to":"ent-trace-exporter","relation":"related_to"}
+{"from":"ent-trace-exporter","to":"ent-log-pipeline","relation":"related_to"}
+{"from":"ent-metrics-collector","to":"ent-log-pipeline","relation":"related_to"}
+{"from":"ent-sqlite-store","to":"ent-migration-runner","relation":"related_to"}

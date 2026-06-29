@@ -2,5 +2,6 @@
 //! slots in without touching the metrics or the others.
 
 pub mod redaction;
+pub mod reflection;
 pub mod retrieval;
 pub mod supersession;

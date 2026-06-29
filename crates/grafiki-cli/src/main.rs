@@ -26,10 +26,10 @@ use grafiki_core::{
     import_agent_transcripts, import_memory, ingest_capture_event, init_project,
     list_agent_queries, list_candidates, list_capture_events, list_context, list_events,
     list_sessions, list_state, load_capture_config, log_decision, process_embedding_jobs,
-    propose_candidate, propose_capture_candidates, reject_candidate, save_entity, search_memory,
-    start_capture_session, start_session, stop_capture_session, update_capture_config,
-    update_context, update_decision, update_entity, update_observation, update_relation,
-    update_session, upsert_state, AddContextOptions, AgentMemoryBriefing,
+    propose_candidate, propose_capture_candidates, reject_candidate, run_reflection, save_entity,
+    search_memory, start_capture_session, start_session, stop_capture_session,
+    update_capture_config, update_context, update_decision, update_entity, update_observation,
+    update_relation, update_session, upsert_state, AddContextOptions, AgentMemoryBriefing,
     AgentTranscriptImportReport, ApproveCandidateOptions, AskMemoryOptions,
     BulkCandidateReviewOptions, BulkCandidateReviewReport, CandidateMutationReport,
     CaptureCandidateReport, CaptureConfigOptions, CaptureConfigReport, CaptureEvent,
@@ -42,9 +42,9 @@ use grafiki_core::{
     IngestCaptureEventOptions, InitOptions, ListAgentQueriesOptions, ListCandidatesOptions,
     ListCaptureEventsOptions, LogDecisionOptions, ProcessEmbeddingsOptions,
     ProcessEmbeddingsReport, ProjectReportOptions, ProjectResolveOptions, ProposeCandidateOptions,
-    ProposeCaptureCandidatesOptions, RejectCandidateOptions, SaveEntityOptions, Scope,
-    SearchMemoryOptions, SearchMode as CoreSearchMode, SessionLogOptions, StartCaptureOptions,
-    StartSessionOptions, StateListOptions, StatusOptions, StopCaptureOptions,
+    ProposeCaptureCandidatesOptions, RejectCandidateOptions, RunReflectionOptions,
+    SaveEntityOptions, Scope, SearchMemoryOptions, SearchMode as CoreSearchMode, SessionLogOptions,
+    StartCaptureOptions, StartSessionOptions, StateListOptions, StatusOptions, StopCaptureOptions,
     UpdateCaptureConfigOptions, UpdateContextOptions, UpdateDecisionOptions, UpdateEntityOptions,
     UpdateObservationOptions, UpdateRelationOptions, UpdateSessionOptions, UpsertStateOptions,
 };
@@ -364,6 +364,33 @@ enum Command {
 
         #[arg(long, value_enum, default_value_t = GraphOutputFormat::Plain)]
         format: GraphOutputFormat,
+    },
+
+    /// Detect entity communities and propose extractive reflection summaries
+    /// (pending review). Manual only — never runs automatically.
+    Reflect {
+        /// Explicit project name. Defaults to .grafiki detection, then directory name.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Slash-delimited scope to reflect over (single scope in v1).
+        #[arg(long, default_value = "")]
+        scope: String,
+
+        /// Minimum community size to summarize (a lone entity is not a theme).
+        #[arg(long, default_value_t = 2)]
+        min_size: usize,
+
+        /// Re-propose even if an equivalent reflection candidate already exists.
+        #[arg(long)]
+        force: bool,
+
+        /// Directory used for project detection.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        #[arg(long, value_enum, default_value_t = OutputFormat::Plain)]
+        format: OutputFormat,
     },
 
     /// Generate a lightweight project memory report.
@@ -2178,6 +2205,53 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 GraphOutputFormat::Plain => print_graph_plain(&report),
                 GraphOutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
                 GraphOutputFormat::Dot => println!("{}", graph_to_dot(&report)),
+            }
+        }
+        Command::Reflect {
+            project,
+            scope,
+            min_size,
+            force,
+            path,
+            format,
+        } => {
+            let mut options = RunReflectionOptions::new(scope, path);
+            options.project_name = project;
+            options.min_community_size = min_size;
+            options.force = force;
+            let report = run_reflection(options)?;
+            match format {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+                OutputFormat::Plain | OutputFormat::Md => {
+                    println!(
+                        "Reflection over scope '{}': {} communities detected, {} summarized, \
+                         {} candidate(s) proposed for review ({} skipped existing, {} too large).",
+                        report.scope,
+                        report.communities_detected,
+                        report.communities_summarized,
+                        report.candidates_created,
+                        report.skipped_existing,
+                        report.skipped_too_large,
+                    );
+                    for detail in &report.details {
+                        if detail.status == "created" {
+                            println!(
+                                "  + [{}] {} entities, {} facts → candidate {}",
+                                detail.community_id,
+                                detail.member_entity_ids.len(),
+                                detail.observation_count,
+                                detail.candidate_id.as_deref().unwrap_or("-"),
+                            );
+                        } else {
+                            println!(
+                                "  - [{}] {} entities → {}",
+                                detail.community_id,
+                                detail.member_entity_ids.len(),
+                                detail.status,
+                            );
+                        }
+                    }
+                }
             }
         }
         Command::Report {
