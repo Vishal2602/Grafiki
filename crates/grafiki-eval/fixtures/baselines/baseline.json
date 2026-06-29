@@ -1,7 +1,7 @@
 {
   "redaction": {
     "max_leaks": 0,
-    "min_precision": 0.8571,
+    "min_precision": 0.8666,
     "min_recall": 1.0
   },
   "retrieval": {

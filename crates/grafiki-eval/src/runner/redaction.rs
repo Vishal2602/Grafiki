@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use grafiki_core::redact_text;
+use grafiki_core::{redact_json, redact_text};
 
 use crate::config::EvalResult;
 use crate::dataset::{RedactionCase, RedactionDataset};
@@ -76,14 +76,46 @@ fn mask(literal: &str) -> String {
     format!("{head}… ({} chars)", literal.chars().count())
 }
 
-fn case_input(case: &RedactionCase) -> EvalResult<String> {
-    if let Some(text) = &case.text {
-        Ok(text.clone())
-    } else if let Some(json) = &case.json_payload {
-        Ok(serde_json::to_string(json)?)
-    } else {
-        Err("redaction case has neither `text` nor `json_payload`".into())
+/// Produce the (input, redacted-output) string pair for a case, routing each
+/// input type through the redactor production actually applies to it: text via
+/// `redact_text` (the `ingest_capture_event` path) and `json_payload` via the
+/// structured `redact_json` (the `propose_candidate` path). The two differ — the
+/// JSON path is value-level and key-aware — so testing only the text path would
+/// be blind to leaks on the dominant candidate-payload sink.
+fn redact_case(case: &RedactionCase) -> EvalResult<(String, String)> {
+    match (&case.text, &case.json_payload) {
+        (Some(t), _) => {
+            let (out, _) = redact_text(t);
+            Ok((t.clone(), out))
+        }
+        (None, Some(j)) => {
+            let (redacted, _) = redact_json(j);
+            Ok((serde_json::to_string(j)?, serde_json::to_string(&redacted)?))
+        }
+        (None, None) => Err("redaction case has neither `text` nor `json_payload`".into()),
     }
+}
+
+/// A planted secret leaks if its literal — or a long contiguous run of it —
+/// survives redaction. The substring check catches *partial* redaction: the
+/// redactor trims surrounding punctuation and replaces only the trimmed core, so
+/// a near-miss could leave most of the secret behind, which a bare
+/// `contains(literal)` would wrongly score as a clean true positive.
+fn leaked(literal: &str, output: &str) -> bool {
+    if output.contains(literal) {
+        return true;
+    }
+    let chars: Vec<char> = literal.chars().collect();
+    let n = chars.len();
+    if n < 16 {
+        // Short literals: exact match only, to avoid coincidental substring hits.
+        return false;
+    }
+    let threshold = (n * 3 / 4).max(16);
+    (0..=n - threshold).any(|start| {
+        let sub: String = chars[start..start + threshold].iter().collect();
+        output.contains(&sub)
+    })
 }
 
 pub fn run_redaction(dataset: &RedactionDataset) -> EvalResult<RedactionReport> {
@@ -96,8 +128,7 @@ pub fn run_redaction(dataset: &RedactionDataset) -> EvalResult<RedactionReport> 
     let mut benign_count = 0usize;
 
     for case in &dataset.cases {
-        let input = case_input(case)?;
-        let (output, _changed) = redact_text(&input);
+        let (input, output) = redact_case(case)?;
 
         // Benign cases (no planted secret) drive precision: any modification is
         // an over-redaction (FP), else a true negative.
@@ -119,8 +150,7 @@ pub fn run_redaction(dataset: &RedactionDataset) -> EvalResult<RedactionReport> 
         // Positive cases: each planted secret is a detection unit.
         for gs in &case.gold_secrets {
             positive_secret_count += 1;
-            let leaked = output.contains(&gs.literal);
-            if leaked {
+            if leaked(&gs.literal, &output) {
                 overall.false_neg += 1;
                 *fn_by_type.entry(gs.secret_type.clone()).or_default() += 1;
                 leaks.push(Leak {

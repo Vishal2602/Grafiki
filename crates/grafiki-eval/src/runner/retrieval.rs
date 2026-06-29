@@ -79,13 +79,30 @@ pub fn run_retrieval(
         .map(|d| (d.doc_id.as_str(), d.record_type.as_str()))
         .collect();
 
+    // Seed-time signal: were embeddings actually built for the corpus? This (not
+    // a per-query empty result) is what gates the semantic/hybrid modes.
+    let embeddings_built = corpus.embedding.as_ref().is_some_and(|e| e.processed > 0);
+
     let mcfg = MetricConfig::default();
     let mut mode_results: Vec<ModeResult> = Vec::new();
     let mut search_ms: u128 = 0;
 
     for &mode in modes {
+        // Determinism guard: never report a silent keyword-fallback as a
+        // semantic/hybrid result (EVAL_DESIGN §2.3). Gate on the seed-time signal,
+        // not a single zero-match query — a semantic query can legitimately return
+        // no positive-cosine hit without meaning the index is missing.
+        if !matches!(mode, SearchMode::Keyword) && !embeddings_built {
+            return Err(format!(
+                "mode '{}' requested but no embeddings were built for the corpus \
+                 (process_embedding_jobs produced 0 vectors) — this would be a keyword \
+                 fallback masquerading as a semantic result",
+                mode_label(mode)
+            )
+            .into());
+        }
+
         let mut runs: Runs = BTreeMap::new();
-        let mut semantic_available = true;
         let mut fallback_count = 0usize;
 
         for q in &dataset.queries {
@@ -102,9 +119,6 @@ pub fn run_retrieval(
             })?;
             search_ms += t.elapsed().as_millis();
 
-            if !report.semantic_available {
-                semantic_available = false;
-            }
             if report.fallback.is_some() {
                 fallback_count += 1;
             }
@@ -120,17 +134,6 @@ pub fn run_retrieval(
                 })
                 .collect();
             runs.insert(q.id.clone(), run);
-        }
-
-        // Determinism guard: never report a silent keyword-fallback as a
-        // semantic/hybrid result (see EVAL_DESIGN §2.3).
-        if !matches!(mode, SearchMode::Keyword) && !semantic_available {
-            return Err(format!(
-                "mode '{}' requested but semantic_available=false — embeddings were not built, \
-                 so this would be a keyword fallback masquerading as a semantic result",
-                mode_label(mode)
-            )
-            .into());
         }
 
         let overall = ir::evaluate(&dataset.qrels, &runs, &mcfg);
@@ -162,7 +165,7 @@ pub fn run_retrieval(
 
         mode_results.push(ModeResult {
             mode,
-            semantic_available,
+            semantic_available: embeddings_built,
             fallback_count,
             overall,
             per_record_type,

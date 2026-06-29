@@ -97,7 +97,7 @@ pub fn bootstrap_ci(samples: &[f64], iters: usize, seed: u64) -> Estimate {
         }
         means.push(acc / n as f64);
     }
-    means.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    means.sort_by(|a, b| a.total_cmp(b));
     let m = mean(&means);
     let var = means.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / means.len() as f64;
     Estimate {
@@ -167,7 +167,7 @@ pub fn holm(pvalues: &[f64]) -> Vec<f64> {
     }
     // Sort indices ascending by p-value.
     let mut order: Vec<usize> = (0..m).collect();
-    order.sort_by(|&i, &j| pvalues[i].partial_cmp(&pvalues[j]).unwrap());
+    order.sort_by(|&i, &j| pvalues[i].total_cmp(&pvalues[j]));
     let mut adjusted = vec![0.0f64; m];
     let mut running_max = 0.0f64;
     for (rank, &idx) in order.iter().enumerate() {

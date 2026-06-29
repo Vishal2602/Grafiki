@@ -96,6 +96,18 @@ pub fn seed_retrieval(
     let mut record_to_doc = HashMap::new();
     for doc in &dataset.corpus {
         let scope = doc.scope.clone().unwrap_or_else(|| EVAL_SCOPE.to_string());
+        // The retrieval arm searches a single scope (EVAL_SCOPE), whose chain is
+        // ["", EVAL_SCOPE]. A doc seeded into any other scope would be written and
+        // embedded but never returned, silently capping its query's metrics — so
+        // refuse it up front rather than report a misleading low score.
+        if !scope.is_empty() && scope != EVAL_SCOPE {
+            return Err(format!(
+                "corpus doc '{}' uses scope '{}' outside the eval search scope '{}' \
+                 (use '{}' or omit `scope`)",
+                doc.doc_id, scope, EVAL_SCOPE, EVAL_SCOPE
+            )
+            .into());
+        }
         let p = &doc.payload;
         let key = match doc.record_type.as_str() {
             "entity" => {

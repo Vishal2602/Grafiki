@@ -17,7 +17,7 @@
 {"template":"Authorization Bearer {S} received","assemble":["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",".","eyJzdWIiOiIxMjM0NTY3ODkwIn0",".","SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"],"secret_type":"jwt","benign":false,"context":"transcript"}
 {"text":"database:\n  password: hunter2supersecretvalue","gold_secrets":[{"literal":"hunter2supersecretvalue","type":"password"}],"benign":false,"context":"config"}
 {"json_payload":{"client_secret":"abcdef1234567890clientsecretvalue","client_id":"public-123"},"gold_secrets":[{"literal":"abcdef1234567890clientsecretvalue","type":"client_secret"}],"benign":false,"context":"json"}
-{"assemble":["-----BEGIN RSA PRIVATE ","KEY-----\n","MIIEowIBAAKCAQEAxQ2bP9notarealkeybodyline\n","AAAABBBBCCCCDDDD\n","-----END RSA PRIVATE ","KEY-----"],"gold_secrets":[{"literal":"MIIEowIBAAKCAQEAxQ2bP9notarealkeybodyline","type":"private_key"}],"benign":false,"context":"file"}
+{"assemble":["-----BEGIN RSA PRIVATE ","KEY-----\n","MIIEowIBAAKCAQEAxQ2bP9notarealkeybodyline\n","AAAABBBBCCCCDDDDnotarealsecondbodyline\n","-----END RSA PRIVATE ","KEY-----"],"gold_secrets":[{"literal":"MIIEowIBAAKCAQEAxQ2bP9notarealkeybodyline","type":"private_key"},{"literal":"AAAABBBBCCCCDDDDnotarealsecondbodyline","type":"private_key"}],"benign":false,"context":"file"}
 {"text":"Merged commit 9f1c2ab3d4e5f60718293a4b5c6d7e8f90123456 into main","gold_secrets":[],"benign":true,"context":"git"}
 {"text":"Request id 550e8400-e29b-41d4-a716-446655440000 completed","gold_secrets":[],"benign":true,"context":"log"}
 {"text":"Cache entry dGhpcyBpcyBub3QgYSBzZWNyZXQ stored","gold_secrets":[],"benign":true,"context":"log"}

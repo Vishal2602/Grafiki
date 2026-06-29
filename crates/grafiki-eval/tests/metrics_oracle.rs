@@ -52,6 +52,19 @@ fn expected() -> BTreeMap<(&'static str, &'static str), f64> {
     m.insert(("q2", "map"), 1.0);
     m.insert(("q2", "success@1"), 1.0);
     m.insert(("q2", "success@5"), 1.0);
+    // q3 — relevant x1,x2,x3; run omits x3 (recall < 1) and interleaves u1
+    // (unjudged) at rank 2, pinning the unjudged-doc and missed-relevant conventions.
+    m.insert(("q3", "ndcg@1"), 1.0);
+    m.insert(("q3", "ndcg@3"), 0.7984848580994974);
+    m.insert(("q3", "ndcg@5"), 0.7984848580994974);
+    m.insert(("q3", "ndcg@10"), 0.7984848580994974);
+    m.insert(("q3", "recall@5"), 0.6666666666666666);
+    m.insert(("q3", "recall@10"), 0.6666666666666666);
+    m.insert(("q3", "P@5"), 0.4);
+    m.insert(("q3", "mrr"), 1.0);
+    m.insert(("q3", "map"), 0.5555555555555555);
+    m.insert(("q3", "success@1"), 1.0);
+    m.insert(("q3", "success@5"), 1.0);
     m
 }
 
@@ -73,10 +86,16 @@ fn pytrec_eval_parity() {
         "q2".to_string(),
         qrel(&[("a", 1), ("b", 1), ("c", 0), ("d", 2)]),
     );
+    qrels.insert(
+        "q3".to_string(),
+        qrel(&[("x1", 2), ("x2", 1), ("x3", 1), ("x4", 0)]),
+    );
 
     let mut runs: Runs = BTreeMap::new();
     runs.insert("q1".to_string(), run(&["d1", "d2", "d3", "d4", "d5", "d6"]));
     runs.insert("q2".to_string(), run(&["b", "d", "a", "c"]));
+    // u1 is unjudged (absent from qrels); x3 is relevant but not retrieved.
+    runs.insert("q3".to_string(), run(&["x1", "u1", "x2", "x4"]));
 
     let scores = ir::evaluate(&qrels, &runs, &MetricConfig::default());
 
@@ -93,8 +112,9 @@ fn pytrec_eval_parity() {
         }
     }
 
-    // Spot-check the macro-average matches pytrec_eval's mean over queries.
-    assert!((scores.macro_avg["ndcg@10"] - 0.8880699827_f64).abs() < 1e-9);
-    assert!((scores.macro_avg["map"] - 0.9020833333_f64).abs() < 1e-9);
-    assert!((scores.macro_avg["P@5"] - 0.7).abs() < 1e-9);
+    // Spot-check the macro-average matches pytrec_eval's mean over the 3 queries.
+    assert!((scores.macro_avg["ndcg@10"] - 0.8582082745671441_f64).abs() < 1e-9);
+    assert!((scores.macro_avg["map"] - 0.786574074074074_f64).abs() < 1e-9);
+    assert!((scores.macro_avg["P@5"] - 0.6).abs() < 1e-9);
+    assert!((scores.macro_avg["recall@10"] - 0.8888888888888888_f64).abs() < 1e-9);
 }

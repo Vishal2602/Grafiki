@@ -146,23 +146,33 @@ impl RetrievalDataset {
         Ok(dataset)
     }
 
-    /// Sanity checks: unique doc-ids/query-ids and qrels that reference real ids.
+    /// Sanity checks: unique doc-ids/query-ids and qrels that reference real
+    /// queries **and** real corpus docs (a qrels corpus-id with no corpus doc can
+    /// never be retrieved and would silently cap a query's metrics).
     fn validate(&self) -> EvalResult<()> {
         let mut doc_ids = std::collections::HashSet::new();
         for d in &self.corpus {
-            if !doc_ids.insert(&d.doc_id) {
+            if !doc_ids.insert(d.doc_id.as_str()) {
                 return Err(format!("duplicate corpus doc_id '{}'", d.doc_id).into());
             }
         }
         let mut query_ids = std::collections::HashSet::new();
         for q in &self.queries {
-            if !query_ids.insert(&q.id) {
+            if !query_ids.insert(q.id.as_str()) {
                 return Err(format!("duplicate query _id '{}'", q.id).into());
             }
         }
-        for qid in self.qrels.keys() {
-            if !query_ids.contains(qid) {
+        for (qid, qrel) in &self.qrels {
+            if !query_ids.contains(qid.as_str()) {
                 return Err(format!("qrels reference unknown query '{qid}'").into());
+            }
+            for doc in qrel.keys() {
+                if !doc_ids.contains(doc.as_str()) {
+                    return Err(format!(
+                        "qrels for query '{qid}' reference unknown corpus doc '{doc}'"
+                    )
+                    .into());
+                }
             }
         }
         Ok(())
@@ -257,7 +267,26 @@ pub struct RedactionDataset {
 impl RedactionDataset {
     pub fn load(path: &Path) -> EvalResult<Self> {
         let raw: Vec<RawRedactionCase> = read_jsonl(path)?;
-        let cases = raw.into_iter().map(RawRedactionCase::resolve).collect();
+        let cases: Vec<RedactionCase> = raw.into_iter().map(RawRedactionCase::resolve).collect();
+        // The scorer keys benign-vs-positive off gold_secrets emptiness; enforce
+        // that the declared `benign` flag agrees, so an authoring mistake fails
+        // loudly instead of silently mis-scoring.
+        for (i, c) in cases.iter().enumerate() {
+            if c.benign != c.gold_secrets.is_empty() {
+                return Err(format!(
+                    "redaction case {} (context '{}'): benign={} but gold_secrets is {}",
+                    i + 1,
+                    c.context,
+                    c.benign,
+                    if c.gold_secrets.is_empty() {
+                        "empty"
+                    } else {
+                        "non-empty"
+                    }
+                )
+                .into());
+            }
+        }
         let name = path
             .file_stem()
             .and_then(|n| n.to_str())

@@ -345,6 +345,18 @@ pub fn check_regressions(
 ) -> Vec<String> {
     let mut failures = Vec::new();
 
+    // Symmetric guard: if the baseline declares an arm but that arm was not run,
+    // fail loudly. Otherwise `--arm retrieval --fail-on-regression` against a full
+    // baseline would silently skip the security-critical redaction/leak gate.
+    if baseline.get("retrieval").is_some() && retrieval.is_none() {
+        failures
+            .push("baseline declares a `retrieval` gate but the retrieval arm was not run".into());
+    }
+    if baseline.get("redaction").is_some() && redaction.is_none() {
+        failures
+            .push("baseline declares a `redaction` gate but the redaction arm was not run".into());
+    }
+
     if let (Some(rb), Some(rep)) = (baseline.get("retrieval"), retrieval) {
         let primary_mode = rb
             .get("primary_mode")
@@ -414,6 +426,11 @@ pub fn build_baseline(
     redaction: Option<&RedactionReport>,
     tolerance: f64,
 ) -> Value {
+    // Round floors DOWN (4 dp) so the stored threshold is always ≤ the achievable
+    // value — otherwise a byte-identical re-run could fall just below a rounded-up
+    // floor and the gate would flap.
+    let floor4 = |x: f64| (x * 10000.0).floor() / 10000.0;
+
     let mut obj = serde_json::Map::new();
     if let Some(rep) = retrieval {
         // Pin to the first mode run (keyword in the deterministic CI gate).
@@ -423,17 +440,22 @@ pub fn build_baseline(
             r.insert("tolerance".into(), json!(tolerance));
             for metric in ["ndcg@10", "recall@10"] {
                 let v = m.overall.macro_avg.get(metric).copied().unwrap_or(0.0);
-                r.insert(metric.into(), json!((v * 10000.0).round() / 10000.0));
+                r.insert(metric.into(), json!(floor4(v)));
             }
             obj.insert("retrieval".into(), Value::Object(r));
         }
     }
     if let Some(rep) = redaction {
-        let p = (rep.overall.precision() * 10000.0).round() / 10000.0;
-        let rcl = (rep.overall.recall() * 10000.0).round() / 10000.0;
+        // max_leaks is hard-coded to 0: a secret leak is never an acceptable
+        // baseline, so re-snapshotting a regressed redactor must not bake in a
+        // tolerance for leaks.
         obj.insert(
             "redaction".into(),
-            json!({ "max_leaks": rep.leaks.len(), "min_precision": p, "min_recall": rcl }),
+            json!({
+                "max_leaks": 0,
+                "min_precision": floor4(rep.overall.precision()),
+                "min_recall": floor4(rep.overall.recall())
+            }),
         );
     }
     Value::Object(obj)

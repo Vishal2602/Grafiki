@@ -198,7 +198,10 @@ impl Default for MetricConfig {
             precision_cutoffs: vec![5, 10],
             success_cutoffs: vec![1, 5],
             judged_cutoff: 10,
-            mrr_cutoff: Some(10),
+            // Unbounded, matching trec_eval / pytrec_eval `recip_rank` (the oracle
+            // maps "mrr" → recip_rank). A cut variant would diverge once the first
+            // relevant doc falls past the cutoff.
+            mrr_cutoff: None,
             rel_threshold: 1,
             gain: GainKind::Linear,
         }

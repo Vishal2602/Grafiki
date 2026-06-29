@@ -5872,6 +5872,41 @@ pub fn redact_text(input: &str) -> (String, bool) {
     (text, changed)
 }
 
+/// Key names whose value is treated as a secret, both in assignment-style text
+/// and in JSON candidate payloads. Hoisted to module scope so the text redactor
+/// and the (key-aware) JSON redactor share one source of truth.
+const SECRET_KEYS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "access_token",
+    "auth_token",
+    "client_secret",
+    "secret",
+    "password",
+    "private_key",
+    "github_token",
+    "openai_api_key",
+    "anthropic_api_key",
+];
+
+/// True when `key` names a secret (case-insensitive substring match).
+fn key_looks_secret(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    SECRET_KEYS.iter().any(|k| lower.contains(k))
+}
+
+/// Public eval/test seam over the structured (JSON) redaction path used for
+/// candidate payloads — the `propose_candidate` sink, which redacts each JSON
+/// value rather than a serialized blob. Returns the redacted document and
+/// whether anything changed. Complements [`redact_text`] (the `ingest_capture_event`
+/// path); the two cover both primary secret sinks.
+pub fn redact_json(value: &serde_json::Value) -> (serde_json::Value, bool) {
+    let mut redacted = value.clone();
+    redact_json_value(&mut redacted);
+    let changed = redacted != *value;
+    (redacted, changed)
+}
+
 fn redact_sensitive_text(text: &mut String) -> bool {
     let original = text.clone();
     let mut redacted = redact_assignment_like_secrets(&original);
@@ -5899,7 +5934,17 @@ fn redact_json_value(value: &mut serde_json::Value) {
             }
         }
         serde_json::Value::Object(map) => {
-            for (_key, item) in map.iter_mut() {
+            for (key, item) in map.iter_mut() {
+                // Key-aware: a string value under a secret-named key (e.g.
+                // "client_secret", "password") is redacted whole, even when the
+                // value alone carries no `=`/`:`/token-prefix the text passes
+                // would catch. This closes a leak on the candidate-payload path.
+                if key_looks_secret(key) {
+                    if let serde_json::Value::String(_) = item {
+                        *item = serde_json::Value::String("[REDACTED_SECRET]".to_owned());
+                        continue;
+                    }
+                }
                 redact_json_value(item);
             }
         }
@@ -5934,19 +5979,6 @@ fn redact_private_key_blocks(input: &str) -> String {
 }
 
 fn redact_assignment_like_secrets(input: &str) -> String {
-    const SECRET_KEYS: &[&str] = &[
-        "api_key",
-        "apikey",
-        "access_token",
-        "auth_token",
-        "client_secret",
-        "secret",
-        "password",
-        "private_key",
-        "github_token",
-        "openai_api_key",
-        "anthropic_api_key",
-    ];
     let mut output = Vec::new();
     for line in input.lines() {
         let lower = line.to_ascii_lowercase();
@@ -9718,6 +9750,31 @@ mod tests {
         assert!(text.contains("[REDACTED_ANTHROPIC_KEY]"));
         // Newline structure is preserved (no whitespace collapse).
         assert_eq!(text.lines().count(), 7);
+    }
+
+    #[test]
+    fn redact_json_is_key_aware_on_candidate_payloads() {
+        // A secret value whose key names a secret but whose value carries no
+        // `=`/`:`/token-prefix must still be redacted on the JSON (propose) path —
+        // the text passes alone would leave it verbatim.
+        let payload = serde_json::json!({
+            "client_secret": "abcdef1234567890clientsecretvalue",
+            "client_id": "public-123",
+            "note": "nothing sensitive here"
+        });
+        let (redacted, changed) = super::redact_json(&payload);
+        assert!(changed);
+        assert_eq!(redacted["client_secret"], "[REDACTED_SECRET]");
+        // Non-secret keys are left intact.
+        assert_eq!(redacted["client_id"], "public-123");
+        assert_eq!(redacted["note"], "nothing sensitive here");
+        let blob = serde_json::to_string(&redacted).unwrap();
+        assert!(!blob.contains("abcdef1234567890clientsecretvalue"));
+
+        // Secret-free payloads round-trip unchanged.
+        let clean = serde_json::json!({ "title": "hello", "count": 3 });
+        let (_, changed) = super::redact_json(&clean);
+        assert!(!changed);
     }
 
     #[test]
