@@ -3251,6 +3251,75 @@ pub fn import_memory(options: ImportOptions) -> Result<ImportReport> {
     })
 }
 
+/// H2 automated detection (real embedding model only): suggest a prior
+/// observation that a newly-proposed observation about the **same entity** likely
+/// supersedes, by embedding similarity above a threshold. The embedding gate only
+/// narrows *which* facts are about the same thing — the supersession itself is
+/// still arbitrated at approval and held for human review (the suggestion is a
+/// `supersedes` hint on the candidate, never an auto-applied write). Returns the
+/// best same-entity match and its cosine score.
+#[cfg(feature = "fastembed")]
+fn detect_observation_conflict(
+    connection: &Connection,
+    scope_chain: &[String],
+    entity_name: &str,
+    content: &str,
+) -> Result<Option<(String, f32)>> {
+    use crate::embeddings::{configured_embedding_provider, cosine_similarity, EmbeddingProvider};
+    const THRESHOLD: f32 = 0.55;
+
+    let entity_sql = scoped_query(
+        "SELECT id FROM entities WHERE name = ? AND scope IN ({scopes}) LIMIT 1",
+        scope_chain.len(),
+    );
+    let mut entity_params: Vec<&dyn rusqlite::ToSql> = vec![&entity_name];
+    entity_params.extend(scope_chain.iter().map(|s| s as &dyn rusqlite::ToSql));
+    let entity_id: Option<String> = connection
+        .query_row(&entity_sql, entity_params.as_slice(), |row| row.get(0))
+        .optional()?;
+    let Some(entity_id) = entity_id else {
+        return Ok(None);
+    };
+
+    let provider = configured_embedding_provider()?;
+    let query_embedding = provider.embed(content)?;
+    let dimension = provider.dimension() as i64;
+
+    let mut statement = connection.prepare(
+        "
+        SELECT v.record_id, v.embedding
+        FROM embedding_vectors v
+        JOIN observations o ON o.id = v.record_id
+        WHERE v.record_type = 'observation'
+          AND v.provider = ?1 AND v.model = ?2 AND v.dimension = ?3
+          AND o.valid_to IS NULL AND o.entity_id = ?4
+        ",
+    )?;
+    let rows = statement.query_map(
+        params![
+            provider.provider_name(),
+            provider.model_name(),
+            dimension,
+            entity_id
+        ],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+
+    let mut best: Option<(String, f32)> = None;
+    for row in rows {
+        let (id, embedding_json) = row?;
+        let embedding: Vec<f32> = serde_json::from_str(&embedding_json)?;
+        if embedding.len() != query_embedding.len() {
+            continue;
+        }
+        let score = cosine_similarity(&query_embedding, &embedding);
+        if score >= THRESHOLD && best.as_ref().is_none_or(|(_, s)| score > *s) {
+            best = Some((id, score));
+        }
+    }
+    Ok(best)
+}
+
 pub fn propose_candidate(options: ProposeCandidateOptions) -> Result<CandidateMutationReport> {
     let record_type = validate_candidate_record_type(options.record_type.trim())?;
     let source_type = validate_candidate_source_type(options.source_type.trim())?;
@@ -3273,6 +3342,42 @@ pub fn propose_candidate(options: ProposeCandidateOptions) -> Result<CandidateMu
     // memory import all route through here), mirroring ingest_capture_event.
     let mut payload = options.payload;
     redact_json_value(&mut payload);
+
+    // H2 automated detection (real embedding model builds only): if a new
+    // observation about an existing entity isn't already marked as superseding a
+    // prior fact, suggest the most-similar same-entity observation as a
+    // `supersedes` hint. The candidate stays pending for human review; arbitration
+    // runs at approval. Best-effort — detection must never fail the proposal.
+    #[cfg(feature = "fastembed")]
+    if record_type == "observation" && payload.get("supersedes").and_then(|v| v.as_str()).is_none()
+    {
+        let entity_name = payload
+            .get("entity_name")
+            .or_else(|| payload.get("name"))
+            .or_else(|| payload.get("title"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let content = payload
+            .get("content")
+            .or_else(|| payload.get("observe"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        if let (Some(name), Some(content)) = (entity_name, content) {
+            if !content.is_empty() {
+                if let Ok(Some((old_id, score))) = detect_observation_conflict(
+                    &connection,
+                    scope.chain().as_slice(),
+                    &name,
+                    &content,
+                ) {
+                    payload["supersedes"] = serde_json::json!(old_id);
+                    payload["conflict_kind"] = serde_json::json!("review");
+                    payload["conflict_similarity"] = serde_json::json!(score);
+                }
+            }
+        }
+    }
+
     let rationale = options.rationale.map(|mut value| {
         redact_sensitive_text(&mut value);
         value
@@ -9259,6 +9364,69 @@ mod tests {
                 .iter()
                 .any(|r| r.snippet.contains("us-east-1")),
             "stale observation must be suppressed after supersession"
+        );
+    }
+
+    #[cfg(feature = "fastembed")]
+    #[test]
+    fn auto_detects_observation_conflict_via_embeddings() {
+        let (_temp, home, project_dir) = setup_project();
+        let scope = "example-project/core";
+
+        // Seed a fact and build its embedding.
+        save_entity(SaveEntityOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            name: "Deploy Target".to_owned(),
+            entity_type: "service".to_owned(),
+            observe: Some("We deploy the application to AWS us-east-1".to_owned()),
+            category: "architecture".to_owned(),
+            scope: scope.to_owned(),
+            relate: None,
+        })
+        .unwrap();
+        process_embedding_jobs(ProcessEmbeddingsOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            scope: "*".to_owned(),
+            limit: 1000,
+            rebuild: false,
+        })
+        .unwrap();
+
+        // Propose a contradicting fact WITHOUT an explicit supersedes.
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "transcript".to_owned(),
+            source: None,
+            record_type: "observation".to_owned(),
+            payload: serde_json::json!({
+                "entity_name": "Deploy Target",
+                "content": "We now deploy the application to GCP europe-west1",
+            }),
+            scope: scope.to_owned(),
+            confidence: 0.9,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+
+        // Detection should have auto-annotated a supersedes hint (routed to review).
+        assert!(
+            proposed.candidate.payload.get("supersedes").is_some(),
+            "automated detection should suggest a supersedes target"
+        );
+        assert_eq!(
+            proposed
+                .candidate
+                .payload
+                .get("conflict_kind")
+                .and_then(|v| v.as_str()),
+            Some("review")
         );
     }
 

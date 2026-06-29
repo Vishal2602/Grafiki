@@ -285,7 +285,7 @@ fn auto_embedding_provider() -> Result<RuntimeEmbeddingProvider> {
 fn auto_embedding_provider_summary() -> EmbeddingProviderSummary {
     #[cfg(feature = "fastembed")]
     {
-        return embedding_provider_summary(
+        embedding_provider_summary(
             "auto",
             "fastembed",
             "sentence-transformers/all-MiniLM-L6-v2",
@@ -296,7 +296,7 @@ fn auto_embedding_provider_summary() -> EmbeddingProviderSummary {
                  offline use."
                     .to_owned(),
             ),
-        );
+        )
     }
     #[cfg(not(feature = "fastembed"))]
     {
@@ -313,9 +313,9 @@ fn auto_embedding_provider_summary() -> EmbeddingProviderSummary {
 fn fastembed_provider() -> Result<RuntimeEmbeddingProvider> {
     #[cfg(feature = "fastembed")]
     {
-        return Ok(RuntimeEmbeddingProvider::FastEmbed(
+        Ok(RuntimeEmbeddingProvider::FastEmbed(
             FastEmbedProvider::try_new()?,
-        ));
+        ))
     }
     #[cfg(not(feature = "fastembed"))]
     {
@@ -328,13 +328,13 @@ fn fastembed_provider() -> Result<RuntimeEmbeddingProvider> {
 fn fastembed_provider_summary(requested_provider: &str) -> EmbeddingProviderSummary {
     #[cfg(feature = "fastembed")]
     {
-        return embedding_provider_summary(
+        embedding_provider_summary(
             requested_provider,
             "fastembed",
             "sentence-transformers/all-MiniLM-L6-v2",
             Some(384),
             None,
-        );
+        )
     }
     #[cfg(not(feature = "fastembed"))]
     {
