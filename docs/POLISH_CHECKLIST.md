@@ -70,6 +70,69 @@ Effort key: **S** ≈ <½ day · **M** ≈ ½–2 days · **L** ≈ multi-day.
 - [ ] **D18 — Cross-platform.** macOS-hardcoded `screencapture`/HOME/`kill`; Windows desktop build.
   Linux CLI already works. **M**
 
+## E. Capability roadmap (research-gap features vs SOTA)
+
+Derived from the literature survey in [RESEARCH_LANDSCAPE.md](RESEARCH_LANDSCAPE.md)
+(85 papers, full citations + concrete landing per item there). These are *new
+capabilities*, not polish — a multi-week program, sequenced after B. Suggested
+order: **H1 → (H2 + H3 + H4 in parallel) → H5 → M-tier**. H2/H3 are highest-ROI
+because they reuse Grafiki's two most underused assets (bitemporal supersession +
+the `relations` table).
+
+### E-High leverage
+
+- [ ] **H1 — Evaluation harness (there is none today; prerequisite for all of E).** A
+  `grafiki-eval` crate that replays LongMemEval/LoCoMo conversations through
+  capture→candidate→trusted and scores `grafiki_ask`, plus a BEIR-style retrieval
+  gold set (nDCG@10/recall@k) for FTS5+RRF, a SecretBench run for the redactor, and
+  a SWE-bench-derived "does memory lift resolved-rate" test. **L**
+- [ ] **H2 — Automated conflict / contradiction resolution.** On a new candidate, find
+  semantically-related trusted facts; on contradiction, set the older row's
+  `valid_to = new.valid_from` (reuse bitemporal supersession) **via the candidate
+  gate** (new `conflict` candidate type). Arbitrate on metadata, not LLM "freshness".
+  (Graphiti, Mem0.) **L**
+- [ ] **H3 — Graph-aware retrieval.** Add a 3rd RRF arm: seed from FTS5+dense top-k
+  entities, expand 1–2 hops over `relations` (respect `valid_from`/`valid_to`), run
+  Personalized PageRank, fuse its ranking. SQL recursive query + in-memory PPR, no new
+  store. (HippoRAG, G-Retriever, GraphRAG.) **M**
+- [ ] **H4 — Reranking stage.** Small local cross-encoder (or listwise LLM) reranker over
+  RRF top-N before `grafiki_ask` builds the cited answer. (RankGPT, bge-reranker.) **M**
+- [ ] **H5 — Reflection / consolidation + community summaries.** Periodic job: Leiden
+  community detection over `relations` → LLM-summarize each community → enter as a
+  **candidate** (provenance = source observation ids). Enables global "themes / what did
+  we decide about X" briefings. (Generative Agents, GraphRAG, LightRAG.) **L**
+
+### E-Medium leverage
+
+- [ ] **M-E1 — Forgetting / decay & salience.** `salience`/`last_accessed`/`access_count`
+  (derive from the agent-query audit log); recency+importance+reuse term in ranking;
+  soft decay proposes archival candidates (never hard-delete). (MemoryBank.) **M**
+- [ ] **M-E2 — Temporal-aware retrieval.** Valid-time filter/boost in the SQL + recency
+  weight in fusion; later diachronic scoring. (HyTE, TKG surveys.) **S→M**
+- [ ] **M-E3 — Calibrated candidate confidence + active-learning review order.** Confidence
+  per `extraction_candidate` (semantic entropy / source prior); sort
+  `grafiki_candidate_list` by uncertainty×representativeness. **M**
+- [ ] **M-E4 — Code-structure indexing.** Tree-sitter capture pass emits code
+  entities + def-ref/call/contains relations into the existing entity/relation tables
+  (so H3 works over symbols). (RepoGraph, code property graphs.) **M**
+- [ ] **M-E5 — MCP security hardening.** Indirect-prompt-injection guards on ingested
+  transcripts/terminal flowing back through tool metadata; read vs write/curate
+  capability split; MCPTox-style poisoning tests in H1. **M**
+- [ ] **M-E6 — PII + higher-recall secret detection.** Entropy gating + configurable rule
+  packs (gitleaks-style) + optional local PII recognizer (Presidio) at the redaction
+  boundary; measure vs SecretBench. **M**
+
+### E-Low leverage
+
+- [ ] **L-E1 — Embedding-inversion protection** (access-control `embedding_vectors`;
+  int8/binary/Matryoshka quantization). **S→M**
+- [ ] **L-E2 — Embedding-model upgrade path** (BGE-small drop-in @384-dim, or Nomic
+  long-context; the table already records provider/model/dimension). **S→M**
+- [ ] **L-E3 — Adaptive / corrective / learned retrieval** (Self-RAG/CRAG gate,
+  query-conditioned fusion weights, SPLADE learned-sparse). **M→L**
+- [ ] **L-E4 — Formal W3C PROV lineage + agent-to-agent sharing** (map `evidence_links`
+  onto PROV; expose curated memory over A2A/ANP later). **M**
+
 ---
 
 ## Recommended path to the finish line
