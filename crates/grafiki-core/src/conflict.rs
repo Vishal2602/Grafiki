@@ -39,10 +39,12 @@ pub enum ConflictVerdict {
     Review,
 }
 
-/// Attributes that hold exactly one value at a time.
+/// Attributes that hold exactly one value at a time. Entries must already be in
+/// `normalize_predicate` canonical form (a unit test enforces this). Ambiguous
+/// attributes that *can* legitimately hold several values (email, role, title)
+/// are deliberately absent → they route to review rather than auto-supersede.
 const SINGLE_VALUED: &[&str] = &[
     "employer",
-    "current_employer",
     "timezone",
     "marital_status",
     "status",
@@ -52,12 +54,9 @@ const SINGLE_VALUED: &[&str] = &[
     "country",
     "version",
     "state",
-    "role",
-    "title",
     "priority",
     "stage",
     "manager",
-    "email",
 ];
 
 /// Attributes that legitimately hold many values at once.
@@ -163,16 +162,43 @@ pub enum TemporalRelation {
     Unknown,
 }
 
-/// Compare two facts' `valid_from` timestamps. Grafiki stamps RFC3339-style
-/// `%Y-%m-%dT%H:%M:%SZ`, which is lexically sortable.
-pub fn temporal_relation(existing_valid_from: &str, incoming_valid_from: &str) -> TemporalRelation {
-    if existing_valid_from.trim().is_empty() || incoming_valid_from.trim().is_empty() {
-        return TemporalRelation::Unknown;
+/// Parse a timestamp into a comparable `[year, month, day, hour, min, sec]`.
+///
+/// Tolerant of common RFC3339 variants (the `T` or space separator, fractional
+/// seconds, a trailing `Z` or offset) so a non-canonical caller-supplied
+/// `captured_at` cannot silently invert recency the way a raw byte comparison
+/// would. **Assumes UTC** — a numeric offset is ignored, not applied (Grafiki
+/// stamps `…Z`). Returns `None` if fewer than three numeric fields are present
+/// (no date), so unparseable input is treated as "unknown time", never reordered.
+fn parse_timestamp(value: &str) -> Option<[i64; 6]> {
+    let nums: Vec<i64> = value
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| p.parse::<i64>().ok())
+        .collect();
+    if nums.len() < 3 {
+        return None;
     }
-    match incoming_valid_from.cmp(existing_valid_from) {
-        std::cmp::Ordering::Greater => TemporalRelation::Succession,
-        std::cmp::Ordering::Equal => TemporalRelation::Concurrent,
-        std::cmp::Ordering::Less => TemporalRelation::Unknown,
+    let mut out = [0i64; 6];
+    for (slot, n) in out.iter_mut().zip(nums.iter()) {
+        *slot = *n;
+    }
+    Some(out)
+}
+
+/// Compare two facts' `valid_from` timestamps by parsed instant (NOT lexically —
+/// see [`parse_timestamp`]). Unparseable input on either side ⇒ `Unknown`.
+pub fn temporal_relation(existing_valid_from: &str, incoming_valid_from: &str) -> TemporalRelation {
+    match (
+        parse_timestamp(existing_valid_from),
+        parse_timestamp(incoming_valid_from),
+    ) {
+        (Some(existing), Some(incoming)) => match incoming.cmp(&existing) {
+            std::cmp::Ordering::Greater => TemporalRelation::Succession,
+            std::cmp::Ordering::Equal => TemporalRelation::Concurrent,
+            std::cmp::Ordering::Less => TemporalRelation::Unknown,
+        },
+        _ => TemporalRelation::Unknown,
     }
 }
 
@@ -197,16 +223,29 @@ pub enum Winner {
 }
 
 /// Source-trust tier (higher = more trusted). Human/manual entry outranks a
-/// transcript, which outranks an automatic extraction.
+/// transcript, which outranks an automatic extraction (the default for anything
+/// unrecognized, including `session:`/`connector:` provenance).
+///
+/// Matches on whole, `:`/`-`/`_`-delimited tokens by **exact equality** — never a
+/// substring — so e.g. `humanitarian` does not read as `human`, nor
+/// `transcription_service` as `transcript`.
 pub fn source_priority(source_type: &str) -> u8 {
-    let s = source_type.to_lowercase();
-    if s.contains("manual") || s.contains("human") {
-        3
-    } else if s.contains("transcript") || s.contains("decision") {
-        2
-    } else {
-        1
+    const TIER3: &[&str] = &["manual", "human"];
+    const TIER2: &[&str] = &["transcript", "decision"];
+    let lower = source_type.to_lowercase();
+    let mut tier = 1u8;
+    for token in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if token.is_empty() {
+            continue;
+        }
+        if TIER3.contains(&token) {
+            return 3;
+        }
+        if TIER2.contains(&token) {
+            tier = tier.max(2);
+        }
     }
+    tier
 }
 
 /// Metadata needed to arbitrate a supersession.
@@ -218,24 +257,32 @@ pub struct FactMeta {
 }
 
 /// Decide who wins, lexicographically: source-priority, then recency, then
-/// confidence. A strictly-higher-trust trusted fact is never auto-superseded by a
-/// lower-trust incoming one (routed to review instead).
+/// confidence.
+///
+/// Source-priority is **symmetric and dominant**: a strictly-higher-trust trusted
+/// fact is never auto-superseded by a lower-trust incoming one (routed to
+/// review), and a strictly-higher-trust *incoming* fact (e.g. a human correction)
+/// wins outright regardless of recency. Only same-tier facts fall through to
+/// recency, then to confidence.
 pub fn arbitrate(trusted: &FactMeta, incoming: &FactMeta) -> (Winner, ArbitrationBasis) {
     let trusted_tier = source_priority(&trusted.source_type);
     let incoming_tier = source_priority(&incoming.source_type);
     if trusted_tier > incoming_tier {
         return (Winner::Review, ArbitrationBasis::SourcePriority);
     }
+    if incoming_tier > trusted_tier {
+        return (Winner::Incoming, ArbitrationBasis::SourcePriority);
+    }
 
-    match temporal_relation(&trusted.valid_from, &incoming.valid_from) {
-        TemporalRelation::Succession => return (Winner::Incoming, ArbitrationBasis::Recency),
-        TemporalRelation::Unknown
-            if !trusted.valid_from.is_empty() && !incoming.valid_from.is_empty() =>
-        {
-            // Incoming is strictly older than trusted → trusted stands.
-            return (Winner::Trusted, ArbitrationBasis::Recency);
-        }
-        _ => {} // concurrent or unknown timestamps → fall through to confidence
+    // Same tier → recency by parsed instant (missing/unparseable times skip to
+    // confidence rather than being mistaken for an ordering).
+    match (
+        parse_timestamp(&trusted.valid_from),
+        parse_timestamp(&incoming.valid_from),
+    ) {
+        (Some(t), Some(i)) if i > t => return (Winner::Incoming, ArbitrationBasis::Recency),
+        (Some(t), Some(i)) if i < t => return (Winner::Trusted, ArbitrationBasis::Recency),
+        _ => {}
     }
 
     let eps = 1e-9;
@@ -367,6 +414,70 @@ mod tests {
             temporal_relation("", "2026-01-01T00:00:00Z"),
             TemporalRelation::Unknown
         );
+    }
+
+    #[test]
+    fn temporal_relation_is_robust_to_format_drift() {
+        // A space separator + 5 seconds newer must NOT lexically invert (' ' < 'T').
+        assert_eq!(
+            temporal_relation("2026-06-29T10:00:00Z", "2026-06-29 10:00:05"),
+            TemporalRelation::Succession
+        );
+        // Fractional seconds compare as concurrent (sub-second precision dropped),
+        // not as older ('.' < 'Z' would have inverted a raw byte comparison).
+        assert_eq!(
+            temporal_relation("2026-06-29T10:00:00Z", "2026-06-29T10:00:00.500Z"),
+            TemporalRelation::Concurrent
+        );
+        // Unparseable input is "unknown time", never reordered.
+        assert_eq!(
+            temporal_relation("not-a-date", "2026-06-29T10:00:00Z"),
+            TemporalRelation::Unknown
+        );
+    }
+
+    #[test]
+    fn source_priority_matches_whole_tokens_only() {
+        assert_eq!(source_priority("manual"), 3);
+        assert_eq!(source_priority("human"), 3);
+        assert_eq!(source_priority("transcript"), 2);
+        assert_eq!(source_priority("decision"), 2);
+        assert_eq!(source_priority("connector:test"), 1);
+        assert_eq!(source_priority("session:01ABC"), 1);
+        assert_eq!(source_priority("agent"), 1);
+        // No substring collisions.
+        assert_eq!(source_priority("humanitarian"), 1);
+        assert_eq!(source_priority("transcription_service"), 1);
+    }
+
+    #[test]
+    fn higher_trust_incoming_wins_over_recency() {
+        // A newer low-trust trusted fact must yield to an older human correction.
+        let trusted = FactMeta {
+            valid_from: "2026-06-01T00:00:00Z".into(),
+            source_type: "transcript".into(),
+            confidence: 0.5,
+        };
+        let incoming = FactMeta {
+            valid_from: "2026-01-01T00:00:00Z".into(), // older, but human
+            source_type: "manual".into(),
+            confidence: 0.9,
+        };
+        assert_eq!(
+            arbitrate(&trusted, &incoming),
+            (Winner::Incoming, ArbitrationBasis::SourcePriority)
+        );
+    }
+
+    #[test]
+    fn registry_entries_are_canonical() {
+        for entry in SINGLE_VALUED.iter().chain(MULTI_VALUED.iter()) {
+            assert_eq!(
+                &normalize_predicate(entry),
+                entry,
+                "registry entry '{entry}' is not in normalize_predicate canonical form"
+            );
+        }
     }
 
     #[test]

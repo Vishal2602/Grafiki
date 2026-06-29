@@ -284,6 +284,9 @@ pub struct SupersessionEvent {
     /// This event retracts the prior fact with no replacement (expect abstention).
     #[serde(default)]
     pub retract: bool,
+    /// Source-trust of this fact (drives arbitration). Defaults to a low tier.
+    #[serde(default)]
+    pub source_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -350,6 +353,26 @@ impl SupersessionDataset {
                     it.item_id
                 )
                 .into());
+            }
+            // A token must not be able to "pass" by matching the entity slug
+            // instead of the fact content.
+            if let Some(entity) = &it.entity {
+                let e = entity.to_lowercase();
+                for tok in it
+                    .assertion
+                    .new_required
+                    .iter()
+                    .chain(it.assertion.stale_forbidden.iter())
+                {
+                    if e.contains(&tok.to_lowercase()) {
+                        return Err(format!(
+                            "item '{}': token '{tok}' is a substring of its entity name '{entity}' \
+                             — it could match for the wrong reason",
+                            it.item_id
+                        )
+                        .into());
+                    }
+                }
             }
         }
         let name = dir

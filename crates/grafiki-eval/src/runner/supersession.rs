@@ -9,9 +9,9 @@
 
 use grafiki_core::{
     approve_candidate, ask_memory, delete_observation, init_project, list_decisions, log_decision,
-    propose_candidate, save_entity, search_memory, ApproveCandidateOptions, AskMemoryOptions,
+    propose_candidate, search_memory, ApproveCandidateOptions, AskMemoryOptions,
     DecisionListOptions, DeleteObservationOptions, InitOptions, LogDecisionOptions,
-    ProposeCandidateOptions, SaveEntityOptions, SearchMemoryOptions, SearchMode,
+    ProposeCandidateOptions, SearchMemoryOptions, SearchMode,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -66,23 +66,7 @@ fn run_item(item: &SupersessionItem) -> EvalResult<ItemOutcome> {
     for (i, ev) in item.events.iter().enumerate() {
         match item.mechanism.as_str() {
             "observation" => {
-                if i == 0 || (!ev.supersedes_prev && !ev.retract) {
-                    // Original fact, or an independent coexisting fact (distractor).
-                    let report = save_entity(SaveEntityOptions {
-                        project_name: Some(PROJECT.to_string()),
-                        start_dir: start.clone(),
-                        grafiki_home: Some(home_path.clone()),
-                        name: entity.clone(),
-                        entity_type: "concept".to_string(),
-                        observe: Some(ev.content.clone()),
-                        category: "general".to_string(),
-                        scope: SCOPE.to_string(),
-                        relate: None,
-                    })?;
-                    if i == 0 {
-                        prev = report.observation_id;
-                    }
-                } else if ev.retract {
+                if ev.retract {
                     if let Some(id) = &prev {
                         delete_observation(DeleteObservationOptions {
                             project_name: Some(PROJECT.to_string()),
@@ -92,38 +76,51 @@ fn run_item(item: &SupersessionItem) -> EvalResult<ItemOutcome> {
                         })?;
                     }
                     prev = None;
-                } else {
-                    // Supersede the prior observation.
-                    let mut payload = json!({
-                        "entity_name": entity,
-                        "content": ev.content,
-                        "category": "general",
-                    });
+                    continue;
+                }
+                // All observation facts go through the candidate gate so the
+                // approval path stamps the logical valid_from (captured_at) and
+                // source_type — giving both old and new facts a controlled
+                // timeline (no post-dating) and a real source tier for arbitration.
+                let mut payload = json!({
+                    "entity_name": entity,
+                    "content": ev.content,
+                    "category": "general",
+                });
+                if let Some(ts) = &ev.captured_at {
+                    payload["captured_at"] = json!(ts);
+                }
+                if ev.supersedes_prev {
                     if let Some(p) = &prev {
                         payload["supersedes"] = json!(p);
                     }
-                    if let Some(ts) = &ev.captured_at {
-                        payload["captured_at"] = json!(ts);
-                    }
-                    let proposed = propose_candidate(ProposeCandidateOptions {
-                        project_name: Some(PROJECT.to_string()),
-                        start_dir: start.clone(),
-                        grafiki_home: Some(home_path.clone()),
-                        source_type: "transcript".to_string(),
-                        source: None,
-                        record_type: "observation".to_string(),
-                        payload,
-                        scope: SCOPE.to_string(),
-                        confidence: 0.9,
-                        rationale: None,
-                        evidence: Vec::new(),
-                    })?;
-                    let approved = approve_candidate(ApproveCandidateOptions {
-                        project_name: Some(PROJECT.to_string()),
-                        start_dir: start.clone(),
-                        grafiki_home: Some(home_path.clone()),
-                        id: proposed.candidate.id,
-                    })?;
+                }
+                let source_type = ev
+                    .source_type
+                    .clone()
+                    .unwrap_or_else(|| "agent".to_string());
+                let proposed = propose_candidate(ProposeCandidateOptions {
+                    project_name: Some(PROJECT.to_string()),
+                    start_dir: start.clone(),
+                    grafiki_home: Some(home_path.clone()),
+                    source_type,
+                    source: None,
+                    record_type: "observation".to_string(),
+                    payload,
+                    scope: SCOPE.to_string(),
+                    confidence: 0.9,
+                    rationale: None,
+                    evidence: Vec::new(),
+                })?;
+                let approved = approve_candidate(ApproveCandidateOptions {
+                    project_name: Some(PROJECT.to_string()),
+                    start_dir: start.clone(),
+                    grafiki_home: Some(home_path.clone()),
+                    id: proposed.candidate.id,
+                })?;
+                // The original fact and each superseding fact advance `prev`; an
+                // independent coexisting fact leaves `prev` on the original.
+                if i == 0 || ev.supersedes_prev {
                     prev = approved.candidate.trusted_record_id;
                 }
             }
@@ -199,10 +196,12 @@ fn run_item(item: &SupersessionItem) -> EvalResult<ItemOutcome> {
             scope: SCOPE.to_string(),
             limit: 20,
         })?;
+        // Observations: match against the fact CONTENT (snippet) only, never the
+        // entity-slug title, so a token can't pass for the wrong reason.
         report
             .results
             .iter()
-            .map(|r| format!("{} {}", r.title, r.snippet).to_lowercase())
+            .map(|r| r.snippet.to_lowercase())
             .collect()
     };
     let contains = |tok: &str| {
@@ -219,6 +218,9 @@ fn run_item(item: &SupersessionItem) -> EvalResult<ItemOutcome> {
         .cloned();
     let stale_suppressed = stale_leak.is_none();
 
+    // Abstention is checked PER FACT (not as a global empty-memory probe): the
+    // retracted fact's token must not appear in the generated answer for its query.
+    // The fixture keeps a coexisting fact alive so the project is not trivially empty.
     let abstained = if item.assertion.expect_abstain {
         let briefing = ask_memory(AskMemoryOptions {
             project_name: Some(PROJECT.to_string()),
@@ -229,16 +231,21 @@ fn run_item(item: &SupersessionItem) -> EvalResult<ItemOutcome> {
             limit: 10,
             agent: Some("eval".to_string()),
         })?;
-        briefing
-            .answer
-            .contains("I do not have trusted memory for this yet")
+        let answer = briefing.answer.to_lowercase();
+        !item
+            .assertion
+            .stale_forbidden
+            .iter()
+            .any(|t| answer.contains(&t.to_lowercase()))
     } else {
         false
     };
 
     let passed = match item.category.as_str() {
         "retraction" => abstained && stale_suppressed,
-        "distractor_noise" => new_surfaced && stale_suppressed,
+        // Negative classes: nothing should be suppressed and the fact(s) that must
+        // remain (new_required) stay live.
+        "distractor_noise" | "false_supersession_guard" => new_surfaced && stale_suppressed,
         _ => new_surfaced && stale_suppressed,
     };
 
@@ -281,15 +288,20 @@ pub fn run_supersession(
         })
         .collect();
 
-    // False supersession: a distractor whose still-true fact got suppressed.
-    let distractors: Vec<&ItemOutcome> = outcomes
+    // False supersession: a negative-class item whose still-true fact got
+    // suppressed. The negative class is both coexisting distractors AND
+    // false_supersession_guard items (which DO invoke the supersession mechanism
+    // against a higher-trust prior fact, so arbitration must decline — making this
+    // a non-vacuous test of the guard).
+    let is_negative = |c: &str| c == "distractor_noise" || c == "false_supersession_guard";
+    let negatives: Vec<&ItemOutcome> = outcomes
         .iter()
-        .filter(|o| o.category == "distractor_noise")
+        .filter(|o| is_negative(&o.category))
         .collect();
-    let false_supersession_rate = if distractors.is_empty() {
+    let false_supersession_rate = if negatives.is_empty() {
         0.0
     } else {
-        distractors.iter().filter(|o| !o.new_surfaced).count() as f64 / distractors.len() as f64
+        negatives.iter().filter(|o| !o.new_surfaced).count() as f64 / negatives.len() as f64
     };
 
     // Retraction-abstain accuracy.
@@ -317,7 +329,7 @@ pub fn run_supersession(
             } else {
                 conflict.false_neg += 1;
             }
-        } else if o.category == "distractor_noise" {
+        } else if is_negative(&o.category) {
             if o.new_surfaced {
                 conflict.true_neg += 1;
             } else {

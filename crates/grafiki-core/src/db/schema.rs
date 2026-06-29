@@ -6,7 +6,7 @@ use crate::Result;
 pub const INITIAL_SCHEMA_VERSION: i64 = 1;
 /// The newest schema version this build knows how to produce. Bump this and add
 /// a `Migration` entry whenever the schema changes.
-pub const LATEST_SCHEMA_VERSION: i64 = 3;
+pub const LATEST_SCHEMA_VERSION: i64 = 4;
 
 struct Migration {
     version: i64,
@@ -31,7 +31,20 @@ const MIGRATIONS: &[Migration] = &[
         description: "entities_fts FTS5 index + sync triggers for tokenized entity search",
         sql: MIGRATION_V3_ENTITY_FTS,
     },
+    Migration {
+        version: 4,
+        description: "observations.source_type for conflict-arbitration source-priority (H2)",
+        sql: MIGRATION_V4_OBSERVATION_SOURCE_TYPE,
+    },
 ];
+
+// Conflict arbitration (H2) ranks facts by source-trust tier. Observations stored
+// `source` as a `session:{id}` provenance link, not a comparable source-type, so
+// give them a nullable source_type the candidate-approval path can stamp. Legacy
+// rows stay NULL (treated as the lowest tier).
+const MIGRATION_V4_OBSERVATION_SOURCE_TYPE: &str = r#"
+ALTER TABLE observations ADD COLUMN source_type TEXT;
+"#;
 
 // Entities were searched with `name LIKE '%<whole query>%'`, which never matches
 // a natural-language query — so entities were effectively unretrievable. Give

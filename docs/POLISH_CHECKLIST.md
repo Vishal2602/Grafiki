@@ -92,11 +92,17 @@ the `relations` table).
   `name LIKE %query%` not FTS, so entities are unretrievable by NL queries ([memory.rs:7184](../crates/grafiki-core/src/memory.rs#L7184)).
   **Remaining (v1.5/v2/v3):** Arm B memory-QA replay (capture→candidate→trusted→ask, needs MiniLM);
   judged LongMemEval/LoCoMo + external BEIR/SecretBench adapters; SWE-bench memory-lift A/B. **L**
-- [ ] **H2 — Automated conflict / contradiction resolution.** On a new candidate, find
-  semantically-related trusted facts; on contradiction, set the older row's
-  `valid_to = new.valid_from` (reuse bitemporal supersession) **via the candidate
-  gate** (new `conflict` candidate type). Arbitrate on metadata, not LLM "freshness".
-  (Graphiti, Mem0.) **L**
+- [~] **H2 — Automated conflict / contradiction resolution.** **v1 deterministic core LANDED**
+  (design in [CONFLICT_DESIGN.md](CONFLICT_DESIGN.md)): `grafiki_core::conflict` — cardinality-gated
+  slot/key/temporal detection + metadata arbitration (source-priority → recency → confidence, so a
+  low-trust auto-extraction never silently overwrites a human fact); **observation supersession via
+  the candidate gate** (`supersedes` → `valid_to = new.valid_from`, honoring `captured_at`),
+  closing the append-only gap (decisions already had native supersedes). Proven by **Eval Arm D**
+  (`crates/grafiki-eval` supersession runner + fixture, CI-gated): pass-rate 1.0, **0 stale leaks**,
+  false-supersession 0.0, retraction-abstain 1.0. **Deferred (v2):** the dedicated `conflict` candidate
+  type + new event vocabulary (needs a CHECK-altering table rebuild); **semantic auto-detection** of
+  the supersedes target (currently `supersedes` is explicit/feature-gated); relation/state/context
+  supersession arms; NLI/LLM escalation; CLI/MCP conflict fields. (Graphiti, Mem0.) **L**
 - [ ] **H3 — Graph-aware retrieval.** Add a 3rd RRF arm: seed from FTS5+dense top-k
   entities, expand 1–2 hops over `relations` (respect `valid_from`/`valid_to`), run
   Personalized PageRank, fuse its ranking. SQL recursive query + in-memory PPR, no new

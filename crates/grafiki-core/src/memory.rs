@@ -5624,58 +5624,81 @@ fn scoped_capture_sessions(
     Ok(sessions)
 }
 
-/// H2: close the validity window of a prior observation that a newly-approved
-/// observation supersedes, when metadata arbitration says the new fact wins.
+/// H2: finalize a just-approved observation. Stamps the candidate's logical time
+/// (`captured_at` → `valid_from`) and `source_type` onto the new observation, then
+/// — if it carries a `supersedes` pointer — closes the prior fact's validity
+/// window when metadata arbitration says the new fact wins.
 ///
-/// The old row's `valid_to` is set to the **new fact's `valid_from`** (the
-/// bitemporal "abutting windows" rule), so point-in-time queries before the cut
-/// still return the old fact. A no-op (returns `None`) when the target is missing/
-/// already invalidated, or when arbitration (source-priority → recency →
-/// confidence) does not put the incoming fact strictly ahead — e.g. a low-trust
-/// auto-extraction must not silently overwrite a human-confirmed fact.
-fn apply_observation_supersession(
+/// Guards: the prior observation must belong to the **same entity and scope** as
+/// the new one (a `supersedes` id can otherwise invalidate an unrelated fact);
+/// the cut is `old.valid_to = new.valid_from` (the bitemporal abutting-windows
+/// rule); and a strictly-higher-trust prior fact is never auto-superseded. A
+/// missing/already-invalidated/cross-entity target is a silent no-op.
+fn finalize_observation_candidate(
     project_name: Option<String>,
     start_dir: PathBuf,
     grafiki_home: Option<PathBuf>,
-    old_id: &str,
     new_id: &str,
     candidate: &ExtractionCandidate,
-) -> Result<Option<crate::conflict::ArbitrationBasis>> {
+    supersedes: Option<String>,
+) -> Result<()> {
     let (_project, mut connection) = resolve_and_open(project_name, start_dir, grafiki_home)?;
 
-    let old: Option<(String, Option<String>, f64, String)> = connection
+    // New observation's entity + scope, and the logical valid_from to stamp.
+    let (new_entity, new_scope, new_default_valid_from): (String, String, String) = connection
         .query_row(
             "
-            SELECT o.valid_from, o.source, o.confidence, e.scope
-            FROM observations o
-            JOIN entities e ON e.id = o.entity_id
-            WHERE o.id = ?1 AND o.valid_to IS NULL
+            SELECT o.entity_id, e.scope, o.valid_from
+            FROM observations o JOIN entities e ON e.id = o.entity_id
+            WHERE o.id = ?1
             ",
-            [old_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    let Some((old_valid_from, old_source, old_confidence, old_scope)) = old else {
-        return Ok(None);
+            [new_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    let new_valid_from = candidate_payload_optional_string(&candidate.payload, &["captured_at"])
+        .unwrap_or(new_default_valid_from);
+
+    // Stamp logical time + source-type so windows abut and future arbitration
+    // sees a real source tier (not the `session:` provenance link).
+    connection.execute(
+        "UPDATE observations SET valid_from = ?1, source_type = ?2 WHERE id = ?3",
+        params![new_valid_from, candidate.source_type, new_id],
+    )?;
+
+    let Some(old_id) = supersedes else {
+        return Ok(());
     };
 
-    // The new fact's logical time is its `captured_at` when supplied (a week-old
-    // transcript supersedes by *its* time, not ingest time), else the row's
-    // valid_from. This is the timestamp used for both arbitration recency and the
-    // bitemporal cut (old.valid_to = new.valid_from).
-    let new_valid_from: String =
-        match candidate_payload_optional_string(&candidate.payload, &["captured_at"]) {
-            Some(captured_at) => captured_at,
-            None => connection.query_row(
-                "SELECT valid_from FROM observations WHERE id = ?1",
-                [new_id],
-                |row| row.get(0),
-            )?,
-        };
+    let old: Option<(String, String, Option<String>, String, f64)> = connection
+        .query_row(
+            "
+            SELECT o.entity_id, e.scope, o.source_type, o.valid_from, o.confidence
+            FROM observations o JOIN entities e ON e.id = o.entity_id
+            WHERE o.id = ?1 AND o.valid_to IS NULL
+            ",
+            [&old_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((old_entity, old_scope, old_source_type, old_valid_from, old_confidence)) = old else {
+        return Ok(());
+    };
+    // Guard: never supersede across entities or scopes.
+    if old_entity != new_entity || old_scope != new_scope {
+        return Ok(());
+    }
 
     let trusted = crate::conflict::FactMeta {
         valid_from: old_valid_from,
-        source_type: old_source.unwrap_or_default(),
+        source_type: old_source_type.unwrap_or_default(),
         confidence: old_confidence,
     };
     let incoming = crate::conflict::FactMeta {
@@ -5685,7 +5708,7 @@ fn apply_observation_supersession(
     };
     let (winner, basis) = crate::conflict::arbitrate(&trusted, &incoming);
     if winner != crate::conflict::Winner::Incoming {
-        return Ok(None);
+        return Ok(());
     }
 
     let tx = connection.transaction()?;
@@ -5693,7 +5716,7 @@ fn apply_observation_supersession(
         "UPDATE observations SET valid_to = ?1 WHERE id = ?2 AND valid_to IS NULL",
         params![new_valid_from, old_id],
     )?;
-    delete_embedding_records(&tx, "observation", old_id)?;
+    delete_embedding_records(&tx, "observation", &old_id)?;
     tx.execute(
         "
         INSERT INTO events (id, event_type, source_session, target_type, target_id, scope, summary)
@@ -5707,7 +5730,7 @@ fn apply_observation_supersession(
         ],
     )?;
     tx.commit()?;
-    Ok(Some(basis))
+    Ok(())
 }
 
 fn approve_candidate_payload(
@@ -5757,20 +5780,19 @@ fn approve_candidate_payload(
                     "approved observation did not create an observation".to_owned(),
                 )
             })?;
-            // H2: if this observation supersedes a prior trusted one, close the
-            // older fact's validity window — arbitrated on metadata (a higher-trust
-            // fact is not silently overwritten). Observations are append-only, so
-            // this supersession primitive did not exist before.
-            if let Some(old_id) = supersedes {
-                apply_observation_supersession(
-                    project_name,
-                    start_dir,
-                    grafiki_home,
-                    &old_id,
-                    &observation_id,
-                    candidate,
-                )?;
-            }
+            // H2: stamp the candidate's logical time + source-type onto the new
+            // observation and apply any supersession (arbitrated on metadata).
+            // Best-effort: a failure here must not fail the approval (the new fact
+            // is already valid) nor leave a pending candidate whose retry would
+            // duplicate the observation.
+            let _ = finalize_observation_candidate(
+                project_name,
+                start_dir,
+                grafiki_home,
+                &observation_id,
+                candidate,
+                supersedes,
+            );
             Ok(("observation".to_owned(), observation_id))
         }
         "decision" => {
