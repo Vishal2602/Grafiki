@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use tauri::State;
+use tauri::{AppHandle, Manager, RunEvent, State};
 
 use grafiki_core::{
     add_context, approve_candidate, bulk_review_candidates, delete_context, delete_decision,
@@ -1377,11 +1377,15 @@ fn capture_screen_snapshot(request: ScreenCaptureRequest) -> Result<CaptureEvent
     let scope = clean_optional(request.scope).unwrap_or_default();
     let captures_dir = grafiki_capture_dir()?;
     fs::create_dir_all(&captures_dir).map_err(|error| error.to_string())?;
-    let timestamp = SystemTime::now()
+    let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_secs();
-    let path = captures_dir.join(format!("screen-{timestamp}.png"));
+        .unwrap_or_else(|_| Duration::from_secs(0));
+    // Include sub-second nanos so two captures in the same second don't collide.
+    let path = captures_dir.join(format!(
+        "screen-{}-{:09}.png",
+        stamp.as_secs(),
+        stamp.subsec_nanos()
+    ));
     let output = ProcessCommand::new("screencapture")
         .arg("-x")
         .arg(&path)
@@ -1396,6 +1400,8 @@ fn capture_screen_snapshot(request: ScreenCaptureRequest) -> Result<CaptureEvent
             message
         });
     }
+    // Bound how many screenshots accumulate on disk.
+    prune_screenshots(&captures_dir, 50);
 
     ingest_capture_event(IngestCaptureEventOptions {
         project_name: None,
@@ -2200,8 +2206,38 @@ pub fn run() {
             stop_daemon,
             capture_memory
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run Grafiki desktop");
+        .build(tauri::generate_context!())
+        .expect("failed to build Grafiki desktop")
+        .run(|app_handle, event| {
+            if let RunEvent::ExitRequested { .. } = event {
+                stop_session_daemons(app_handle);
+            }
+        });
+}
+
+/// Best-effort: on quit, stop any daemons this desktop session started so they do
+/// not outlive the app. Drains the token map and drops the lock BEFORE the
+/// blocking CLI stop calls so quit can never deadlock on the mutex.
+fn stop_session_daemons(app: &AppHandle) {
+    let dirs: Vec<String> = {
+        let tokens = app.state::<DaemonTokens>();
+        let Ok(mut map) = tokens.0.lock() else {
+            return;
+        };
+        map.drain().map(|(dir, _token)| dir).collect()
+    };
+    if dirs.is_empty() {
+        return;
+    }
+    let Some(cli_path) = find_grafiki_cli() else {
+        return;
+    };
+    for dir in dirs {
+        let _ = run_grafiki_cli_json(
+            &cli_path,
+            &["daemon", "stop", "--path", &dir, "--format", "json"],
+        );
+    }
 }
 
 fn resolve_start_dir(raw: Option<String>) -> PathBuf {
@@ -2223,6 +2259,38 @@ fn grafiki_capture_dir() -> Result<PathBuf, String> {
         .map(PathBuf::from)
         .ok_or_else(|| "Could not determine HOME for capture storage.".to_owned())?;
     Ok(home.join(".grafiki").join("captures"))
+}
+
+/// Best-effort: keep at most `keep` screenshot files in `dir`, deleting the
+/// oldest beyond that so snapshots don't accumulate unbounded.
+fn prune_screenshots(dir: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut shots: Vec<(SystemTime, PathBuf)> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("screen-") && name.ends_with(".png"))
+                .unwrap_or(false)
+        })
+        .map(|path| {
+            let modified = fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .unwrap_or(UNIX_EPOCH);
+            (modified, path)
+        })
+        .collect();
+    if shots.len() <= keep {
+        return;
+    }
+    shots.sort_by_key(|(modified, _)| *modified);
+    let remove = shots.len() - keep;
+    for (_, path) in shots.into_iter().take(remove) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn find_grafiki_cli() -> Option<PathBuf> {
