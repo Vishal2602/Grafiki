@@ -10,6 +10,7 @@ use crate::metrics::ir::AggregateScores;
 use crate::metrics::stats;
 use crate::runner::redaction::RedactionReport;
 use crate::runner::retrieval::{mode_label, RetrievalReport};
+use crate::runner::supersession::SupersessionReport;
 
 /// Run provenance recorded in every `results.json` — the harness, not the model,
 /// is the dominant source of irreproducibility (lm-eval lesson), so we pin it.
@@ -333,6 +334,121 @@ pub fn redaction_md(report: &RedactionReport) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Supersession (Arm D)
+// ---------------------------------------------------------------------------
+
+pub fn supersession_json(report: &SupersessionReport, cfg: &EvalConfig) -> Value {
+    let c = &report.conflict;
+    let outcomes: Vec<Value> = report
+        .outcomes
+        .iter()
+        .map(|o| {
+            json!({
+                "item_id": o.item_id, "category": o.category, "mechanism": o.mechanism,
+                "new_surfaced": o.new_surfaced, "stale_suppressed": o.stale_suppressed,
+                "abstained": o.abstained, "passed": o.passed
+            })
+        })
+        .collect();
+    let leaks: Vec<Value> = report
+        .stale_leak_list
+        .iter()
+        .map(|(item, mech, tok)| json!({ "item_id": item, "mechanism": mech, "leaked_token": tok }))
+        .collect();
+    json!({
+        "provenance": provenance(cfg, "n/a (supersession)", None),
+        "arm": "supersession",
+        "dataset": report.dataset_name,
+        "item_count": report.item_count,
+        "pass_rate": { "mean": report.pass_rate.mean, "ci95": [report.pass_rate.ci_low, report.pass_rate.ci_high] },
+        "stale_leaks": leaks,
+        "false_supersession_rate": report.false_supersession_rate,
+        "retraction_abstain_acc": report.retraction_abstain_acc,
+        "conflict_detection": {
+            "precision": c.precision(), "recall": c.recall(), "f1": c.f1(),
+            "tp": c.true_pos, "fp": c.false_pos, "fn": c.false_neg, "tn": c.true_neg
+        },
+        "per_item": outcomes
+    })
+}
+
+pub fn supersession_md(report: &SupersessionReport) -> String {
+    let mut s = String::new();
+    let c = &report.conflict;
+    let _ = writeln!(
+        s,
+        "# Grafiki eval — supersession (`{}`)\n",
+        report.dataset_name
+    );
+    let _ = writeln!(
+        s,
+        "{} items · **strict pass = new surfaced ∧ stale suppressed**\n",
+        report.item_count
+    );
+    let _ = writeln!(s, "## Headline\n");
+    let _ = writeln!(s, "| metric | value |");
+    let _ = writeln!(s, "|---|---|");
+    let _ = writeln!(
+        s,
+        "| supersession pass-rate | {:.4} [{:.4}, {:.4}] |",
+        report.pass_rate.mean, report.pass_rate.ci_low, report.pass_rate.ci_high
+    );
+    let _ = writeln!(
+        s,
+        "| stale leaks (hard gate) | {} |",
+        report.stale_leak_list.len()
+    );
+    let _ = writeln!(
+        s,
+        "| false-supersession rate | {:.4} |",
+        report.false_supersession_rate
+    );
+    let _ = writeln!(
+        s,
+        "| retraction-abstain accuracy | {:.4} |",
+        report.retraction_abstain_acc
+    );
+    let _ = writeln!(
+        s,
+        "| conflict detection P / R / F1 | {:.4} / {:.4} / {:.4} |",
+        c.precision(),
+        c.recall(),
+        c.f1()
+    );
+
+    if report.stale_leak_list.is_empty() {
+        let _ = writeln!(s, "\n_No stale fact survived a supersession._");
+    } else {
+        let _ = writeln!(s, "\n## Stale leaks — the hard gate\n");
+        let _ = writeln!(s, "| item | mechanism | leaked token |");
+        let _ = writeln!(s, "|---|---|---|");
+        for (item, mech, tok) in &report.stale_leak_list {
+            let _ = writeln!(s, "| {item} | {mech} | `{tok}` |");
+        }
+    }
+
+    let _ = writeln!(s, "\n## Per item\n");
+    let _ = writeln!(
+        s,
+        "| item | category | mech | new | stale-suppressed | pass |"
+    );
+    let _ = writeln!(s, "|---|---|---|---|---|---|");
+    for o in &report.outcomes {
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} | {} | {} |",
+            o.item_id,
+            o.category,
+            o.mechanism,
+            if o.new_surfaced { "✓" } else { "·" },
+            if o.stale_suppressed { "✓" } else { "LEAK" },
+            if o.passed { "✓" } else { "✗" }
+        );
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
 // Baseline regression gate
 // ---------------------------------------------------------------------------
 
@@ -342,6 +458,7 @@ pub fn check_regressions(
     baseline: &Value,
     retrieval: Option<&RetrievalReport>,
     redaction: Option<&RedactionReport>,
+    supersession: Option<&SupersessionReport>,
 ) -> Vec<String> {
     let mut failures = Vec::new();
 
@@ -355,6 +472,55 @@ pub fn check_regressions(
     if baseline.get("redaction").is_some() && redaction.is_none() {
         failures
             .push("baseline declares a `redaction` gate but the redaction arm was not run".into());
+    }
+    if baseline.get("supersession").is_some() && supersession.is_none() {
+        failures.push(
+            "baseline declares a `supersession` gate but the supersession arm was not run".into(),
+        );
+    }
+
+    if let (Some(rb), Some(rep)) = (baseline.get("supersession"), supersession) {
+        if !rep.stale_leak_list.is_empty() {
+            failures.push(format!(
+                "supersession stale leaks = {} > 0 (stale facts survived: {})",
+                rep.stale_leak_list.len(),
+                rep.stale_leak_list
+                    .iter()
+                    .map(|(i, _, t)| format!("{i}:{t}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(minp) = rb.get("min_pass_rate").and_then(|v| v.as_f64()) {
+            if rep.pass_rate.mean < minp {
+                failures.push(format!(
+                    "supersession pass-rate = {:.4} < min_pass_rate {minp:.4}",
+                    rep.pass_rate.mean
+                ));
+            }
+        }
+        if let Some(maxfs) = rb
+            .get("max_false_supersession_rate")
+            .and_then(|v| v.as_f64())
+        {
+            if rep.false_supersession_rate > maxfs {
+                failures.push(format!(
+                    "false-supersession rate = {:.4} > max {maxfs:.4}",
+                    rep.false_supersession_rate
+                ));
+            }
+        }
+        if let Some(minab) = rb
+            .get("min_retraction_abstain_acc")
+            .and_then(|v| v.as_f64())
+        {
+            if rep.retraction_abstain_acc < minab {
+                failures.push(format!(
+                    "retraction-abstain accuracy = {:.4} < min {minab:.4}",
+                    rep.retraction_abstain_acc
+                ));
+            }
+        }
     }
 
     if let (Some(rb), Some(rep)) = (baseline.get("retrieval"), retrieval) {
@@ -424,6 +590,7 @@ pub fn check_regressions(
 pub fn build_baseline(
     retrieval: Option<&RetrievalReport>,
     redaction: Option<&RedactionReport>,
+    supersession: Option<&SupersessionReport>,
     tolerance: f64,
 ) -> Value {
     // Round floors DOWN (4 dp) so the stored threshold is always ≤ the achievable
@@ -455,6 +622,19 @@ pub fn build_baseline(
                 "max_leaks": 0,
                 "min_precision": floor4(rep.overall.precision()),
                 "min_recall": floor4(rep.overall.recall())
+            }),
+        );
+    }
+    if let Some(rep) = supersession {
+        // Hard floors: a surviving stale fact and a false supersession are never
+        // acceptable, so these are fixed at 0 regardless of the snapshot run.
+        obj.insert(
+            "supersession".into(),
+            json!({
+                "min_pass_rate": floor4(rep.pass_rate.mean),
+                "max_stale_leaks": 0,
+                "max_false_supersession_rate": 0.0,
+                "min_retraction_abstain_acc": floor4(rep.retraction_abstain_acc)
             }),
         );
     }

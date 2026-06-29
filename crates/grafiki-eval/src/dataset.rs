@@ -264,6 +264,103 @@ pub struct RedactionDataset {
     pub cases: Vec<RedactionCase>,
 }
 
+// ---------------------------------------------------------------------------
+// Supersession / knowledge-update (Arm D)
+// ---------------------------------------------------------------------------
+
+/// One event in a supersession item's timeline.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SupersessionEvent {
+    /// The fact text (observation content / decision title). Empty for a retraction.
+    #[serde(default)]
+    pub content: String,
+    /// Logical time of this fact; used for arbitration recency + the bitemporal
+    /// cut. Observation supersessions need this strictly later than the prior fact.
+    #[serde(default)]
+    pub captured_at: Option<String>,
+    /// This event supersedes the immediately-prior one.
+    #[serde(default)]
+    pub supersedes_prev: bool,
+    /// This event retracts the prior fact with no replacement (expect abstention).
+    #[serde(default)]
+    pub retract: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SupersessionAssert {
+    pub query: String,
+    #[serde(default)]
+    pub new_required: Vec<String>,
+    #[serde(default)]
+    pub stale_forbidden: Vec<String>,
+    #[serde(default)]
+    pub expect_abstain: bool,
+}
+
+/// A supersession test item: a fact, then an update/retraction, then a probe.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SupersessionItem {
+    pub item_id: String,
+    /// `knowledge_update` | `decision_reversal` | `retraction` | `distractor_noise`.
+    pub category: String,
+    /// `observation` | `decision`.
+    pub mechanism: String,
+    #[serde(default)]
+    pub entity: Option<String>,
+    pub events: Vec<SupersessionEvent>,
+    #[serde(rename = "assert")]
+    pub assertion: SupersessionAssert,
+}
+
+#[derive(Debug, Clone)]
+pub struct SupersessionDataset {
+    pub name: String,
+    pub items: Vec<SupersessionItem>,
+}
+
+impl SupersessionDataset {
+    pub fn load(dir: &Path) -> EvalResult<Self> {
+        let items: Vec<SupersessionItem> = read_jsonl(&dir.join("updates.jsonl"))?;
+        // Fail-loud validation: tokens disjoint and present; retractions have no
+        // replacement event; distractors do not supersede.
+        for it in &items {
+            let new: std::collections::HashSet<&str> = it
+                .assertion
+                .new_required
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            for s in &it.assertion.stale_forbidden {
+                if new.contains(s.as_str()) {
+                    return Err(format!(
+                        "item '{}': token '{s}' is in both new_required and stale_forbidden",
+                        it.item_id
+                    )
+                    .into());
+                }
+            }
+            if it.category == "retraction" && !it.assertion.expect_abstain {
+                return Err(format!("retraction item '{}' must expect_abstain", it.item_id).into());
+            }
+            if it.category == "distractor_noise"
+                && it.events.iter().any(|e| e.supersedes_prev || e.retract)
+            {
+                return Err(format!(
+                    "distractor_noise item '{}' must not supersede or retract",
+                    it.item_id
+                )
+                .into());
+            }
+        }
+        let name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("supersession")
+            .to_string();
+        Ok(Self { name, items })
+    }
+}
+
 impl RedactionDataset {
     pub fn load(path: &Path) -> EvalResult<Self> {
         let raw: Vec<RawRedactionCase> = read_jsonl(path)?;

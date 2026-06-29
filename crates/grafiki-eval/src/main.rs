@@ -8,10 +8,11 @@ use clap::{Parser, Subcommand};
 use grafiki_core::SearchMode;
 
 use grafiki_eval::config::{EvalConfig, EvalResult, OutputFormat};
-use grafiki_eval::dataset::{RedactionDataset, RetrievalDataset};
+use grafiki_eval::dataset::{RedactionDataset, RetrievalDataset, SupersessionDataset};
 use grafiki_eval::report;
 use grafiki_eval::runner::redaction::{run_redaction, RedactionReport};
 use grafiki_eval::runner::retrieval::{run_retrieval, RetrievalReport};
+use grafiki_eval::runner::supersession::{run_supersession, SupersessionReport};
 
 #[derive(Parser)]
 #[command(
@@ -109,9 +110,10 @@ fn run(args: &RunArgs) -> EvalResult<i32> {
     let arm = args.arm.trim().to_ascii_lowercase();
     let do_retrieval = arm == "retrieval" || arm == "all";
     let do_redaction = arm == "redaction" || arm == "all";
-    if !do_retrieval && !do_redaction {
+    let do_supersession = arm == "supersession" || arm == "all";
+    if !do_retrieval && !do_redaction && !do_supersession {
         return Err(format!(
-            "unknown --arm '{}' (expected retrieval|redaction|all)",
+            "unknown --arm '{}' (expected retrieval|redaction|supersession|all)",
             args.arm
         )
         .into());
@@ -119,6 +121,7 @@ fn run(args: &RunArgs) -> EvalResult<i32> {
 
     let mut retrieval_report: Option<RetrievalReport> = None;
     let mut redaction_report: Option<RedactionReport> = None;
+    let mut supersession_report: Option<SupersessionReport> = None;
 
     if do_retrieval {
         let dir = args
@@ -161,10 +164,31 @@ fn run(args: &RunArgs) -> EvalResult<i32> {
         redaction_report = Some(rep);
     }
 
+    if do_supersession {
+        let dir = args
+            .dataset
+            .clone()
+            .filter(|_| arm == "supersession")
+            .unwrap_or_else(|| fixtures_dir().join("supersession/grafiki_updates_v1"));
+        let dataset = SupersessionDataset::load(&dir)?;
+        let rep = run_supersession(&dataset, &cfg)?;
+        let json = report::supersession_json(&rep, &cfg);
+        let md = report::supersession_md(&rep);
+        if let Some(out) = &cfg.out_dir {
+            write_outputs(out, "supersession", &json, &md)?;
+        } else if matches!(cfg.format, OutputFormat::Json) {
+            println!("{}", serde_json::to_string_pretty(&json)?);
+        } else {
+            println!("{md}");
+        }
+        supersession_report = Some(rep);
+    }
+
     if let Some(path) = &args.write_baseline {
         let baseline = report::build_baseline(
             retrieval_report.as_ref(),
             redaction_report.as_ref(),
+            supersession_report.as_ref(),
             args.tolerance,
         );
         if let Some(parent) = path.parent() {
@@ -187,6 +211,7 @@ fn run(args: &RunArgs) -> EvalResult<i32> {
             &baseline,
             retrieval_report.as_ref(),
             redaction_report.as_ref(),
+            supersession_report.as_ref(),
         );
         if !failures.is_empty() {
             eprintln!("\n❌ REGRESSION GATE FAILED ({} issue(s)):", failures.len());

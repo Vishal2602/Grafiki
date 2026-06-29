@@ -5659,11 +5659,19 @@ fn apply_observation_supersession(
         return Ok(None);
     };
 
-    let new_valid_from: String = connection.query_row(
-        "SELECT valid_from FROM observations WHERE id = ?1",
-        [new_id],
-        |row| row.get(0),
-    )?;
+    // The new fact's logical time is its `captured_at` when supplied (a week-old
+    // transcript supersedes by *its* time, not ingest time), else the row's
+    // valid_from. This is the timestamp used for both arbitration recency and the
+    // bitemporal cut (old.valid_to = new.valid_from).
+    let new_valid_from: String =
+        match candidate_payload_optional_string(&candidate.payload, &["captured_at"]) {
+            Some(captured_at) => captured_at,
+            None => connection.query_row(
+                "SELECT valid_from FROM observations WHERE id = ?1",
+                [new_id],
+                |row| row.get(0),
+            )?,
+        };
 
     let trusted = crate::conflict::FactMeta {
         valid_from: old_valid_from,

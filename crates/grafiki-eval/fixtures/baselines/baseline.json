@@ -9,5 +9,11 @@
     "primary_mode": "keyword",
     "recall@10": 0.8958,
     "tolerance": 0.05
+  },
+  "supersession": {
+    "max_false_supersession_rate": 0.0,
+    "max_stale_leaks": 0,
+    "min_pass_rate": 1.0,
+    "min_retraction_abstain_acc": 1.0
   }
 }

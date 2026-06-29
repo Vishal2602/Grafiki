@@ -3,3 +3,4 @@
 
 pub mod redaction;
 pub mod retrieval;
+pub mod supersession;
