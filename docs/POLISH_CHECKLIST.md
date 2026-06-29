@@ -114,8 +114,13 @@ the `relations` table).
   fixture `grafiki_graph_v1`: keyword recall@10 **0.00 → graph 1.00**, nDCG@10 0.00 → 0.47 — recovers
   every relation-reachable, term-disjoint fact lexical search misses. CI regression test
   `graph_arm_surfaces_multihop_facts`. (HippoRAG, GraphRAG.) **M**
-- [ ] **H4 — Reranking stage.** Small local cross-encoder (or listwise LLM) reranker over
-  RRF top-N before `grafiki_ask` builds the cited answer. (RankGPT, bge-reranker.) **M**
+- [x] **H4 — Reranking stage.** **DONE** (adversarially reviewed, 5 findings fixed incl. 2 HIGH).
+  New opt-in `SearchMode::Rerank`: fuse keyword+semantic into a 3× candidate pool, then a local
+  cross-encoder (BAAI/bge-reranker-base via the existing `fastembed` dep, sigmoid-normalized) reorders
+  the top-N. Best-effort + never silent — a no-op with a surfaced note in the default (model-free)
+  build, so CI is unaffected. Harness-measured on `grafiki_dev_v1` with the real model: **nDCG@10
+  0.814 → 0.927 (+0.11), MRR 0.875 → 0.958**, recall@10 0.896 → 0.917. Known v1 limit: model loaded
+  per call (C12 = cache the session). (RankGPT, bge-reranker.) **M**
 - [ ] **H5 — Reflection / consolidation + community summaries.** Periodic job: Leiden
   community detection over `relations` → LLM-summarize each community → enter as a
   **candidate** (provenance = source observation ids). Enables global "themes / what did
