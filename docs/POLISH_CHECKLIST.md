@@ -4,7 +4,7 @@ Tracks the remaining work after the 9 production-hardening milestones (M1–M5, 
 Distribution) landed on branch `production-hardening`. Current state: builds, 56
 tests pass, fmt + clippy `-D warnings` clean, smoke green, frontend + desktop build.
 
-> **Status (Section A complete):** A1–A5 done, adversarially reviewed, and committed on `production-hardening` (C11 token-hygiene also landed with A4). Each verified: tests + fmt + clippy -D warnings + smoke + frontend/desktop build.
+> **Status (Sections A + B complete):** A1-A5 and B6-B10 done, adversarially reviewed, and committed on `production-hardening`. Section E (capability roadmap) documented from RESEARCH_LANDSCAPE.md, to be planned next. Each milestone verified (tests + fmt + clippy -D warnings + smoke + frontend/desktop build).
 
 Effort key: **S** ≈ <½ day · **M** ≈ ½–2 days · **L** ≈ multi-day.
 
@@ -34,16 +34,16 @@ Effort key: **S** ≈ <½ day · **M** ≈ ½–2 days · **L** ≈ multi-day.
 
 ## B. Full polish (UI/UX completeness)
 
-- [ ] **B6 — Async Tauri commands.** export / screencapture / daemon control / 5k-file
+- [x] **B6 — Async Tauri commands.** export / screencapture / daemon control / 5k-file
   auto-capture walk run synchronously and freeze the window → `async` / `spawn_blocking`. `lib.rs`. **M**
-- [ ] **B7 — Accessibility finish.** Real `role="dialog"` + aria-modal + focus-trap + Escape on
+- [x] **B7 — Accessibility finish.** Real `role="dialog"` + aria-modal + focus-trap + Escape on
   Launcher & CommandPalette. (focus-visible, dark mode, reduced-motion already done.) `App.tsx`. **M**
-- [ ] **B8 — Lifecycle hygiene.** Stop the app-started daemon on quit (`RunEvent::ExitRequested`);
+- [x] **B8 — Lifecycle hygiene.** Stop the app-started daemon on quit (`RunEvent::ExitRequested`);
   bound screenshot retention + fix whole-second filename collisions. `lib.rs` (~L1366). **S**
-- [ ] **B9 — State round-trip completeness.** export/import still drops state
+- [x] **B9 — State round-trip completeness.** export/import still drops state
   `details`/`blockers`/`depends_on` (needs `StateItem` field additions that ripple into the
   status view). `memory.rs`. **M**
-- [ ] **B10 — Small UX bugs.** min-confidence free-text can hide all candidates; duplicate-pane
+- [x] **B10 — Small UX bugs.** min-confidence free-text can hide all candidates; duplicate-pane
   uses active not clicked pane; `titleForPane` crash on tampered URL hash; restrictive CSP
   (`tauri.conf.json`). `App.tsx`. **S each**
 
