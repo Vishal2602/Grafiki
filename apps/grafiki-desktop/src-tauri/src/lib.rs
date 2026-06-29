@@ -539,7 +539,7 @@ struct HandoffSessionRequest {
     session_id: Option<String>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_project_snapshot(request: Option<SnapshotRequest>) -> ProjectSnapshot {
     let request = request.unwrap_or(SnapshotRequest {
         start_dir: None,
@@ -712,7 +712,7 @@ fn handoff_grafiki_session(request: HandoffSessionRequest) -> Result<HandoffRepo
     .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_memory_record(request: DetailRequest) -> Result<MemoryRecordDetail, String> {
     let start_dir = resolve_start_dir(request.start_dir);
     let scope = clean_optional(request.scope).unwrap_or_default();
@@ -1185,7 +1185,7 @@ fn reject_memory_candidate(
     .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn auto_capture_memory(request: AutoCaptureRequest) -> Result<AutoCaptureResponse, String> {
     let start_dir = resolve_start_dir(request.start_dir);
     let scope = clean_optional(request.scope).unwrap_or_default();
@@ -1332,7 +1332,7 @@ fn update_capture_config_settings(
     .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn summarize_automatic_capture(
     request: Option<CaptureListRequest>,
 ) -> Result<CaptureCandidateReport, String> {
@@ -1354,7 +1354,7 @@ fn summarize_automatic_capture(
     .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn import_agent_transcripts_from_disk(
     request: TranscriptImportRequest,
 ) -> Result<AgentTranscriptImportReport, String> {
@@ -1371,7 +1371,7 @@ fn import_agent_transcripts_from_disk(
     .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn capture_screen_snapshot(request: ScreenCaptureRequest) -> Result<CaptureEventReport, String> {
     let start_dir = resolve_start_dir(request.start_dir);
     let scope = clean_optional(request.scope).unwrap_or_default();
@@ -1709,7 +1709,7 @@ fn update_memory_record(request: UpdateRecordRequest) -> Result<UpdateRecordResp
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn export_memory_file(request: ExportFileRequest) -> Result<ExportFileResponse, String> {
     let output_path = required("Output path", &request.output_path)?;
     let bundle = export_memory(ExportOptions {
@@ -1736,7 +1736,7 @@ fn export_memory_file(request: ExportFileRequest) -> Result<ExportFileResponse, 
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn import_memory_file(request: ImportFileRequest) -> Result<ImportReport, String> {
     let input_path = required("Input path", &request.input_path)?;
     let content = fs::read_to_string(&input_path).map_err(|error| error.to_string())?;
@@ -1751,7 +1751,7 @@ fn import_memory_file(request: ImportFileRequest) -> Result<ImportReport, String
     .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn process_project_embeddings(
     request: Option<ProcessEmbeddingsRequest>,
 ) -> Result<ProcessEmbeddingsReport, String> {
@@ -1773,7 +1773,7 @@ fn process_project_embeddings(
     .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_daemon_status(
     request: Option<DaemonControlRequest>,
     tokens: State<DaemonTokens>,
@@ -1844,7 +1844,7 @@ fn get_daemon_status(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn start_daemon(
     request: DaemonControlRequest,
     tokens: State<DaemonTokens>,
@@ -1912,7 +1912,7 @@ fn start_daemon(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn stop_daemon(
     request: Option<DaemonControlRequest>,
     tokens: State<DaemonTokens>,
