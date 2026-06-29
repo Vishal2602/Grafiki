@@ -903,6 +903,12 @@ pub struct StateItem {
     pub priority: String,
     pub owner: Option<String>,
     pub scope: String,
+    #[serde(default)]
+    pub details: Option<String>,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3053,11 +3059,14 @@ pub fn import_memory(options: ImportOptions) -> Result<ImportReport> {
         tx.execute(
             "
             INSERT INTO state (id, key, title, status, owner, details, blockers, depends_on, scope, priority)
-            VALUES (?1, ?2, ?3, ?4, ?5, NULL, '[]', '[]', ?6, ?7)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(key) DO UPDATE SET
                 title = excluded.title,
                 status = excluded.status,
                 owner = excluded.owner,
+                details = excluded.details,
+                blockers = excluded.blockers,
+                depends_on = excluded.depends_on,
                 scope = excluded.scope,
                 priority = excluded.priority,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
@@ -3068,6 +3077,9 @@ pub fn import_memory(options: ImportOptions) -> Result<ImportReport> {
                 item.title,
                 item.status,
                 item.owner,
+                item.details,
+                json_array(&item.blockers)?,
+                json_array(&item.depends_on)?,
                 item.scope,
                 item.priority
             ],
@@ -4112,7 +4124,7 @@ pub fn list_state(options: StateListOptions) -> Result<Vec<StateItem>> {
             let status = validate_state_status(status.trim())?;
             let sql = scoped_query(
                 "
-                SELECT key, title, status, priority, owner, scope
+                SELECT key, title, status, priority, owner, scope, details, blockers, depends_on
                 FROM state
                 WHERE status = ? AND scope IN ({scopes})
                 ORDER BY updated_at DESC
@@ -4132,7 +4144,7 @@ pub fn list_state(options: StateListOptions) -> Result<Vec<StateItem>> {
         None => query_scoped_rows(
             &connection,
             "
-            SELECT key, title, status, priority, owner, scope
+            SELECT key, title, status, priority, owner, scope, details, blockers, depends_on
             FROM state
             WHERE scope IN ({scopes})
             ORDER BY updated_at DESC
@@ -5259,6 +5271,9 @@ fn state_item_from_row(row: &Row<'_>) -> rusqlite::Result<StateItem> {
         priority: row.get(3)?,
         owner: row.get(4)?,
         scope: row.get(5)?,
+        details: row.get(6)?,
+        blockers: parse_json_list(row.get::<_, Option<String>>(7)?.as_deref()),
+        depends_on: parse_json_list(row.get::<_, Option<String>>(8)?.as_deref()),
     })
 }
 
@@ -7676,7 +7691,7 @@ fn export_state(connection: &Connection, scope_chain: &[String]) -> Result<Vec<S
     query_scoped_rows(
         connection,
         "
-        SELECT key, title, status, priority, owner, scope
+        SELECT key, title, status, priority, owner, scope, details, blockers, depends_on
         FROM state
         WHERE scope IN ({scopes})
         ORDER BY updated_at ASC, key ASC
@@ -9800,6 +9815,69 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(db_mode, 0o600, "project database should be owner-only");
+    }
+
+    #[test]
+    fn export_import_round_trips_state_details_blockers_depends_on() {
+        let (temp, home, source_dir) = setup_project();
+        upsert_state(UpsertStateOptions {
+            project_name: None,
+            start_dir: source_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            key: "migrate-db".to_owned(),
+            title: "Migrate DB".to_owned(),
+            status: "blocked".to_owned(),
+            owner: Some("alice".to_owned()),
+            details: Some("waiting on schema sign-off".to_owned()),
+            blockers: vec!["schema-review".to_owned(), "staging-access".to_owned()],
+            depends_on: vec!["auth-service".to_owned()],
+            scope: "example-project/core".to_owned(),
+            priority: "high".to_owned(),
+        })
+        .unwrap();
+
+        let bundle = export_memory(ExportOptions {
+            project_name: None,
+            start_dir: source_dir,
+            grafiki_home: Some(home.clone()),
+            scope: "example-project/core".to_owned(),
+        })
+        .unwrap();
+        let exported = bundle.state.iter().find(|s| s.key == "migrate-db").unwrap();
+        assert_eq!(
+            exported.details.as_deref(),
+            Some("waiting on schema sign-off")
+        );
+        assert_eq!(exported.blockers, vec!["schema-review", "staging-access"]);
+        assert_eq!(exported.depends_on, vec!["auth-service"]);
+
+        let target_dir = temp.path().join("target-project");
+        init_project(InitOptions {
+            project_name: None,
+            project_dir: target_dir.clone(),
+            grafiki_home: Some(home.clone()),
+        })
+        .unwrap();
+        import_memory(ImportOptions {
+            project_name: None,
+            start_dir: target_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            bundle,
+        })
+        .unwrap();
+
+        let imported = list_state(StateListOptions {
+            project_name: None,
+            start_dir: target_dir,
+            grafiki_home: Some(home),
+            status: None,
+            scope: "example-project/core".to_owned(),
+        })
+        .unwrap();
+        let item = imported.iter().find(|s| s.key == "migrate-db").unwrap();
+        assert_eq!(item.details.as_deref(), Some("waiting on schema sign-off"));
+        assert_eq!(item.blockers, vec!["schema-review", "staging-access"]);
+        assert_eq!(item.depends_on, vec!["auth-service"]);
     }
 
     #[test]
