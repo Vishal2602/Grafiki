@@ -121,10 +121,20 @@ the `relations` table).
   build, so CI is unaffected. Harness-measured on `grafiki_dev_v1` with the real model: **nDCG@10
   0.814 → 0.927 (+0.11), MRR 0.875 → 0.958**, recall@10 0.896 → 0.917. Known v1 limit: model loaded
   per call (C12 = cache the session). (RankGPT, bge-reranker.) **M**
-- [ ] **H5 — Reflection / consolidation + community summaries.** Periodic job: Leiden
-  community detection over `relations` → LLM-summarize each community → enter as a
-  **candidate** (provenance = source observation ids). Enables global "themes / what did
-  we decide about X" briefings. (Generative Agents, GraphRAG, LightRAG.) **L**
+- [x] **H5 — Reflection / consolidation + community summaries.** **DONE** (adversarially
+  reviewed twice — design + diff; all C1–C10 + 3 confirmed diff findings fixed).
+  `grafiki_core::detect_communities` (deterministic single-level **Louvain**, canonical
+  adjacency — no Leiden dep) over the in-scope `relations` graph → a **deterministic,
+  model-free EXTRACTIVE** summary per community (no LLM; Grafiki has no generator) →
+  proposed as a **pending `context` candidate** with `evidence_links` provenance to the
+  source observation ids, redaction-at-source, and cohesion-weighted confidence. Idempotent
+  (membership/fact-set dedup key; `context.key` is an unconditional backstop even under
+  `--force`). CLI `grafiki reflect` (manual only). **Eval Arm E** (`grafiki_themes_v1`) runs
+  the real pipeline end-to-end as a model-free CI gate: produced summaries byte-equal the
+  committed fixture, the consolidated doc is retrievable only after reflection, and the lift
+  is real (keyword nDCG@10 0.275→0.515, recall@10 0.72→1.00). v1 defers multi-level/Leiden
+  refinement + the optional `#[cfg(feature="llm-summaries")]` refiner. (Generative Agents,
+  GraphRAG, LightRAG.) See `docs/REFLECTION_DESIGN.md`. **L**
 
 ### E-Medium leverage
 
