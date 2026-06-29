@@ -2,6 +2,17 @@
 
 > Granola for coding agents. Local-first memory that captures coding decisions, cites evidence, and lets AI coding agents ask what happened before.
 
+[![CI](https://github.com/Vishal2602/Grafiki/actions/workflows/ci.yml/badge.svg)](https://github.com/Vishal2602/Grafiki/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.95-orange.svg)](rust-toolchain.toml)
+
+> **Status:** working local alpha, production-hardened. Builds, tested, and linted in CI
+> (`cargo test` + `clippy -D warnings` + `scripts/smoke.sh` + desktop build). Pre-1.0; the
+> macOS desktop app is not yet code-signed (see [docs/INSTALL.md](docs/INSTALL.md)). See
+> [docs/POLISH_CHECKLIST.md](docs/POLISH_CHECKLIST.md) for the roadmap and
+> [docs/RESEARCH_LANDSCAPE.md](docs/RESEARCH_LANDSCAPE.md) for how it compares to the
+> agent-memory research frontier.
+
 Grafiki is a local-first memory layer for AI-assisted software development. It is not a generic notes app and not a broad screen recorder. It is a coding flight recorder: it stores project decisions, observations, active state, handoffs, raw coding capture events, reviewable memory candidates, and cited answers for AI agents.
 
 The core loop is now implemented: project init, first-run import, sessions, decisions, entity graph memory, scoped search, coding-memory retrieval fixtures, candidate review with grouping/edit/bulk/noisy actions, evidence-linked capture summaries, workspace capture consent config, Codex/Claude Code/Cursor transcript import, terminal command capture, workspace file-change snapshots, git working-tree summaries, `grafiki ask`, agent query audit logs, raw capture sessions/events, HTTP, MCP, Tauri desktop, reports, analysis, export, and JSON import.
