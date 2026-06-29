@@ -1,0 +1,9 @@
+{"doc_id":"ent-billing","record_type":"entity","payload":{"name":"Billing Service","entity_type":"service","category":"architecture"}}
+{"doc_id":"obs-billing","record_type":"observation","payload":{"name":"Billing Service","entity_type":"service","category":"architecture","text":"Handles invoicing and dunning workflows for monthly subscriptions"}}
+{"doc_id":"ent-postgres","record_type":"entity","payload":{"name":"Postgres Database","entity_type":"service","category":"architecture"}}
+{"doc_id":"obs-postgres","record_type":"observation","payload":{"name":"Postgres Database","entity_type":"service","category":"architecture","text":"Provisioned on AWS RDS with multi-AZ failover and nightly snapshots"}}
+{"doc_id":"ent-auth","record_type":"entity","payload":{"name":"Auth Service","entity_type":"service","category":"architecture"}}
+{"doc_id":"ent-redis","record_type":"entity","payload":{"name":"Redis Cache","entity_type":"service","category":"architecture"}}
+{"doc_id":"obs-redis","record_type":"observation","payload":{"name":"Redis Cache","entity_type":"service","category":"architecture","text":"Configured with an LRU eviction policy and a two gigabyte memory ceiling"}}
+{"doc_id":"ent-gateway","record_type":"entity","payload":{"name":"API Gateway","entity_type":"service","category":"architecture"}}
+{"doc_id":"obs-gateway","record_type":"observation","payload":{"name":"API Gateway","entity_type":"service","category":"architecture","text":"Throttles clients at one thousand calls per minute using token-bucket limiting"}}

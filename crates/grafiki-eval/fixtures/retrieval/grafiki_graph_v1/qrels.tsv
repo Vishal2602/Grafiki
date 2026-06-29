@@ -1,0 +1,9 @@
+query-id	corpus-id	score
+q1	obs-postgres	2
+q1	ent-postgres	1
+q2	obs-redis	2
+q2	ent-redis	1
+q3	obs-billing	2
+q3	ent-billing	1
+q4	obs-postgres	2
+q4	ent-postgres	1

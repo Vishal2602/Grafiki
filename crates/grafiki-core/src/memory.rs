@@ -279,6 +279,10 @@ pub enum SearchMode {
     Keyword,
     Semantic,
     Hybrid,
+    /// Hybrid + a graph-aware arm: Personalized PageRank over the `relations`
+    /// graph, seeded from the lexical/dense hits, fused into the RRF. Helps
+    /// multi-hop / relational queries (H3).
+    Graph,
 }
 
 impl SearchMode {
@@ -287,6 +291,7 @@ impl SearchMode {
             "keyword" => Ok(Self::Keyword),
             "semantic" => Ok(Self::Semantic),
             "hybrid" => Ok(Self::Hybrid),
+            "graph" => Ok(Self::Graph),
             _ => Err(GrafikiError::InvalidSearchMode(raw.to_owned())),
         }
     }
@@ -2214,7 +2219,7 @@ pub fn search_memory(options: SearchMemoryOptions) -> Result<SearchReport> {
     )?;
     let limit = options.limit.clamp(1, 100);
     let record_type = options.record_type.as_str();
-    let candidate_limit = if options.mode == SearchMode::Hybrid {
+    let candidate_limit = if matches!(options.mode, SearchMode::Hybrid | SearchMode::Graph) {
         limit.saturating_mul(3).max(limit).min(100)
     } else {
         limit
@@ -2261,7 +2266,13 @@ pub fn search_memory(options: SearchMemoryOptions) -> Result<SearchReport> {
             ),
         ),
         SearchMode::Hybrid if semantic_available => (
-            hybrid_search_results(&options.query, keyword_results, semantic_results, limit),
+            hybrid_search_results(
+                &options.query,
+                keyword_results,
+                semantic_results,
+                Vec::new(),
+                limit,
+            ),
             None,
         ),
         SearchMode::Hybrid if semantic_error.is_some() => (
@@ -2278,6 +2289,36 @@ pub fn search_memory(options: SearchMemoryOptions) -> Result<SearchReport> {
                     .to_owned(),
             ),
         ),
+        // Graph: PPR over relations, seeded from the lexical/dense hits, fused with
+        // keyword (+ semantic when available). Model-free with keyword seeds alone.
+        SearchMode::Graph => {
+            let graph_results = graph_search_results(
+                &connection,
+                &scope_chain,
+                &keyword_results,
+                &semantic_results,
+                candidate_limit,
+            )
+            .unwrap_or_default();
+            let fallback = if semantic_available {
+                None
+            } else {
+                Some(
+                    "Graph search used keyword seeds only (no semantic vectors yet)."
+                        .to_owned(),
+                )
+            };
+            (
+                hybrid_search_results(
+                    &options.query,
+                    keyword_results,
+                    semantic_results,
+                    graph_results,
+                    limit,
+                ),
+                fallback,
+            )
+        }
     };
 
     attach_search_evidence(&connection, &mut results)?;
@@ -2545,6 +2586,7 @@ fn search_mode_label(mode: SearchMode) -> &'static str {
         SearchMode::Keyword => "keyword",
         SearchMode::Semantic => "semantic",
         SearchMode::Hybrid => "hybrid",
+        SearchMode::Graph => "graph",
     }
 }
 
@@ -7169,15 +7211,157 @@ fn sqlite_vec_table_name_parts(provider_name: &str, model_name: &str, dimension:
     format!("embedding_vec_{}", &hash[..16])
 }
 
+/// H3 graph-aware arm: Personalized PageRank over the in-scope `relations` graph,
+/// seeded from the entities surfaced by the lexical/dense arms, mapped back to
+/// retrievable records (each ranked entity contributes itself + its live
+/// observations). Returns an empty list when there are no seeds or no relations,
+/// so it is a safe no-op on corpora without a graph.
+fn graph_search_results(
+    connection: &Connection,
+    scope_chain: &[String],
+    keyword_results: &[SearchResult],
+    semantic_results: &[SearchResult],
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    use crate::graph::{
+        personalized_pagerank, Graph, DEFAULT_DAMPING, DEFAULT_MAX_ITERS, DEFAULT_TOLERANCE,
+    };
+
+    // 1. Seeds: entity ids from the prior arms, weighted by rank (earlier ⇒ stronger).
+    let mut seeds: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    for results in [keyword_results, semantic_results] {
+        for (rank, result) in results.iter().enumerate() {
+            let entity_id = match result.record_type.as_str() {
+                "entity" => Some(result.id.clone()),
+                // search_observations returns the owning entity_id in `title`.
+                "observation" => Some(result.title.clone()),
+                _ => None,
+            };
+            if let Some(id) = entity_id {
+                *seeds.entry(id).or_insert(0.0) += 1.0 / (rank as f64 + 1.0);
+            }
+        }
+    }
+    if seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 2. Load the in-scope, currently-valid relations subgraph (both endpoints in scope).
+    let placeholders = vec!["?"; scope_chain.len()].join(",");
+    let sql = format!(
+        "
+        SELECT r.from_entity, r.to_entity, r.weight
+        FROM relations r
+        JOIN entities ef ON ef.id = r.from_entity
+        JOIN entities et ON et.id = r.to_entity
+        WHERE r.valid_to IS NULL
+          AND ef.scope IN ({placeholders}) AND et.scope IN ({placeholders})
+        "
+    );
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(scope_chain.len() * 2);
+    for scope in scope_chain {
+        params.push(scope);
+    }
+    for scope in scope_chain {
+        params.push(scope);
+    }
+    let mut graph = Graph::new();
+    {
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (from, to, weight) = row?;
+            graph.add_edge(&from, &to, weight);
+        }
+    }
+    // No graph, or no seed actually lands on a node → nothing to add.
+    if graph.is_empty() || !seeds.keys().any(|s| graph.contains(s)) {
+        return Ok(Vec::new());
+    }
+
+    // 3. Personalized PageRank.
+    let scores = personalized_pagerank(
+        &graph,
+        &seeds,
+        DEFAULT_DAMPING,
+        DEFAULT_MAX_ITERS,
+        DEFAULT_TOLERANCE,
+    );
+
+    // 4. Rank entities by PPR (desc, id tie-break) and map back to records.
+    let mut ranked: Vec<(String, f64)> = scores.into_iter().filter(|(_, s)| *s > 0.0).collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut out = Vec::new();
+    for (entity_id, _score) in ranked {
+        let entity: Option<(String, String, String)> = connection
+            .query_row(
+                "SELECT name, entity_type, scope FROM entities WHERE id = ?1",
+                [&entity_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((name, entity_type, scope)) = entity else {
+            continue;
+        };
+        if !scope_chain.iter().any(|s| s == &scope) {
+            continue;
+        }
+        out.push(SearchResult {
+            record_type: "entity".to_owned(),
+            id: entity_id.clone(),
+            title: name,
+            snippet: entity_type,
+            scope: scope.clone(),
+            score: None,
+            evidence: Vec::new(),
+        });
+        let mut statement = connection.prepare(
+            "SELECT id, content FROM observations WHERE entity_id = ?1 AND valid_to IS NULL",
+        )?;
+        let obs = statement.query_map([&entity_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in obs {
+            let (obs_id, content) = row?;
+            out.push(SearchResult {
+                record_type: "observation".to_owned(),
+                id: obs_id,
+                title: entity_id.clone(),
+                snippet: content,
+                scope: scope.clone(),
+                score: None,
+                evidence: Vec::new(),
+            });
+        }
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 fn hybrid_search_results(
     query: &str,
     keyword_results: Vec<SearchResult>,
     semantic_results: Vec<SearchResult>,
+    graph_results: Vec<SearchResult>,
     limit: usize,
 ) -> Vec<SearchResult> {
     let mut scored: HashMap<(String, String), HybridScore> = HashMap::new();
     add_hybrid_scores(&mut scored, query, keyword_results, SearchSource::Keyword);
     add_hybrid_scores(&mut scored, query, semantic_results, SearchSource::Semantic);
+    add_hybrid_scores(&mut scored, query, graph_results, SearchSource::Graph);
     let mut results: Vec<_> = scored.into_values().collect();
     results.sort_by(|left, right| {
         right
@@ -7210,6 +7394,7 @@ struct HybridScore {
 enum SearchSource {
     Keyword,
     Semantic,
+    Graph,
 }
 
 impl SearchSource {
@@ -7217,13 +7402,17 @@ impl SearchSource {
         match self {
             Self::Keyword => 1.10,
             Self::Semantic => 1.00,
+            // Slightly below the direct-match arms: graph reachability is a
+            // weaker (structural) signal than a direct lexical/dense hit.
+            Self::Graph => 0.90,
         }
     }
 
     fn bit(self) -> u8 {
         match self {
-            Self::Keyword => 0b01,
-            Self::Semantic => 0b10,
+            Self::Keyword => 0b001,
+            Self::Semantic => 0b010,
+            Self::Graph => 0b100,
         }
     }
 }
@@ -8312,7 +8501,13 @@ mod tests {
             ),
         ];
 
-        let results = hybrid_search_results("token rotation", keyword_results, semantic_results, 3);
+        let results = hybrid_search_results(
+            "token rotation",
+            keyword_results,
+            semantic_results,
+            Vec::new(),
+            3,
+        );
 
         assert_eq!(results[0].id, "auth-guide");
         assert!(results[0].score.is_some());

@@ -1,0 +1,5 @@
+{
+  "name": "grafiki_graph_v1",
+  "version": "1.0.0",
+  "description": "Multi-hop graph-retrieval gold set (H3): the relevant fact for each query lives on an entity reachable only by traversing the relations graph from the query's seed entity, and its content shares no terms with the query — so lexical/dense miss it and Personalized PageRank must surface it."
+}

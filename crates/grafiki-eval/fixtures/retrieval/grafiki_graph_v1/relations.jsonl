@@ -1,0 +1,3 @@
+{"from":"ent-billing","to":"ent-postgres","relation":"owns"}
+{"from":"ent-auth","to":"ent-redis","relation":"uses"}
+{"from":"ent-gateway","to":"ent-billing","relation":"calls"}

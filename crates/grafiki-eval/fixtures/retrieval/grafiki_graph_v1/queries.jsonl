@@ -1,0 +1,4 @@
+{"_id":"q1","text":"what is billing backed by"}
+{"_id":"q2","text":"what does auth rely on"}
+{"_id":"q3","text":"what does the gateway forward to"}
+{"_id":"q4","text":"which datastore is behind the gateway"}

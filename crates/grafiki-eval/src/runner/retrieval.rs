@@ -24,6 +24,7 @@ pub fn mode_label(mode: SearchMode) -> &'static str {
         SearchMode::Keyword => "keyword",
         SearchMode::Semantic => "semantic",
         SearchMode::Hybrid => "hybrid",
+        SearchMode::Graph => "graph",
     }
 }
 
@@ -66,7 +67,11 @@ pub fn run_retrieval(
     modes: &[SearchMode],
     cfg: &EvalConfig,
 ) -> EvalResult<RetrievalReport> {
-    let needs_embeddings = modes.iter().any(|m| !matches!(m, SearchMode::Keyword));
+    // Only semantic/hybrid require the embedding model. Keyword and Graph are
+    // model-free (Graph seeds from the keyword arm + PPR over relations).
+    let needs_embeddings = modes
+        .iter()
+        .any(|m| matches!(m, SearchMode::Semantic | SearchMode::Hybrid));
 
     let t_seed = Instant::now();
     let corpus = seed_retrieval(dataset, needs_embeddings)?;
@@ -92,7 +97,7 @@ pub fn run_retrieval(
         // semantic/hybrid result (EVAL_DESIGN §2.3). Gate on the seed-time signal,
         // not a single zero-match query — a semantic query can legitimately return
         // no positive-cosine hit without meaning the index is missing.
-        if !matches!(mode, SearchMode::Keyword) && !embeddings_built {
+        if matches!(mode, SearchMode::Semantic | SearchMode::Hybrid) && !embeddings_built {
             return Err(format!(
                 "mode '{}' requested but no embeddings were built for the corpus \
                  (process_embedding_jobs produced 0 vectors) — this would be a keyword \

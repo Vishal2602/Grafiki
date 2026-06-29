@@ -66,6 +66,15 @@ pub struct DatasetMeta {
     pub description: Option<String>,
 }
 
+/// A relation edge between two corpus entities (referenced by `doc_id`), used to
+/// seed the graph for the H3 graph-retrieval arm.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelationSpec {
+    pub from: String,
+    pub to: String,
+    pub relation: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct RetrievalDataset {
     pub name: String,
@@ -74,6 +83,8 @@ pub struct RetrievalDataset {
     pub corpus: Vec<CorpusDoc>,
     pub queries: Vec<Query>,
     pub qrels: Qrels,
+    /// Optional graph edges (from `relations.jsonl`) for the graph arm.
+    pub relations: Vec<RelationSpec>,
 }
 
 /// Parse a TREC `qrels.tsv`: `query-id <TAB> corpus-id <TAB> grade`. An optional
@@ -121,6 +132,12 @@ impl RetrievalDataset {
         let corpus: Vec<CorpusDoc> = read_jsonl(&dir.join("corpus_seed.jsonl"))?;
         let queries: Vec<Query> = read_jsonl(&dir.join("queries.jsonl"))?;
         let qrels = load_qrels(&dir.join("qrels.tsv"))?;
+        let relations_path = dir.join("relations.jsonl");
+        let relations: Vec<RelationSpec> = if relations_path.exists() {
+            read_jsonl(&relations_path)?
+        } else {
+            Vec::new()
+        };
 
         let meta_path = dir.join("dataset.json");
         let meta: DatasetMeta = if meta_path.exists() {
@@ -141,6 +158,7 @@ impl RetrievalDataset {
             corpus,
             queries,
             qrels,
+            relations,
         };
         dataset.validate()?;
         Ok(dataset)

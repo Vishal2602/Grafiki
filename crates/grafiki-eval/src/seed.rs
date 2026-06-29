@@ -94,6 +94,8 @@ pub fn seed_retrieval(
     })?;
 
     let mut record_to_doc = HashMap::new();
+    // doc_id -> (name, entity_type, entity_id) for entity docs, to wire relations.
+    let mut entity_by_doc: HashMap<String, (String, String, String)> = HashMap::new();
     for doc in &dataset.corpus {
         let scope = doc.scope.clone().unwrap_or_else(|| EVAL_SCOPE.to_string());
         // The retrieval arm searches a single scope (EVAL_SCOPE), whose chain is
@@ -111,17 +113,20 @@ pub fn seed_retrieval(
         let p = &doc.payload;
         let key = match doc.record_type.as_str() {
             "entity" => {
+                let name = pstr(p, "name")?;
+                let entity_type = pstr_or(p, "entity_type", "concept");
                 let r = save_entity(SaveEntityOptions {
                     project_name: Some(EVAL_PROJECT.to_string()),
                     start_dir: start_dir.clone(),
                     grafiki_home: Some(home_path.clone()),
-                    name: pstr(p, "name")?,
-                    entity_type: pstr_or(p, "entity_type", "concept"),
+                    name: name.clone(),
+                    entity_type: entity_type.clone(),
                     observe: popt(p, "observe"),
                     category: pstr_or(p, "category", "general"),
                     scope,
                     relate: None,
                 })?;
+                entity_by_doc.insert(doc.doc_id.clone(), (name, entity_type, r.entity_id.clone()));
                 format!("entity:{}", r.entity_id)
             }
             "observation" => {
@@ -179,6 +184,41 @@ pub fn seed_retrieval(
             )
             .into());
         }
+    }
+
+    // Second pass: wire relations between already-created entities. Re-saving the
+    // `from` entity with `relate` creates the edge (the entity id is its slug, so
+    // the re-save is an idempotent upsert).
+    for rel in &dataset.relations {
+        let from = entity_by_doc
+            .get(&rel.from)
+            .ok_or_else(|| -> crate::config::EvalError {
+                format!(
+                    "relation references unknown/ non-entity from-doc '{}'",
+                    rel.from
+                )
+                .into()
+            })?;
+        let to = entity_by_doc
+            .get(&rel.to)
+            .ok_or_else(|| -> crate::config::EvalError {
+                format!(
+                    "relation references unknown/ non-entity to-doc '{}'",
+                    rel.to
+                )
+                .into()
+            })?;
+        save_entity(SaveEntityOptions {
+            project_name: Some(EVAL_PROJECT.to_string()),
+            start_dir: start_dir.clone(),
+            grafiki_home: Some(home_path.clone()),
+            name: from.0.clone(),
+            entity_type: from.1.clone(),
+            observe: None,
+            category: "general".to_string(),
+            scope: EVAL_SCOPE.to_string(),
+            relate: Some(format!("{}:{}", to.2, rel.relation)),
+        })?;
     }
 
     let embedding = if build_embeddings {

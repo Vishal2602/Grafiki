@@ -16,6 +16,30 @@ fn fixtures() -> PathBuf {
 }
 
 #[test]
+fn graph_arm_surfaces_multihop_facts() {
+    // H3: on multi-hop queries whose relevant fact is only reachable via the
+    // relations graph (and shares no terms with the query), keyword retrieval
+    // finds nothing, while the model-free graph arm (keyword seeds + PPR) recovers
+    // it. Pure model-free — no embeddings.
+    let dataset = RetrievalDataset::load(&fixtures().join("retrieval/grafiki_graph_v1"))
+        .expect("load graph fixture");
+    let cfg = EvalConfig::default();
+    let keyword = run_retrieval(&dataset, &[SearchMode::Keyword], &cfg).expect("keyword");
+    let graph = run_retrieval(&dataset, &[SearchMode::Graph], &cfg).expect("graph");
+
+    let kw_recall = keyword.modes[0].overall.macro_avg["recall@10"];
+    let graph_recall = graph.modes[0].overall.macro_avg["recall@10"];
+    assert!(
+        graph_recall >= 0.99,
+        "graph arm should surface the multi-hop facts (recall@10={graph_recall:.4})"
+    );
+    assert!(
+        graph_recall > kw_recall + 0.5,
+        "graph must lift multi-hop recall over keyword (kw={kw_recall:.4}, graph={graph_recall:.4})"
+    );
+}
+
+#[test]
 fn keyword_retrieval_is_sane() {
     let dataset = RetrievalDataset::load(&fixtures().join("retrieval/grafiki_dev_v1"))
         .expect("load retrieval fixture");
