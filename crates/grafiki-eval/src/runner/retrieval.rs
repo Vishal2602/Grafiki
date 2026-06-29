@@ -71,9 +71,12 @@ pub fn run_retrieval(
     // Semantic/Hybrid/Rerank need the model (Rerank's candidate pool includes the
     // semantic arm, and the cross-encoder itself is a model). Keyword and Graph are
     // model-free (Graph seeds from the keyword arm + PPR over relations).
-    let needs_embeddings = modes
-        .iter()
-        .any(|m| matches!(m, SearchMode::Semantic | SearchMode::Hybrid | SearchMode::Rerank));
+    let needs_embeddings = modes.iter().any(|m| {
+        matches!(
+            m,
+            SearchMode::Semantic | SearchMode::Hybrid | SearchMode::Rerank
+        )
+    });
 
     let t_seed = Instant::now();
     let corpus = seed_retrieval(dataset, needs_embeddings)?;
