@@ -7,6 +7,24 @@ export const defaultPanes: PaneState[] = [
 const STORAGE_KEY = "grafiki.desktop.layout";
 const LAYOUT_VERSION = 2;
 
+// Known pane kinds (must match PaneKind in types.ts). Used to reject panes from a
+// tampered/old URL hash before they reach the renderer.
+const PANE_KINDS: ReadonlySet<string> = new Set([
+  "overview",
+  "search",
+  "graph",
+  "candidates",
+  "relations",
+  "sessions",
+  "state",
+  "decisions",
+  "context",
+  "settings",
+  "detail",
+  "capture",
+  "agent",
+]);
+
 export function createDefaultLayout(): LayoutState {
   return {
     activePaneId: defaultPanes[0].id,
@@ -55,11 +73,17 @@ export function decodeLayout(value: string | null): LayoutState | null {
     if (parsed.version !== LAYOUT_VERSION) return null;
     if (!Array.isArray(parsed.panes) || parsed.panes.length === 0) return null;
     const panes = parsed.panes
-      .filter((pane) => typeof pane.id === "string" && typeof pane.kind === "string")
+      .filter(
+        (pane) =>
+          typeof pane.id === "string" &&
+          typeof pane.kind === "string" &&
+          PANE_KINDS.has(pane.kind),
+      )
       .map((pane) => ({
         ...pane,
         title: pane.title || titleForPane(pane),
       }));
+    if (panes.length === 0) return null;
     const activePaneId = panes.some((pane) => pane.id === parsed.activePaneId)
       ? parsed.activePaneId
       : panes[0].id;
@@ -78,7 +102,9 @@ export function titleForPane(pane: Pick<PaneState, "kind" | "query" | "recordId"
   if (pane.kind === "capture") return pane.captureType ? `New ${pane.captureType}` : "Capture";
   if (pane.kind === "candidates") return "Memory Review";
   if (pane.kind === "agent") return "Agent Activity";
-  return pane.kind[0].toUpperCase() + pane.kind.slice(1);
+  const kind = pane.kind ?? "";
+  if (!kind) return "Pane";
+  return kind[0].toUpperCase() + kind.slice(1);
 }
 
 export function newPaneId(kind: string) {

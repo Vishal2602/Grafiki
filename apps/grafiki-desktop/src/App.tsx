@@ -79,6 +79,7 @@ import {
   isPreviewMode,
   confirmDialog,
 } from "./api";
+import { useModalDialog } from "./useModalDialog";
 import {
   decodeLayoutFromHash,
   loadInitialLayout,
@@ -463,17 +464,24 @@ export default function App() {
     });
   }
 
+  function duplicatePane(id: string) {
+    setLayout((current) => {
+      const source = current.panes.find((pane) => pane.id === id);
+      if (!source) return current;
+      const copy = {
+        ...source,
+        id: newPaneId(source.kind),
+        title: `${source.title} Copy`,
+      };
+      return {
+        activePaneId: copy.id,
+        panes: [...current.panes, copy],
+      };
+    });
+  }
+
   function duplicateActivePane() {
-    if (!activePane) return;
-    const pane = {
-      ...activePane,
-      id: newPaneId(activePane.kind),
-      title: `${activePane.title} Copy`,
-    };
-    setLayout((current) => ({
-      activePaneId: pane.id,
-      panes: [...current.panes, pane],
-    }));
+    duplicatePane(layout.activePaneId);
   }
 
   function openResultInPane(result: SearchResult) {
@@ -553,7 +561,7 @@ export default function App() {
                 reduceMotion={reduceMotion}
                 onActivate={() => activatePane(pane.id)}
                 onClose={() => closePane(pane.id)}
-                onSplit={duplicateActivePane}
+                onSplit={() => duplicatePane(pane.id)}
                 onUpdate={(patch) => updatePane(pane.id, patch)}
                 onSelectResult={(result) => {
                   setSelectedResult(result);
@@ -1785,7 +1793,11 @@ function CandidatesPane(props: {
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const minConfidenceValue = Number(minConfidence);
+  const parsedConfidence = Number.parseFloat(minConfidence);
+  // Confidence is 0..1; clamp so a stray "9" can't silently hide everything.
+  const minConfidenceValue = Number.isFinite(parsedConfidence)
+    ? Math.min(Math.max(parsedConfidence, 0), 1)
+    : 0;
   const visibleCandidates = useMemo(
     () =>
       candidates.filter((candidate) => {
@@ -2284,6 +2296,10 @@ function CandidatesPane(props: {
         <label className="compact-input confidence-filter">
           <span>Min Confidence</span>
           <input
+            type="number"
+            min={0}
+            max={1}
+            step={0.05}
             value={minConfidence}
             onChange={(event) => setMinConfidence(event.target.value)}
             inputMode="decimal"
@@ -2295,6 +2311,11 @@ function CandidatesPane(props: {
           {capturing ? "Capturing" : "Auto Capture"}
         </button>
         <span className="subtle">{visibleCandidates.length}/{candidates.length} candidates</span>
+        {candidates.length > 0 && visibleCandidates.length === 0 && minConfidenceValue > 0 ? (
+          <span className="subtle">
+            All hidden below {minConfidenceValue.toFixed(2)} — lower Min Confidence to see them.
+          </span>
+        ) : null}
       </div>
       <div className="toolbar-row candidate-toolbar">
         <span className="subtle">{selectedIds.length} selected</span>
@@ -4273,6 +4294,7 @@ function CommandPalette(props: {
   onCapture: (captureType: CaptureType) => void;
   onSplit: () => void;
 }) {
+  const dialogRef = useModalDialog<HTMLElement>(props.onClose);
   const [query, setQuery] = useState("");
   const commands = [
     ...navItems.map((item) => ({
@@ -4320,7 +4342,12 @@ function CommandPalette(props: {
       transition={transition.quick}
     >
       <motion.section
+        ref={dialogRef}
         className="command-palette"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Command palette"
+        tabIndex={-1}
         onMouseDown={(event) => event.stopPropagation()}
         initial={props.reduceMotion ? false : { opacity: 0, y: 12, scale: 0.985 }}
         animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -4373,6 +4400,7 @@ function Launcher(props: {
   onClose: () => void;
   onCapture: (captureType: CaptureType) => void;
 }) {
+  const dialogRef = useModalDialog<HTMLElement>(props.onClose);
   return (
     <motion.div
       className="overlay"
@@ -4384,7 +4412,12 @@ function Launcher(props: {
       transition={transition.quick}
     >
       <motion.section
+        ref={dialogRef}
         className="launcher"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Capture memory"
+        tabIndex={-1}
         onMouseDown={(event) => event.stopPropagation()}
         initial={props.reduceMotion ? false : { opacity: 0, y: 12, scale: 0.985 }}
         animate={{ opacity: 1, y: 0, scale: 1 }}
@@ -4438,21 +4471,13 @@ type PromptConfig = {
 // without submitting.
 function PromptModal(props: { config: PromptConfig; reduceMotion: boolean; onClose: () => void }) {
   const { config } = props;
+  const dialogRef = useModalDialog<HTMLElement>(props.onClose);
   const [values, setValues] = useState<Record<string, string>>(() =>
     Object.fromEntries(config.fields.map((field) => [field.name, field.defaultValue ?? ""])),
   );
   const setField = (name: string, value: string) =>
     setValues((current) => ({ ...current, [name]: value }));
   const submit = () => config.onSubmit(values);
-
-  // Escape closes the modal regardless of where focus is (not just inside it).
-  useEffect(() => {
-    function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") props.onClose();
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [props]);
 
   return (
     <motion.div
@@ -4465,14 +4490,13 @@ function PromptModal(props: { config: PromptConfig; reduceMotion: boolean; onClo
       transition={transition.quick}
     >
       <motion.section
+        ref={dialogRef}
         className="launcher prompt-modal"
         role="dialog"
         aria-modal="true"
         aria-label={config.title}
+        tabIndex={-1}
         onMouseDown={(event) => event.stopPropagation()}
-        onKeyDown={(event) => {
-          if (event.key === "Escape") props.onClose();
-        }}
         initial={props.reduceMotion ? false : { opacity: 0, y: 12, scale: 0.985 }}
         animate={{ opacity: 1, y: 0, scale: 1 }}
         exit={props.reduceMotion ? undefined : { opacity: 0, y: 8, scale: 0.985 }}
