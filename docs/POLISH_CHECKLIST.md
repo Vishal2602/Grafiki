@@ -105,10 +105,15 @@ the `relations` table).
   **0 stale leaks**, false-supersession 0.0 (incl. a non-vacuous guard), retraction-abstain 1.0.
   **Future (v2, optional):** dedicated `conflict` candidate type (CHECK table rebuild); NLI/LLM
   escalation; relation/state/context supersession arms; CLI/MCP conflict fields. (Graphiti, Mem0.) **L**
-- [ ] **H3 — Graph-aware retrieval.** Add a 3rd RRF arm: seed from FTS5+dense top-k
-  entities, expand 1–2 hops over `relations` (respect `valid_from`/`valid_to`), run
-  Personalized PageRank, fuse its ranking. SQL recursive query + in-memory PPR, no new
-  store. (HippoRAG, G-Retriever, GraphRAG.) **M**
+- [x] **H3 — Graph-aware retrieval.** **DONE** (adversarially reviewed — no HIGH findings; 3 lower
+  fixed). `grafiki_core::graph` = deterministic Personalized PageRank (power iteration, damping 0.5,
+  HippoRAG-style). New opt-in `SearchMode::Graph`: seeds from the keyword/dense entity hits → loads
+  the in-scope, `valid_to IS NULL` `relations` subgraph → PPR → maps ranked entities back to records
+  → fused as a 3rd RRF arm (weight 0.90). **Model-free** (keyword seeds), so it runs in fast CI; a
+  no-op when there are no relations (no single-hop regression). Harness-proven on the new multi-hop
+  fixture `grafiki_graph_v1`: keyword recall@10 **0.00 → graph 1.00**, nDCG@10 0.00 → 0.47 — recovers
+  every relation-reachable, term-disjoint fact lexical search misses. CI regression test
+  `graph_arm_surfaces_multihop_facts`. (HippoRAG, GraphRAG.) **M**
 - [ ] **H4 — Reranking stage.** Small local cross-encoder (or listwise LLM) reranker over
   RRF top-N before `grafiki_ask` builds the cited answer. (RankGPT, bge-reranker.) **M**
 - [ ] **H5 — Reflection / consolidation + community summaries.** Periodic job: Leiden
