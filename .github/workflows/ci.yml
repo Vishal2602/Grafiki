@@ -56,9 +56,29 @@ jobs:
       # Test the library + CLI (the desktop crate is exercised in the desktop job).
       - name: Test core + cli
         run: cargo test -p grafiki-core -p grafiki-cli
-      # Ensure the optional embedding features still compile (no model download).
+      # Cache the ort (ONNX Runtime) binary the `ort` crate downloads at build time.
+      - name: Cache ONNX Runtime (ort)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/ort.pyke.io
+            ~/.cache/ort.pyke.io
+          key: ort-${{ matrix.os }}-${{ hashFiles('Cargo.lock') }}
+      # Ensure the optional embedding features still compile. The `ort` crate
+      # downloads an ONNX Runtime binary at build time which can transiently fail
+      # on CI, so retry a few times before giving up.
       - name: Build with embedding features
-        run: cargo build -p grafiki-core -p grafiki-cli --features fastembed,sqlite-vec
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if cargo build -p grafiki-core -p grafiki-cli --features fastembed,sqlite-vec; then
+              exit 0
+            fi
+            echo "::warning::embedding-features build attempt ${attempt} failed (likely a flaky ort binary download); retrying in 15s"
+            sleep 15
+          done
+          echo "::error::embedding-features build failed after 3 attempts"
+          exit 1
 
   smoke:
     name: Smoke (end-to-end CLI/HTTP/MCP)
