@@ -2223,6 +2223,9 @@ pub fn search_memory(options: SearchMemoryOptions) -> Result<SearchReport> {
     )?;
     let limit = options.limit.clamp(1, 100);
     let record_type = options.record_type.as_str();
+    // Fused/reranked modes pull a wider candidate pool (3×) so fusion/reranking has
+    // material to reorder. Capped at 100 to bound work (esp. the cross-encoder),
+    // so the 3× widening only fully holds for limit ≤ 33; larger limits taper to 1×.
     let candidate_limit = if matches!(
         options.mode,
         SearchMode::Hybrid | SearchMode::Graph | SearchMode::Rerank
@@ -2350,16 +2353,21 @@ pub fn search_memory(options: SearchMemoryOptions) -> Result<SearchReport> {
                 candidate_limit,
             );
             let (reranked, rerank_note) = rerank_results(&options.query, fused, limit);
-            let fallback = rerank_note.or_else(|| {
-                if semantic_available {
-                    None
-                } else {
-                    Some(
-                        "Rerank used keyword candidates only (no semantic vectors yet)."
-                            .to_owned(),
-                    )
-                }
-            });
+            // Describe the candidate pool honestly: surface a real embedding error,
+            // and don't claim "fused results" when the pool was keyword-only.
+            let pool_note = if semantic_available {
+                None
+            } else if let Some(error) = &semantic_error {
+                Some(format!("candidate pool was keyword-only (semantic arm unavailable: {error})"))
+            } else {
+                Some("candidate pool was keyword-only (no semantic vectors yet)".to_owned())
+            };
+            let fallback = match (rerank_note, pool_note) {
+                (Some(rerank), Some(pool)) => Some(format!("{rerank} ({pool})")),
+                (Some(rerank), None) => Some(rerank),
+                (None, Some(pool)) => Some(format!("Rerank applied; {pool}.")),
+                (None, None) => None,
+            };
             (reranked, fallback)
         }
     };
@@ -7416,7 +7424,7 @@ fn rerank_results(
             .collect();
         match crate::embeddings::rerank_documents(query, &docs) {
             Ok(scored) => {
-                let mut out = Vec::with_capacity(scored.len().min(limit));
+                let mut out = Vec::with_capacity(limit);
                 for (index, score) in scored.into_iter().take(limit) {
                     if let Some(result) = candidates.get(index) {
                         let mut result = result.clone();

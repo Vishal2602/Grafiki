@@ -138,7 +138,14 @@ pub fn rerank_documents(query: &str, documents: &[String]) -> Result<Vec<(usize,
     let results = model
         .rerank(query, &refs, false, None)
         .map_err(|error| GrafikiError::Embedding(format!("rerank failed: {error}")))?;
-    Ok(results.into_iter().map(|r| (r.index, r.score)).collect())
+    // Cross-encoder outputs are raw logits (unbounded, possibly negative). Squash
+    // with a sigmoid to a [0,1] relevance score, consistent with every other
+    // score-producing path (which are all non-negative). Monotonic, so ranking is
+    // unchanged.
+    Ok(results
+        .into_iter()
+        .map(|r| (r.index, 1.0 / (1.0 + (-r.score).exp())))
+        .collect())
 }
 
 #[cfg(feature = "fastembed")]
