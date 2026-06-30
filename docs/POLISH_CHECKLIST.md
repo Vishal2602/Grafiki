@@ -65,8 +65,11 @@ Effort key: **S** ≈ <½ day · **M** ≈ ½–2 days · **L** ≈ multi-day.
 - [~] **C14 — Misc audit P2s.** ~~MCP stdin size cap~~ (**DONE**: `run_mcp` reads each JSON-RPC
   message with a 16 MiB `Read::take` + `read_until` cap instead of unbounded `lines()`; oversized →
   `-32600` error + graceful exit, never OOM; regression test `mcp_rejects_oversized_message`) +
-  protocol-version negotiation; chunked `Transfer-Encoding`; daemon PID-reuse race; ~~entity `LIKE`
-  wildcard escaping~~ (already fixed — entity search uses FTS5, schema v3); empty/colliding slug ids;
+  ~~protocol-version negotiation~~ (**DONE**: `initialize` echoes the client's requested
+  `protocolVersion` when supported {2024-11-05, 2025-03-26, 2025-06-18}, else returns the latest;
+  test `mcp_initialize_negotiates_protocol_version`); chunked `Transfer-Encoding`; daemon PID-reuse
+  race; ~~entity `LIKE` wildcard escaping~~ (already fixed — entity search uses FTS5, schema v3);
+  empty/colliding slug ids;
   ~~`add_context` can't update an existing key~~ (**DONE**: `add_context` now UPSERTs on the UNIQUE
   `key` — bumps `version`, emits `context_updated`; also makes the candidate-approval `context` arm a
   graceful update instead of a crash on a colliding key; H5 dedup unchanged, Arm E green). **S each**

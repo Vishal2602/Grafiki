@@ -407,6 +407,57 @@ fn mcp_search_tool_round_trip() {
 }
 
 #[test]
+fn mcp_initialize_negotiates_protocol_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("mcp");
+    std::fs::create_dir_all(&project).unwrap();
+    run_ok(&home, ["init", "mcp", "--path"], &[&project]);
+
+    let mut child = Command::new(GRAFIKI)
+        .env("GRAFIKI_HOME", &home)
+        .args([
+            "mcp",
+            "--project",
+            "mcp",
+            "--path",
+            project.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        // id=1: a supported version must be echoed back.
+        writeln!(
+            stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-06-18\"}}}}"
+        )
+        .unwrap();
+        // id=2: an unsupported version falls back to the server's latest.
+        writeln!(
+            stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"1999-01-01\"}}}}"
+        )
+        .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected two responses, got: {stdout}");
+
+    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(first["result"]["protocolVersion"], "2025-06-18");
+    let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(
+        second["result"]["protocolVersion"], "2025-06-18",
+        "unsupported request must fall back to the latest supported version"
+    );
+}
+
+#[test]
 fn mcp_rejects_oversized_message() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");

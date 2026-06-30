@@ -7909,17 +7909,33 @@ fn handle_mcp_message(
     let id = id.unwrap_or(serde_json::Value::Null);
 
     let response = match method {
-        "initialize" => mcp_result(
-            id,
-            serde_json::json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": { "tools": {} },
-                "serverInfo": {
-                    "name": "grafiki",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
-        ),
+        "initialize" => {
+            // Negotiate per the MCP spec: echo the client's requested protocol
+            // version if we support it, otherwise respond with our latest (the
+            // client then decides whether to proceed). The tools-only surface is
+            // identical across these revisions.
+            const SUPPORTED: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
+            const LATEST: &str = "2025-06-18";
+            let requested = message
+                .get("params")
+                .and_then(|params| params.get("protocolVersion"))
+                .and_then(|value| value.as_str());
+            let negotiated = match requested {
+                Some(version) if SUPPORTED.contains(&version) => version,
+                _ => LATEST,
+            };
+            mcp_result(
+                id,
+                serde_json::json!({
+                    "protocolVersion": negotiated,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": {
+                        "name": "grafiki",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }),
+            )
+        }
         "ping" => mcp_result(id, serde_json::json!({})),
         "tools/list" => mcp_result(id, serde_json::json!({ "tools": mcp_tools(read_only) })),
         "tools/call" => match handle_mcp_tool_call(&message, project, path, read_only) {
