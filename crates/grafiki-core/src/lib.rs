@@ -15,6 +15,7 @@ pub mod decay;
 pub mod embeddings;
 pub mod error;
 pub mod graph;
+pub mod injection;
 pub mod memory;
 pub mod project;
 pub mod reflection;
