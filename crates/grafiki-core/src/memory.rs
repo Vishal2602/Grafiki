@@ -3586,10 +3586,12 @@ pub fn list_candidates(options: ListCandidatesOptions) -> Result<Vec<ExtractionC
         options.grafiki_home,
     )?;
     let requested_limit = options.limit.clamp(1, 200) as i64;
-    // Active learning prioritizes across the whole reviewable pool, not just the newest window,
-    // so fetch up to the cap and truncate to the requested limit AFTER re-ranking by priority.
+    // Active learning prioritizes across the pending pool (not just the newest window), so it fetches
+    // the whole in-scope/status set up to a generous safety cap, then re-ranks by priority and
+    // truncates to the requested limit. A human review queue is far below this cap in practice.
+    const ACTIVE_LEARNING_POOL_CAP: i64 = 10_000;
     let limit = if options.order == CandidateOrder::ActiveLearning {
-        200
+        ACTIVE_LEARNING_POOL_CAP
     } else {
         requested_limit
     };
@@ -3649,13 +3651,9 @@ pub fn list_candidates(options: ListCandidatesOptions) -> Result<Vec<ExtractionC
 
     for candidate in &mut rows {
         attach_candidate_evidence(&connection, candidate)?;
-        // M-E3: refine the calibrated confidence with the real corroboration count, and derive the
-        // active-learning review priority. Deterministic (pure `confidence` math over store data).
-        let evidence_count = candidate.evidence.len() as u64;
-        candidate.calibrated_confidence =
-            crate::confidence::calibrated_confidence(&candidate.source_type, evidence_count);
-        let uncertainty = crate::confidence::uncertainty(candidate.calibrated_confidence);
-        candidate.review_priority = crate::confidence::review_priority(uncertainty, evidence_count);
+        // M-E3: refine the calibrated confidence + active-learning review priority with the real
+        // corroboration count (shared with the single-fetch path for cross-surface consistency).
+        refine_candidate_confidence(candidate);
     }
     if options.order == CandidateOrder::ActiveLearning {
         // Most informative first; stable tiebreak by recency then id so order is deterministic.
@@ -5700,7 +5698,20 @@ fn load_extraction_candidate(connection: &Connection, id: &str) -> Result<Extrac
         .optional()?
         .ok_or_else(|| GrafikiError::CandidateNotFound(id.to_owned()))?;
     attach_candidate_evidence(connection, &mut candidate)?;
+    refine_candidate_confidence(&mut candidate);
     Ok(candidate)
+}
+
+/// M-E3: (re)compute the calibrated confidence + active-learning review priority from the
+/// candidate's source tier and its currently-attached corroborating evidence. Must run AFTER
+/// `attach_candidate_evidence` so the evidence count is real. Pure/deterministic; applied on every
+/// surface that returns a candidate so the fields are consistent across list and mutation reports.
+fn refine_candidate_confidence(candidate: &mut ExtractionCandidate) {
+    let evidence_count = candidate.evidence.len() as u64;
+    candidate.calibrated_confidence =
+        crate::confidence::calibrated_confidence(&candidate.source_type, evidence_count);
+    let uncertainty = crate::confidence::uncertainty(candidate.calibrated_confidence);
+    candidate.review_priority = crate::confidence::review_priority(uncertainty, evidence_count);
 }
 
 fn attach_candidate_evidence(

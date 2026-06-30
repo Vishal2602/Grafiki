@@ -157,7 +157,7 @@ the `relations` table).
   from mnemosyne's MIT veracity tiers): each `extraction_candidate` gets a principled
   `calibrated_confidence` + a `review_priority` (uncertainty × evidence-representativeness). New
   `ListCandidatesOptions.order = CandidateOrder::{Recent (default) | ActiveLearning}`; active-learning
-  prioritizes across the whole reviewable pool (fetch-then-rerank-then-truncate, not just the newest
+  prioritizes across the pending pool (fetch up to a 10k cap → re-rank → truncate, not just the newest
   window). CLI `grafiki candidates list --order active-learning`. Deterministic; off-by-default
   (Recent ⇒ unchanged). Core gate `active_learning_order_and_calibrated_confidence`. **M**
 - [ ] **M-E4 — Code-structure indexing.** Tree-sitter capture pass emits code
