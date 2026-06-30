@@ -122,16 +122,20 @@ fn canonical_bool(value: &str) -> Option<bool> {
 /// strictly *reduces* (never creates) supersessions — a precision guard that
 /// cannot raise the false-supersession rate.
 pub fn values_equivalent(a: &str, b: &str) -> bool {
-    // Boolean polarity: fold yes/true/on/enabled and no/false/off/disabled.
+    // Boolean polarity: fold yes/true/on/enabled and no/false/off/disabled. The
+    // guard fires only when BOTH sides are recognized boolean literals; a mixed
+    // pair (`"on"` vs `"maybe"`/`"1"`) falls through to the numeric/string arms.
     if let (Some(pa), Some(pb)) = (canonical_bool(a), canonical_bool(b)) {
         return pa == pb;
     }
-    // Numeric: both parse as the same finite number (compare with a relative
-    // epsilon so `2` ≡ `2.0` without a brittle exact float compare).
+    // Numeric: fold only EXACT restatements of the same finite number (`2` ≡
+    // `2.0`, `8080` ≡ `08080`). Exact f64 equality is the intent — both textual
+    // forms parse to a bit-identical double — so distinct adjacent large integers
+    // (≥ 2^52, where a relative epsilon would wrongly merge them) stay a conflict.
     if let (Ok(na), Ok(nb)) = (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
         if na.is_finite() && nb.is_finite() {
-            let tolerance = f64::EPSILON * na.abs().max(nb.abs()).max(1.0);
-            return (na - nb).abs() <= tolerance;
+            #[allow(clippy::float_cmp)] // exact equality of two parsed decimals is intentional
+            return na == nb;
         }
     }
     normalize_value(a) == normalize_value(b)
@@ -430,6 +434,12 @@ mod tests {
         assert!(values_equivalent("8080", "08080"));
         assert!(values_equivalent("2.50", "2.5"));
         assert!(!values_equivalent("2", "3"));
+        // Distinct adjacent large integers (≥ 2^52) must NOT fold — a relative
+        // epsilon would have merged these; exact f64 equality keeps them apart.
+        assert!(!values_equivalent("4503599627370496", "4503599627370497"));
+        // Mixed boolean/non-boolean falls through and stays distinct.
+        assert!(!values_equivalent("on", "maybe"));
+        assert!(!values_equivalent("on", "1"));
         // Boolean polarity.
         assert!(values_equivalent("true", "yes"));
         assert!(values_equivalent("Enabled", "on"));
