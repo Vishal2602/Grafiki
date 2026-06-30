@@ -656,6 +656,7 @@ fn search_project_memory(request: SearchRequest) -> Result<SearchReport, String>
         mode,
         scope: request.scope.unwrap_or_default(),
         limit: request.limit.unwrap_or(20),
+        temporal_weight: 0.0,
     })
     .map_err(|error| error.to_string())
 }

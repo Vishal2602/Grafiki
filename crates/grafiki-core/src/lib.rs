@@ -10,6 +10,7 @@
 
 pub mod conflict;
 pub mod db;
+pub mod decay;
 pub mod embeddings;
 pub mod error;
 pub mod graph;

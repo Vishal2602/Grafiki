@@ -195,6 +195,7 @@ fn run_item(item: &SupersessionItem) -> EvalResult<ItemOutcome> {
             mode: SearchMode::Keyword,
             scope: SCOPE.to_string(),
             limit: 20,
+            temporal_weight: 0.0,
         })?;
         // Observations: match against the fact CONTENT (snippet) only, never the
         // entity-slug title, so a token can't pass for the wrong reason.

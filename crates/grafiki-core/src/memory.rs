@@ -260,6 +260,11 @@ pub struct SearchMemoryOptions {
     pub mode: SearchMode,
     pub scope: String,
     pub limit: usize,
+    /// M-E1/M-E2 temporal boost. `0.0` (default) = off → fusion is byte-identical to the
+    /// lexical/dense ranking. When `> 0`, recent + frequently-reused records get an additive
+    /// bonus in the fused arms (Hybrid/Graph/Rerank), scaled to ~one RRF rank per unit. See
+    /// `grafiki_core::decay` and `docs/DECAY_DESIGN.md`.
+    pub temporal_weight: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -2258,6 +2263,26 @@ pub fn search_memory(options: SearchMemoryOptions) -> Result<SearchReport> {
     };
     let semantic_available = !semantic_results.is_empty();
 
+    // M-E1/M-E2 temporal boost (opt-in; empty when temporal_weight == 0 ⇒ fusion unchanged).
+    // Precomputed over the lexical+dense candidate union — complete for the Hybrid and Rerank arms
+    // (which add no further candidates). The Graph arm recomputes over a wider union that also
+    // includes its PPR-discovered records (below) so they are boost-eligible too.
+    let temporal_boost = if options.temporal_weight > 0.0 {
+        let candidates: Vec<(String, String)> = keyword_results
+            .iter()
+            .chain(semantic_results.iter())
+            .map(|r| (r.record_type.clone(), r.id.clone()))
+            .collect();
+        temporal_boosts(
+            &connection,
+            &scope_chain,
+            &candidates,
+            options.temporal_weight,
+        )?
+    } else {
+        HashMap::new()
+    };
+
     let (mut results, fallback) = match options.mode {
         SearchMode::Keyword => (keyword_results.into_iter().take(limit).collect(), None),
         SearchMode::Semantic if semantic_available => (semantic_results, None),
@@ -2282,6 +2307,7 @@ pub fn search_memory(options: SearchMemoryOptions) -> Result<SearchReport> {
                 semantic_results,
                 Vec::new(),
                 limit,
+                &temporal_boost,
             ),
             None,
         ),
@@ -2330,6 +2356,24 @@ pub fn search_memory(options: SearchMemoryOptions) -> Result<SearchReport> {
                     )
                 }
             });
+            // Recompute the boost over the FULL union incl. PPR-discovered graph records, so a
+            // recent/reused multi-hop observation is boost-eligible (not just lexical/dense hits).
+            let graph_boost = if options.temporal_weight > 0.0 {
+                let candidates: Vec<(String, String)> = keyword_results
+                    .iter()
+                    .chain(semantic_results.iter())
+                    .chain(graph_results.iter())
+                    .map(|r| (r.record_type.clone(), r.id.clone()))
+                    .collect();
+                temporal_boosts(
+                    &connection,
+                    &scope_chain,
+                    &candidates,
+                    options.temporal_weight,
+                )?
+            } else {
+                HashMap::new()
+            };
             (
                 hybrid_search_results(
                     &options.query,
@@ -2337,6 +2381,7 @@ pub fn search_memory(options: SearchMemoryOptions) -> Result<SearchReport> {
                     semantic_results,
                     graph_results,
                     limit,
+                    &graph_boost,
                 ),
                 fallback,
             )
@@ -2351,6 +2396,7 @@ pub fn search_memory(options: SearchMemoryOptions) -> Result<SearchReport> {
                 semantic_results,
                 Vec::new(),
                 candidate_limit,
+                &temporal_boost,
             );
             let (reranked, rerank_note) = rerank_results(&options.query, fused, limit);
             // Describe the candidate pool honestly: surface a real embedding error,
@@ -2415,6 +2461,7 @@ pub fn ask_memory(options: AskMemoryOptions) -> Result<AgentMemoryBriefing> {
         mode: SearchMode::Hybrid,
         scope: scope.clone(),
         limit,
+        temporal_weight: 0.0,
     })?;
     let pending_candidates = list_candidates(ListCandidatesOptions {
         project_name: options.project_name.clone(),
@@ -7744,17 +7791,138 @@ fn rerank_results(
     }
 }
 
+/// RRF rank-decay constant (shared by the fusion and the temporal-boost scaling).
+const RRF_K: f64 = 45.0;
+/// One rank-0 RRF score unit — the scale a `temporal_weight` of 1.0 is worth.
+pub(crate) const RRF_UNIT: f64 = 1.0 / (RRF_K + 1.0);
+
+/// Compute the additive temporal boost per candidate (M-E1/M-E2). Empty when
+/// `temporal_weight <= 0`. Boost = `temporal_weight · RRF_UNIT · temporal_term(recency, salience)`:
+/// recency = Weibull freshness of the record's timestamp by category; salience = reuse from the
+/// `agent_queries` audit log. The decay math is pure (`crate::decay`); this fn does only the I/O.
+fn temporal_boosts(
+    connection: &Connection,
+    scope_chain: &[String],
+    candidates: &[(String, String)],
+    temporal_weight: f64,
+) -> Result<HashMap<(String, String), f64>> {
+    let mut boosts: HashMap<(String, String), f64> = HashMap::new();
+    if temporal_weight <= 0.0 || candidates.is_empty() {
+        return Ok(boosts);
+    }
+    let placeholders = |n: usize| vec!["?"; n].join(",");
+
+    // 1. Recency: (age_hours, category) per candidate, by record type. Types without a
+    //    meaningful timestamp (entity/state) are recency-neutral and simply omitted.
+    let mut recency: HashMap<(String, String), (f64, String)> = HashMap::new();
+    let mut by_type: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for (ty, id) in candidates {
+        by_type.entry(ty.as_str()).or_default().push(id.as_str());
+    }
+    for (ty, ids) in &by_type {
+        let sql = match *ty {
+            "observation" => format!(
+                "SELECT id, category, (strftime('%s','now') - strftime('%s', valid_from))/3600.0 \
+                 FROM observations WHERE valid_to IS NULL AND id IN ({})",
+                placeholders(ids.len())
+            ),
+            "decision" => format!(
+                "SELECT id, 'decision', (strftime('%s','now') - strftime('%s', created_at))/3600.0 \
+                 FROM decisions WHERE id IN ({})",
+                placeholders(ids.len())
+            ),
+            "context" => format!(
+                "SELECT key, 'general', (strftime('%s','now') - strftime('%s', updated_at))/3600.0 \
+                 FROM context WHERE key IN ({})",
+                placeholders(ids.len())
+            ),
+            _ => continue,
+        };
+        let mut stmt = connection.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+            ))
+        })?;
+        for row in rows {
+            let (id, category, age_hours) = row?;
+            recency.insert(((*ty).to_string(), id), (age_hours, category));
+        }
+    }
+
+    // 2. Salience: access count + last-access age per "type:id" from the audit log.
+    let mut salience: HashMap<String, (u64, f64)> = HashMap::new();
+    {
+        let sql = format!(
+            "SELECT je.value, COUNT(*), \
+                (strftime('%s','now') - strftime('%s', MAX(aq.created_at)))/3600.0 \
+             FROM agent_queries aq, json_each(aq.returned_ids) je \
+             WHERE aq.scope IN ({}) GROUP BY je.value",
+            placeholders(scope_chain.len())
+        );
+        let mut stmt = connection.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = scope_chain
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.max(0) as u64,
+                row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+            ))
+        })?;
+        for row in rows {
+            let (key, count, last_age) = row?;
+            salience.insert(key, (count, last_age));
+        }
+    }
+
+    // 3. Combine into the additive boost.
+    for (ty, id) in candidates {
+        let key = (ty.clone(), id.clone());
+        let rec = recency
+            .get(&key)
+            .map(|(age, cat)| crate::decay::category_freshness(cat, *age))
+            .unwrap_or(0.0);
+        let sal = salience
+            .get(&format!("{ty}:{id}"))
+            .map(|(count, last_age)| crate::decay::reuse_salience(*count, *last_age))
+            .unwrap_or(0.0);
+        let term = crate::decay::temporal_term(rec, sal);
+        if term > 0.0 {
+            boosts.insert(key, temporal_weight * RRF_UNIT * term);
+        }
+    }
+    Ok(boosts)
+}
+
 fn hybrid_search_results(
     query: &str,
     keyword_results: Vec<SearchResult>,
     semantic_results: Vec<SearchResult>,
     graph_results: Vec<SearchResult>,
     limit: usize,
+    temporal_boost: &HashMap<(String, String), f64>,
 ) -> Vec<SearchResult> {
     let mut scored: HashMap<(String, String), HybridScore> = HashMap::new();
     add_hybrid_scores(&mut scored, query, keyword_results, SearchSource::Keyword);
     add_hybrid_scores(&mut scored, query, semantic_results, SearchSource::Semantic);
     add_hybrid_scores(&mut scored, query, graph_results, SearchSource::Graph);
+    // M-E1/M-E2: add the precomputed temporal boost (recency + reuse salience) before ranking.
+    // Empty map (the default, temporal_weight=0) leaves every score untouched.
+    if !temporal_boost.is_empty() {
+        for (key, hybrid) in scored.iter_mut() {
+            if let Some(bonus) = temporal_boost.get(key) {
+                hybrid.score += *bonus;
+            }
+        }
+    }
     let mut results: Vec<_> = scored.into_values().collect();
     results.sort_by(|left, right| {
         right
@@ -7816,7 +7984,6 @@ fn add_hybrid_scores(
     results: Vec<SearchResult>,
     source: SearchSource,
 ) {
-    const RRF_K: f64 = 45.0;
     const CROSS_SOURCE_BONUS: f64 = 0.018;
     for (rank, result) in results.into_iter().enumerate() {
         let key = (result.record_type.clone(), result.id.clone());
@@ -8946,6 +9113,145 @@ mod tests {
         assert_eq!(forced.skipped_existing, 1);
     }
 
+    // --- M-E1/M-E2 temporal boost (decay + salience) -----------------------
+
+    fn save_obs(home: &std::path::Path, dir: &std::path::Path, name: &str, text: &str) -> String {
+        save_entity(SaveEntityOptions {
+            project_name: None,
+            start_dir: dir.to_path_buf(),
+            grafiki_home: Some(home.to_path_buf()),
+            name: name.to_string(),
+            entity_type: "concept".to_string(),
+            observe: Some(text.to_string()),
+            category: "general".to_string(),
+            scope: "core".to_string(),
+            relate: None,
+        })
+        .unwrap()
+        .observation_id
+        .unwrap()
+    }
+
+    fn graph_search_ids(
+        home: &std::path::Path,
+        dir: &std::path::Path,
+        query: &str,
+        temporal_weight: f64,
+    ) -> Vec<String> {
+        // Graph mode is the model-free fused path: it always routes through
+        // `hybrid_search_results` (where the temporal boost applies), even with no
+        // semantic vectors or relations.
+        search_memory(SearchMemoryOptions {
+            project_name: None,
+            start_dir: dir.to_path_buf(),
+            grafiki_home: Some(home.to_path_buf()),
+            query: query.to_string(),
+            record_type: "all".to_string(),
+            mode: SearchMode::Graph,
+            scope: "core".to_string(),
+            limit: 10,
+            temporal_weight,
+        })
+        .unwrap()
+        .results
+        .into_iter()
+        .map(|r| r.id)
+        .collect()
+    }
+
+    #[test]
+    fn temporal_weight_promotes_recent_over_stale() {
+        let (_t, home, dir) = setup_project();
+        // Lexically IDENTICAL observations on distinct entities ⇒ equal lexical score, so the
+        // baseline order is the deterministic insertion tiebreak (old first) and recency is the
+        // ONLY differentiator once the temporal weight is applied.
+        let old_id = save_obs(
+            &home,
+            &dir,
+            "Alpha Cache",
+            "Cache layer uses in-memory storage for sessions.",
+        );
+        let new_id = save_obs(
+            &home,
+            &dir,
+            "Bravo Cache",
+            "Cache layer uses in-memory storage for sessions.",
+        );
+        {
+            let (_p, conn) = resolve_and_open(None, dir.clone(), Some(home.clone())).unwrap();
+            conn.execute(
+                "UPDATE observations SET valid_from = '2025-01-01T00:00:00Z' WHERE id = ?1",
+                [&old_id],
+            )
+            .unwrap();
+        }
+
+        let baseline = graph_search_ids(&home, &dir, "cache layer storage sessions", 0.0);
+        let boosted = graph_search_ids(&home, &dir, "cache layer storage sessions", 5.0);
+        let pos = |v: &[String], id: &str| v.iter().position(|x| x == id);
+
+        assert!(
+            pos(&baseline, &old_id) < pos(&baseline, &new_id),
+            "baseline (no temporal weight) ranks by insertion tiebreak — older first: {baseline:?}"
+        );
+        assert!(
+            pos(&boosted, &new_id) < pos(&boosted, &old_id),
+            "temporal weight must flip the order, promoting the recent record: {boosted:?}"
+        );
+        // Deterministic.
+        assert_eq!(
+            boosted,
+            graph_search_ids(&home, &dir, "cache layer storage sessions", 5.0)
+        );
+    }
+
+    #[test]
+    fn temporal_weight_promotes_reused_record() {
+        let (_t, home, dir) = setup_project();
+        // Equally-fresh, equally-matching observations. `cold` is saved FIRST so it owns the
+        // deterministic baseline tiebreak (smaller ULID); only `reused` (saved second) gets
+        // audit-log reuse. Recency is equal, so a flip can only come from salience.
+        let cold_id = save_obs(
+            &home,
+            &dir,
+            "Beta Deploy",
+            "Deployment pipeline runs on staging.",
+        );
+        let reused_id = save_obs(
+            &home,
+            &dir,
+            "Alpha Deploy",
+            "Deployment pipeline runs on staging.",
+        );
+        {
+            let (_p, conn) = resolve_and_open(None, dir.clone(), Some(home.clone())).unwrap();
+            let returned =
+                serde_json::to_string(&vec![format!("observation:{reused_id}")]).unwrap();
+            for _ in 0..5 {
+                conn.execute(
+                    "INSERT INTO agent_queries (id, agent, question, scope, returned_ids, retrieval_mode) \
+                     VALUES (?1, 'eval', 'deployment', 'core', ?2, 'graph')",
+                    rusqlite::params![super::new_ulid(), returned],
+                )
+                .unwrap();
+            }
+        }
+
+        let pos = |v: &[String], id: &str| v.iter().position(|x| x == id);
+        // Baseline (no weight): the first-saved `cold` wins the tiebreak — reuse must overcome it.
+        let baseline = graph_search_ids(&home, &dir, "deployment pipeline staging", 0.0);
+        assert!(
+            pos(&baseline, &cold_id) < pos(&baseline, &reused_id),
+            "baseline tiebreak should rank the first-saved (cold) record ahead: {baseline:?}"
+        );
+        // With weight: audit-log reuse must flip the order, promoting the reused record.
+        let boosted = graph_search_ids(&home, &dir, "deployment pipeline staging", 5.0);
+        assert!(
+            pos(&boosted, &reused_id) < pos(&boosted, &cold_id),
+            "audit-log reuse should promote the reused record over the cold one: {boosted:?}"
+        );
+    }
+
     fn start_codex(home: std::path::PathBuf, project_dir: std::path::PathBuf) -> String {
         start_session(StartSessionOptions {
             project_name: None,
@@ -8996,6 +9302,7 @@ mod tests {
             semantic_results,
             Vec::new(),
             3,
+            &std::collections::HashMap::new(),
         );
 
         assert_eq!(results[0].id, "auth-guide");
@@ -9135,6 +9442,7 @@ mod tests {
                 mode: SearchMode::Hybrid,
                 scope: "example-project/core".to_owned(),
                 limit: 4,
+                temporal_weight: 0.0,
             })
             .unwrap(),
             &[auth.observation_id.as_deref().unwrap(), "auth-runbook"],
@@ -9150,6 +9458,7 @@ mod tests {
                 mode: SearchMode::Hybrid,
                 scope: "example-project/core".to_owned(),
                 limit: 4,
+                temporal_weight: 0.0,
             })
             .unwrap(),
             &[storage.observation_id.as_deref().unwrap()],
@@ -9165,6 +9474,7 @@ mod tests {
                 mode: SearchMode::Hybrid,
                 scope: "example-project/core".to_owned(),
                 limit: 4,
+                temporal_weight: 0.0,
             })
             .unwrap(),
             &[billing.observation_id.as_deref().unwrap()],
@@ -9180,6 +9490,7 @@ mod tests {
                 mode: SearchMode::Hybrid,
                 scope: "example-project/core".to_owned(),
                 limit: 4,
+                temporal_weight: 0.0,
             })
             .unwrap(),
             &[search.observation_id.as_deref().unwrap()],
@@ -9351,6 +9662,7 @@ mod tests {
                 mode: SearchMode::Hybrid,
                 scope: scope.clone(),
                 limit: 5,
+                temporal_weight: 0.0,
             })
             .unwrap(),
             &[
@@ -9369,6 +9681,7 @@ mod tests {
                 mode: SearchMode::Hybrid,
                 scope: scope.clone(),
                 limit: 5,
+                temporal_weight: 0.0,
             })
             .unwrap(),
             &[review_context.key.as_str()],
@@ -9384,6 +9697,7 @@ mod tests {
                 mode: SearchMode::Hybrid,
                 scope: scope.clone(),
                 limit: 5,
+                temporal_weight: 0.0,
             })
             .unwrap(),
             &[handoff_context.key.as_str()],
@@ -9398,6 +9712,7 @@ mod tests {
             mode: SearchMode::Keyword,
             scope: scope.clone(),
             limit: 5,
+            temporal_weight: 0.0,
         })
         .unwrap();
         assert!(
@@ -9496,6 +9811,7 @@ mod tests {
             mode: SearchMode::Keyword,
             scope: "example-project/core".to_owned(),
             limit: 10,
+            temporal_weight: 0.0,
         })
         .unwrap();
 
@@ -9508,6 +9824,7 @@ mod tests {
             mode: SearchMode::Semantic,
             scope: "example-project/core".to_owned(),
             limit: 10,
+            temporal_weight: 0.0,
         })
         .unwrap();
 
@@ -9540,6 +9857,7 @@ mod tests {
             mode: SearchMode::Semantic,
             scope: "example-project/core".to_owned(),
             limit: 10,
+            temporal_weight: 0.0,
         })
         .unwrap();
 
@@ -9807,6 +10125,7 @@ mod tests {
             mode: SearchMode::Keyword,
             scope: "example-project/core".to_owned(),
             limit: 10,
+            temporal_weight: 0.0,
         })
         .unwrap();
 
@@ -10020,6 +10339,7 @@ mod tests {
             mode: SearchMode::Keyword,
             scope: scope.to_owned(),
             limit: 10,
+            temporal_weight: 0.0,
         })
         .unwrap();
         assert!(
@@ -10040,6 +10360,7 @@ mod tests {
             mode: SearchMode::Keyword,
             scope: scope.to_owned(),
             limit: 10,
+            temporal_weight: 0.0,
         })
         .unwrap();
         assert!(
@@ -10684,6 +11005,7 @@ mod tests {
             mode: SearchMode::Keyword,
             scope: "example-project/core".to_owned(),
             limit: 10,
+            temporal_weight: 0.0,
         })
         .unwrap();
 
@@ -10735,6 +11057,7 @@ mod tests {
                 mode: SearchMode::Keyword,
                 scope: "example-project/core".to_owned(),
                 limit: 10,
+                temporal_weight: 0.0,
             })
             .unwrap()
         };

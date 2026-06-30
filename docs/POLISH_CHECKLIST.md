@@ -138,11 +138,20 @@ the `relations` table).
 
 ### E-Medium leverage
 
-- [ ] **M-E1 — Forgetting / decay & salience.** `salience`/`last_accessed`/`access_count`
-  (derive from the agent-query audit log); recency+importance+reuse term in ranking;
-  soft decay proposes archival candidates (never hard-delete). (MemoryBank.) **M**
-- [ ] **M-E2 — Temporal-aware retrieval.** Valid-time filter/boost in the SQL + recency
-  weight in fusion; later diachronic scoring. (HyTE, TKG surveys.) **S→M**
+- [x] **M-E1 — Forgetting / decay & salience.** **DONE (ranking half; adversarially reviewed, 2
+  findings fixed).** Pure `grafiki_core::decay`: per-category **Weibull** freshness + **reuse salience**
+  derived from the `agent_queries` audit log (`json_each(returned_ids)` → access count + last-access age).
+  Borrowed from mnemosyne's MIT `weibull.py`. Feeds the opt-in temporal boost (M-E2). CI gate
+  `temporal_weight_promotes_reused_record` (baseline-flip proof). **Deferred → M-E1b:** soft-decay
+  *archival-candidate* generation (propose retiring stale+never-accessed+low-confidence observations
+  via a new gate "retire" action) — scoping in `docs/DECAY_DESIGN.md` §5. (MemoryBank, Weibull.) **M**
+- [x] **M-E2 — Temporal-aware retrieval.** **DONE (adversarially reviewed).** Opt-in
+  `SearchMemoryOptions.temporal_weight` (default 0.0 = off → fusion byte-identical → eval baselines
+  unchanged, eval-gate confirmed). When > 0, recent + reused records get an additive boost in the fused
+  arms (Hybrid/Graph/Rerank), scaled to ~one RRF rank/unit; the Graph arm boosts its PPR-discovered
+  records too. CLI `grafiki search --temporal-weight`. Model-free, deterministic. CI gate
+  `temporal_weight_promotes_recent_over_stale` (a fresh record overtakes a stale one at equal lexical
+  score). See `docs/DECAY_DESIGN.md`. (HyTE, TKG surveys.) **S→M**
 - [ ] **M-E3 — Calibrated candidate confidence + active-learning review order.** Confidence
   per `extraction_candidate` (semantic entropy / source prior); sort
   `grafiki_candidate_list` by uncertainty×representativeness. **M**

@@ -130,6 +130,7 @@ pub fn run_retrieval(
                 mode,
                 scope: EVAL_SCOPE.to_string(),
                 limit: cfg.limit,
+                temporal_weight: 0.0,
             })?;
             search_ms += t.elapsed().as_millis();
 

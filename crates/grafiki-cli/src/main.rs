@@ -254,6 +254,11 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         limit: usize,
 
+        /// Temporal/decay boost weight for fused modes (0 = off). Recent + frequently-reused
+        /// records gain ~one RRF rank per unit. (M-E1/M-E2; hybrid/graph/rerank only.)
+        #[arg(long, default_value_t = 0.0)]
+        temporal_weight: f64,
+
         /// Directory used for project detection.
         #[arg(long, default_value = ".")]
         path: PathBuf,
@@ -1771,6 +1776,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             mode,
             scope,
             limit,
+            temporal_weight,
             path,
             format,
         } => {
@@ -1783,6 +1789,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 mode: mode.into(),
                 scope,
                 limit,
+                temporal_weight,
             })?;
 
             match format {
@@ -6728,6 +6735,7 @@ fn http_search(
         mode: CoreSearchMode::parse(&query_value(query, "mode", "keyword"))?,
         scope: query_value(query, "scope", ""),
         limit: query_usize(query, "limit", 10),
+        temporal_weight: 0.0,
     })?;
     json_response(&report)
 }
@@ -8068,6 +8076,7 @@ fn handle_mcp_tool_call(
                 mode: CoreSearchMode::parse(&json_arg_string(&args, "mode", "keyword"))?,
                 scope: json_arg_string(&args, "scope", ""),
                 limit: json_arg_usize(&args, "limit", 10),
+                temporal_weight: 0.0,
             })?;
             mcp_json_tool_result(&report)
         }

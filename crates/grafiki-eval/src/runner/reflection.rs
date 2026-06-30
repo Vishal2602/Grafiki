@@ -97,6 +97,7 @@ fn search_runs(
             mode: SearchMode::Keyword,
             scope: EVAL_SCOPE.to_string(),
             limit,
+            temporal_weight: 0.0,
         })?;
         let docs: RunList = report
             .results
