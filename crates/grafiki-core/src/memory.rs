@@ -521,6 +521,19 @@ pub struct ListCandidatesOptions {
     pub status: Option<String>,
     pub scope: String,
     pub limit: usize,
+    /// M-E3 review ordering. `Recent` (default) preserves the newest-first behavior; `ActiveLearning`
+    /// surfaces the most informative (uncertain × well-evidenced) candidates first.
+    pub order: CandidateOrder,
+}
+
+/// Ordering for the candidate review queue (M-E3).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CandidateOrder {
+    /// Newest candidates first (back-compatible default).
+    #[default]
+    Recent,
+    /// Active-learning: highest `review_priority` (uncertainty × representativeness) first.
+    ActiveLearning,
 }
 
 #[derive(Debug, Clone)]
@@ -664,6 +677,14 @@ pub struct ExtractionCandidate {
     pub reviewed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<EvidenceLink>,
+    /// M-E3: a principled confidence derived from the source-reliability prior + corroboration
+    /// (evidence count) — distinct from the caller-supplied `confidence`. Computed at list time.
+    #[serde(default)]
+    pub calibrated_confidence: f64,
+    /// M-E3: uncertainty × representativeness; higher ⇒ review sooner (active learning). Computed
+    /// at list time (0.0 elsewhere).
+    #[serde(default)]
+    pub review_priority: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2470,6 +2491,7 @@ pub fn ask_memory(options: AskMemoryOptions) -> Result<AgentMemoryBriefing> {
         status: Some("pending".to_owned()),
         scope: scope.clone(),
         limit: 200,
+        order: CandidateOrder::Recent,
     })?
     .len();
 
@@ -3563,7 +3585,14 @@ pub fn list_candidates(options: ListCandidatesOptions) -> Result<Vec<ExtractionC
         options.start_dir,
         options.grafiki_home,
     )?;
-    let limit = options.limit.clamp(1, 200) as i64;
+    let requested_limit = options.limit.clamp(1, 200) as i64;
+    // Active learning prioritizes across the whole reviewable pool, not just the newest window,
+    // so fetch up to the cap and truncate to the requested limit AFTER re-ranking by priority.
+    let limit = if options.order == CandidateOrder::ActiveLearning {
+        200
+    } else {
+        requested_limit
+    };
 
     let mut rows = match status {
         Some(status) => {
@@ -3620,6 +3649,24 @@ pub fn list_candidates(options: ListCandidatesOptions) -> Result<Vec<ExtractionC
 
     for candidate in &mut rows {
         attach_candidate_evidence(&connection, candidate)?;
+        // M-E3: refine the calibrated confidence with the real corroboration count, and derive the
+        // active-learning review priority. Deterministic (pure `confidence` math over store data).
+        let evidence_count = candidate.evidence.len() as u64;
+        candidate.calibrated_confidence =
+            crate::confidence::calibrated_confidence(&candidate.source_type, evidence_count);
+        let uncertainty = crate::confidence::uncertainty(candidate.calibrated_confidence);
+        candidate.review_priority = crate::confidence::review_priority(uncertainty, evidence_count);
+    }
+    if options.order == CandidateOrder::ActiveLearning {
+        // Most informative first; stable tiebreak by recency then id so order is deterministic.
+        rows.sort_by(|a, b| {
+            b.review_priority
+                .partial_cmp(&a.review_priority)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        rows.truncate(requested_limit as usize);
     }
     Ok(rows)
 }
@@ -5556,6 +5603,13 @@ fn extraction_candidate_from_row(row: &Row<'_>) -> rusqlite::Result<ExtractionCa
         created_at: row.get(11)?,
         reviewed_at: row.get(12)?,
         evidence: Vec::new(),
+        // Calibrated from the source prior alone here (evidence not yet loaded); list_candidates
+        // refines both fields once corroboration is attached.
+        calibrated_confidence: crate::confidence::calibrated_confidence(
+            &row.get::<_, String>(1)?,
+            0,
+        ),
+        review_priority: 0.0,
     })
 }
 
@@ -8991,17 +9045,17 @@ mod tests {
         process_embedding_jobs, propose_candidate, reject_candidate, resolve_and_open, save_entity,
         search_memory, update_context, update_decision, update_entity, update_observation,
         update_relation, update_session, upsert_state, AddContextOptions, ApproveCandidateOptions,
-        AskMemoryOptions, BulkCandidateReviewOptions, ContextListOptions, DecisionListOptions,
-        DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions, DeleteObservationOptions,
-        DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions, EmbeddingStatusOptions,
-        EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions, GetContextOptions,
-        GraphOptions, HandoffOptions, ImportOptions, ListCandidatesOptions, LogDecisionOptions,
-        ObservationListOptions, ProcessEmbeddingsOptions, ProjectReportOptions,
-        ProposeCandidateOptions, RejectCandidateOptions, RelationListOptions, SaveEntityOptions,
-        SearchMemoryOptions, SearchMode, SearchReport, SearchResult, SessionLogOptions,
-        StateListOptions, StatusOptions, UpdateContextOptions, UpdateDecisionOptions,
-        UpdateEntityOptions, UpdateObservationOptions, UpdateRelationOptions, UpdateSessionOptions,
-        UpsertStateOptions,
+        AskMemoryOptions, BulkCandidateReviewOptions, CandidateOrder, ContextListOptions,
+        DecisionListOptions, DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions,
+        DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions,
+        EmbeddingStatusOptions, EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions,
+        ExtractionCandidate, GetContextOptions, GraphOptions, HandoffOptions, ImportOptions,
+        ListCandidatesOptions, LogDecisionOptions, ObservationListOptions,
+        ProcessEmbeddingsOptions, ProjectReportOptions, ProposeCandidateOptions,
+        RejectCandidateOptions, RelationListOptions, SaveEntityOptions, SearchMemoryOptions,
+        SearchMode, SearchReport, SearchResult, SessionLogOptions, StateListOptions, StatusOptions,
+        UpdateContextOptions, UpdateDecisionOptions, UpdateEntityOptions, UpdateObservationOptions,
+        UpdateRelationOptions, UpdateSessionOptions, UpsertStateOptions,
     };
 
     fn setup_project() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -9085,6 +9139,7 @@ mod tests {
             status: Some("pending".to_string()),
             scope: scope.to_string(),
             limit: 50,
+            order: CandidateOrder::Recent,
         })
         .unwrap();
         let candidate = pending.iter().find(|c| c.id == candidate_id).unwrap();
@@ -9249,6 +9304,110 @@ mod tests {
         assert!(
             pos(&boosted, &reused_id) < pos(&boosted, &cold_id),
             "audit-log reuse should promote the reused record over the cold one: {boosted:?}"
+        );
+    }
+
+    // --- M-E3 calibrated confidence + active-learning review order -----------
+
+    #[test]
+    fn active_learning_order_and_calibrated_confidence() {
+        let (_t, home, dir) = setup_project();
+        let scope = "core";
+        let propose = |source_type: &str, content: &str, evidence: Vec<EvidenceInput>| -> String {
+            propose_candidate(ProposeCandidateOptions {
+                project_name: None,
+                start_dir: dir.clone(),
+                grafiki_home: Some(home.clone()),
+                source_type: source_type.to_string(),
+                source: None,
+                record_type: "observation".to_string(),
+                payload: serde_json::json!({
+                    "entity_name": "Subject",
+                    "content": content,
+                    "category": "general",
+                }),
+                scope: scope.to_string(),
+                confidence: 0.5,
+                rationale: None,
+                evidence,
+            })
+            .unwrap()
+            .candidate
+            .id
+        };
+        let ev = || EvidenceInput {
+            source_event_id: None,
+            source_type: "test".to_string(),
+            source: None,
+            title: None,
+            excerpt: "corroborating excerpt".to_string(),
+            uri: None,
+            byte_start: None,
+            byte_end: None,
+            line_start: None,
+            line_end: None,
+            captured_at: None,
+        };
+
+        // Proposed in DESCENDING priority order (evidenced inferred fact, then tool, then the
+        // confident user fact LAST) — so recency (newest-first) is the REVERSE of the
+        // active-learning order, making any coincidence between the two impossible.
+        let _evd_id = propose("inferred", "inferred from context", vec![ev(), ev()]);
+        let tool_id = propose("tool", "tool reported value", Vec::new());
+        let user_id = propose("user", "user stated preference", Vec::new());
+
+        let list = |order: CandidateOrder| -> Vec<ExtractionCandidate> {
+            list_candidates(ListCandidatesOptions {
+                project_name: None,
+                start_dir: dir.clone(),
+                grafiki_home: Some(home.clone()),
+                status: Some("pending".to_string()),
+                scope: scope.to_string(),
+                limit: 50,
+                order,
+            })
+            .unwrap()
+        };
+
+        let recent = list(CandidateOrder::Recent);
+        let active = list(CandidateOrder::ActiveLearning);
+        let find =
+            |v: &[ExtractionCandidate], id: &str| v.iter().find(|c| c.id == id).cloned().unwrap();
+
+        // Calibration: trusted source ⇒ higher calibrated confidence than a tool fact.
+        let user = find(&recent, &user_id);
+        let tool = find(&recent, &tool_id);
+        assert!(
+            user.calibrated_confidence > tool.calibrated_confidence,
+            "user {} should outrank tool {}",
+            user.calibrated_confidence,
+            tool.calibrated_confidence
+        );
+        assert!(
+            (tool.calibrated_confidence - 0.5).abs() < 1e-9,
+            "tool prior 0.5 with no evidence"
+        );
+
+        // Active learning: the confident, uncorroborated user fact is the LEAST informative ⇒ last.
+        let pos = |v: &[ExtractionCandidate], id: &str| v.iter().position(|c| c.id == id).unwrap();
+        assert_eq!(
+            pos(&active, &user_id),
+            active.len() - 1,
+            "the confident user fact should be reviewed last under active learning"
+        );
+        // And the ordering must actually differ from plain recency.
+        assert_ne!(
+            recent.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+            active.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+            "active-learning order should differ from recency"
+        );
+        // Deterministic.
+        assert_eq!(
+            active.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+            list(CandidateOrder::ActiveLearning)
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -10188,6 +10347,7 @@ mod tests {
             status: Some("pending".to_owned()),
             scope: "example-project/core".to_owned(),
             limit: 10,
+            order: CandidateOrder::Recent,
         })
         .unwrap();
         assert_eq!(pending.len(), 1);
@@ -11196,6 +11356,7 @@ mod tests {
             status: Some("pending".to_owned()),
             scope: "example-project/core".to_owned(),
             limit: 20,
+            order: CandidateOrder::Recent,
         })
         .unwrap();
         let dump = serde_json::to_string(&candidates).unwrap();

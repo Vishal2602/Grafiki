@@ -152,9 +152,14 @@ the `relations` table).
   records too. CLI `grafiki search --temporal-weight`. Model-free, deterministic. CI gate
   `temporal_weight_promotes_recent_over_stale` (a fresh record overtakes a stale one at equal lexical
   score). See `docs/DECAY_DESIGN.md`. (HyTE, TKG surveys.) **S→M**
-- [ ] **M-E3 — Calibrated candidate confidence + active-learning review order.** Confidence
-  per `extraction_candidate` (semantic entropy / source prior); sort
-  `grafiki_candidate_list` by uncertainty×representativeness. **M**
+- [x] **M-E3 — Calibrated candidate confidence + active-learning review order.** **DONE.** Pure
+  `grafiki_core::confidence` (source-reliability prior + Bayesian `1−(1−p)·0.7ⁿ` corroboration, borrowed
+  from mnemosyne's MIT veracity tiers): each `extraction_candidate` gets a principled
+  `calibrated_confidence` + a `review_priority` (uncertainty × evidence-representativeness). New
+  `ListCandidatesOptions.order = CandidateOrder::{Recent (default) | ActiveLearning}`; active-learning
+  prioritizes across the whole reviewable pool (fetch-then-rerank-then-truncate, not just the newest
+  window). CLI `grafiki candidates list --order active-learning`. Deterministic; off-by-default
+  (Recent ⇒ unchanged). Core gate `active_learning_order_and_calibrated_confidence`. **M**
 - [ ] **M-E4 — Code-structure indexing.** Tree-sitter capture pass emits code
   entities + def-ref/call/contains relations into the existing entity/relation tables
   (so H3 works over symbols). (RepoGraph, code property graphs.) **M**

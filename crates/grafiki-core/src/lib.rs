@@ -8,6 +8,7 @@
     clippy::ptr_arg
 )]
 
+pub mod confidence;
 pub mod conflict;
 pub mod db;
 pub mod decay;
@@ -41,7 +42,7 @@ pub use memory::{
     update_decision, update_entity, update_observation, update_relation, update_session,
     upsert_state, AddContextOptions, AgentMemoryBriefing, AgentQueryLogItem,
     ApproveCandidateOptions, AskMemoryOptions, BulkCandidateReviewOptions,
-    BulkCandidateReviewReport, CandidateMutationReport, CandidateReviewError,
+    BulkCandidateReviewReport, CandidateMutationReport, CandidateOrder, CandidateReviewError,
     CaptureCandidateReport, CaptureEvent, CaptureEventReport, CaptureSession, CaptureSessionReport,
     CaptureStatusOptions, CaptureStatusReport, ContextDocument, ContextListOptions, ContextReport,
     ContextSummary, DecisionItem, DecisionListOptions, DecisionReport, DeleteContextOptions,

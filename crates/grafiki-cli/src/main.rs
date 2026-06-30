@@ -31,7 +31,7 @@ use grafiki_core::{
     update_capture_config, update_context, update_decision, update_entity, update_observation,
     update_relation, update_session, upsert_state, AddContextOptions, AgentMemoryBriefing,
     AgentTranscriptImportReport, ApproveCandidateOptions, AskMemoryOptions,
-    BulkCandidateReviewOptions, BulkCandidateReviewReport, CandidateMutationReport,
+    BulkCandidateReviewOptions, BulkCandidateReviewReport, CandidateMutationReport, CandidateOrder,
     CaptureCandidateReport, CaptureConfigOptions, CaptureConfigReport, CaptureEvent,
     CaptureEventReport, CaptureSessionReport, CaptureSourceUpdates, CaptureStatusOptions,
     CaptureStatusReport, ContextListOptions, DeleteContextOptions, DeleteDecisionOptions,
@@ -702,6 +702,21 @@ enum OutputFormat {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+enum CandidateOrderArg {
+    Recent,
+    ActiveLearning,
+}
+
+impl From<CandidateOrderArg> for CandidateOrder {
+    fn from(value: CandidateOrderArg) -> Self {
+        match value {
+            CandidateOrderArg::Recent => CandidateOrder::Recent,
+            CandidateOrderArg::ActiveLearning => CandidateOrder::ActiveLearning,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum GraphOutputFormat {
     Plain,
     Json,
@@ -1234,6 +1249,10 @@ enum CandidateCommand {
         /// Maximum candidates.
         #[arg(long, default_value_t = 20)]
         limit: usize,
+
+        /// Review order: recent (newest first) or active-learning (most uncertain × evidenced first).
+        #[arg(long, value_enum, default_value_t = CandidateOrderArg::Recent)]
+        order: CandidateOrderArg,
 
         /// Explicit project name. Defaults to .grafiki detection, then directory name.
         #[arg(long)]
@@ -2647,6 +2666,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 status,
                 scope,
                 limit,
+                order,
                 project,
                 path,
                 format,
@@ -2658,6 +2678,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     status: Some(status),
                     scope,
                     limit,
+                    order: order.into(),
                 })?;
                 print_candidates(&candidates, format)?;
             }
@@ -6919,6 +6940,7 @@ fn http_candidates_list(
         status: Some(query_value(query, "status", "pending")),
         scope: query_value(query, "scope", ""),
         limit: query_usize(query, "limit", 20),
+        order: CandidateOrder::Recent,
     })?;
     json_response(&candidates)
 }
@@ -8108,6 +8130,7 @@ fn handle_mcp_tool_call(
                 status: Some(json_arg_string(&args, "status", "pending")),
                 scope: json_arg_string(&args, "scope", ""),
                 limit: json_arg_usize(&args, "limit", 20),
+                order: CandidateOrder::Recent,
             })?;
             mcp_json_tool_result(&candidates)
         }

@@ -22,7 +22,7 @@ use grafiki_core::{
     update_context, update_decision, update_entity, update_observation, update_relation,
     update_session, upsert_state, AddContextOptions, AgentQueryLogItem,
     AgentTranscriptImportReport, ApproveCandidateOptions, BulkCandidateReviewOptions,
-    BulkCandidateReviewReport, CandidateMutationReport, CaptureCandidateReport,
+    BulkCandidateReviewReport, CandidateMutationReport, CandidateOrder, CaptureCandidateReport,
     CaptureConfigOptions, CaptureConfigReport, CaptureEvent, CaptureEventReport,
     CaptureSessionReport, CaptureSourceUpdates, CaptureStatusOptions, CaptureStatusReport,
     ContextListOptions, ContextSummary, DecisionItem, DecisionListOptions, DeleteContextOptions,
@@ -1104,6 +1104,7 @@ fn list_memory_candidates(
         status: clean_optional(request.status),
         scope: clean_optional(request.scope).unwrap_or_default(),
         limit: request.limit.unwrap_or(50),
+        order: CandidateOrder::Recent,
     })
     .map_err(|error| error.to_string())
 }
