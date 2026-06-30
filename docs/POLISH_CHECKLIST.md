@@ -62,9 +62,12 @@ Effort key: **S** ≈ <½ day · **M** ≈ ½–2 days · **L** ≈ multi-day.
   `{none,default,strict}` (`validate_enum_config_value`); an unknown/legacy stored value falls back
   to `Default` at read time (a typo never disables redaction). `memory.rs` + `project.rs`. 4 unit
   tests + CLI smoke. **M**
-- [ ] **C14 — Misc audit P2s.** MCP stdin size cap + protocol-version negotiation; chunked
-  `Transfer-Encoding`; daemon PID-reuse race; entity `LIKE` wildcard escaping; empty/colliding
-  slug ids; `add_context` can't update an existing key. **S each**
+- [~] **C14 — Misc audit P2s.** MCP stdin size cap + protocol-version negotiation; chunked
+  `Transfer-Encoding`; daemon PID-reuse race; ~~entity `LIKE` wildcard escaping~~ (already fixed —
+  entity search uses FTS5, schema v3); empty/colliding slug ids; ~~`add_context` can't update an
+  existing key~~ (**DONE**: `add_context` now UPSERTs on the UNIQUE `key` — bumps `version`, emits
+  `context_updated`; also makes the candidate-approval `context` arm a graceful update instead of a
+  crash on a colliding key; H5 dedup unchanged, Arm E green). **S each**
 
 ## D. External / ops (mostly you, not code)
 

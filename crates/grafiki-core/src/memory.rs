@@ -4783,19 +4783,40 @@ pub fn add_context(options: AddContextOptions) -> Result<ContextReport> {
     )?;
     let active_session = latest_active_session(&connection, &project.project)?;
     let id = new_ulid();
+    let key = options.key.trim().to_owned();
+    let title = options.title.trim().to_owned();
     let checksum = checksum(&options.content);
-    let context_embedding_text = format!("{} {}", options.title.trim(), options.content.trim());
+    let context_embedding_text = format!("{} {}", title, options.content.trim());
+
+    // `context.key` is globally UNIQUE. Re-adding an existing key UPSERTS (bumps
+    // the version) instead of failing the constraint — "add" is create-or-update,
+    // mirroring `upsert_state`. This also turns the candidate-approval path
+    // (`approve_candidate_payload`'s `context` arm) into a graceful update rather
+    // than a crash on a colliding key.
+    let existing = load_context_document(&connection, &key).ok();
+    let (version, event_type, verb) = match &existing {
+        Some(doc) => (doc.version + 1, "context_updated", "Updated"),
+        None => (1, "context_added", "Added"),
+    };
 
     let tx = connection.transaction()?;
     tx.execute(
         "
         INSERT INTO context (id, key, title, content, category, scope, checksum)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(key) DO UPDATE SET
+            title = excluded.title,
+            content = excluded.content,
+            category = excluded.category,
+            scope = excluded.scope,
+            checksum = excluded.checksum,
+            version = context.version + 1,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
         ",
         params![
             id,
-            options.key.trim(),
-            options.title.trim(),
+            key,
+            title,
             options.content,
             category,
             scope.as_str(),
@@ -4805,31 +4826,32 @@ pub fn add_context(options: AddContextOptions) -> Result<ContextReport> {
     enqueue_embedding_job(
         &tx,
         "context",
-        options.key.trim(),
+        &key,
         scope.as_str(),
         &context_embedding_text,
     )?;
     tx.execute(
         "
         INSERT INTO events (id, event_type, source_session, target_type, target_id, scope, summary)
-        VALUES (?1, 'context_added', ?2, 'context', ?3, ?4, ?5)
+        VALUES (?1, ?2, ?3, 'context', ?4, ?5, ?6)
         ",
         params![
             new_ulid(),
+            event_type,
             active_session,
-            options.key,
+            key,
             scope.as_str(),
-            format!("Added context {}", options.title.trim())
+            format!("{verb} context {title}")
         ],
     )?;
     tx.commit()?;
 
     Ok(ContextReport {
-        key: options.key,
-        title: options.title,
+        key,
+        title,
         category,
         scope: scope.as_str().to_owned(),
-        version: 1,
+        version,
     })
 }
 
@@ -7975,11 +7997,12 @@ pub fn run_reflection(
         let context_key = format!("reflection-{scope_slug}-{}", draft.dedup_key);
 
         // Dedup. An approved `context` row with this key is an UNCONDITIONAL skip — even
-        // under `--force` — because `context.key` is UNIQUE and `add_context` is a plain
-        // INSERT, so re-approving a colliding key would error at approval (the unique
-        // constraint must be a backstop, never a crash path — §4.6). The
-        // extraction_candidates check (any status incl. `rejected`, so a human rejection
-        // is durable) is the part `--force` bypasses to re-propose a fresh review.
+        // under `--force` — so reflection never silently overwrites an existing
+        // consolidation. (`add_context` now UPSERTS on a key collision rather than
+        // crashing, so this is a correctness/idempotency choice, no longer a
+        // crash-avoidance one — §4.6.) The extraction_candidates check (any status incl.
+        // `rejected`, so a human rejection is durable) is the part `--force` bypasses to
+        // re-propose a fresh review.
         let context_hit: Option<i64> = connection
             .query_row(
                 "SELECT 1 FROM context WHERE key = ?1 LIMIT 1",
@@ -10719,6 +10742,57 @@ mod tests {
         assert_eq!(updated.version, 2);
         assert_eq!(search.results.len(), 1);
         assert_eq!(deleted.key, "phase1-prd");
+    }
+
+    #[test]
+    fn add_context_upserts_existing_key() {
+        let (_temp, home, project_dir) = setup_project();
+        start_codex(home.clone(), project_dir.clone());
+
+        let add = |title: &str, content: &str| {
+            add_context(AddContextOptions {
+                project_name: None,
+                start_dir: project_dir.clone(),
+                grafiki_home: Some(home.clone()),
+                key: "deploy-runbook".to_owned(),
+                title: title.to_owned(),
+                category: "runbook".to_owned(),
+                scope: "example-project/core".to_owned(),
+                content: content.to_owned(),
+            })
+        };
+
+        // First add → version 1.
+        let first = add("Deploy", "Deploy via CI.").unwrap();
+        assert_eq!(first.version, 1);
+
+        // Re-adding the SAME key must UPSERT (bump version), not fail on UNIQUE.
+        let second = add("Deploy v2", "Deploy via CI, then verify health.").unwrap();
+        assert_eq!(
+            second.version, 2,
+            "re-adding an existing key must bump version"
+        );
+
+        // Exactly one row remains, carrying the updated content.
+        let listed = list_context(ContextListOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            category: Some("runbook".to_owned()),
+            scope: "example-project/core".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(listed.len(), 1, "upsert must not create a duplicate row");
+
+        let shown = get_context(GetContextOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            key: "deploy-runbook".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(shown.title, "Deploy v2");
+        assert!(shown.content.contains("verify health"));
     }
 
     #[test]
