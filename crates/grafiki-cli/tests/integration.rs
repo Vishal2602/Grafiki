@@ -407,6 +407,50 @@ fn mcp_search_tool_round_trip() {
 }
 
 #[test]
+fn mcp_rejects_oversized_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("mcp");
+    std::fs::create_dir_all(&project).unwrap();
+    run_ok(&home, ["init", "mcp", "--path"], &[&project]);
+
+    let mut child = Command::new(GRAFIKI)
+        .env("GRAFIKI_HOME", &home)
+        .args([
+            "mcp",
+            "--project",
+            "mcp",
+            "--path",
+            project.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        // A single line larger than the 16 MiB cap, with no newline. The server
+        // may reject and close stdin before we finish writing, so a broken pipe
+        // here is expected — tolerate it (the point is the server must not OOM).
+        let _ = stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"");
+        let _ = stdin.write_all(&vec![b'a'; 17 * 1024 * 1024]);
+    }
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("exceeds maximum size"),
+        "expected size-limit error, got: {stdout}"
+    );
+    // Graceful reject + exit — never a crash/panic/OOM.
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn mcp_read_only_blocks_writes_and_flags_injection() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");

@@ -7790,13 +7790,57 @@ fn run_mcp(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    let mut reader = stdin.lock();
 
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
+    // Cap each JSON-RPC message so a client cannot exhaust memory with a single
+    // unterminated line (DoS guard). 16 MiB is far above any legitimate request;
+    // an oversized message is rejected and ends the session rather than buffering
+    // unbounded input the way `lines()` would.
+    const MAX_MCP_LINE_BYTES: u64 = 16 * 1024 * 1024;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let read = {
+            let mut limited = Read::take(&mut reader, MAX_MCP_LINE_BYTES + 1);
+            limited.read_until(b'\n', &mut buf)?
+        };
+        if read == 0 {
+            break; // EOF
+        }
+        // Filled the cap without reaching a newline → oversized; reject and stop.
+        if buf.len() as u64 > MAX_MCP_LINE_BYTES && buf.last() != Some(&b'\n') {
+            writeln!(
+                stdout,
+                "{}",
+                mcp_error(
+                    serde_json::Value::Null,
+                    -32600,
+                    "Invalid Request: message exceeds maximum size",
+                )
+            )?;
+            stdout.flush()?;
+            break;
+        }
+        let line = match std::str::from_utf8(&buf) {
+            Ok(text) => text.trim(),
+            Err(_) => {
+                writeln!(
+                    stdout,
+                    "{}",
+                    mcp_error(
+                        serde_json::Value::Null,
+                        -32700,
+                        "Parse error: invalid UTF-8"
+                    )
+                )?;
+                stdout.flush()?;
+                continue;
+            }
+        };
+        if line.is_empty() {
             continue;
         }
-        let message: serde_json::Value = match serde_json::from_str(&line) {
+        let message: serde_json::Value = match serde_json::from_str(line) {
             Ok(message) => message,
             Err(error) => {
                 writeln!(
