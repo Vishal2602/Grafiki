@@ -3416,6 +3416,120 @@ pub fn import_memory(options: ImportOptions) -> Result<ImportReport> {
     })
 }
 
+/// Build the incoming `(subject, predicate, value)` slot for an observation
+/// candidate, for deterministic Stage-1.2 conflict detection. Explicit
+/// `predicate`/`attribute` + `value`/`object` payload fields take precedence;
+/// otherwise the slot is recovered from a canonical leading `"<predicate>:
+/// <value>"` content line. Returns `None` — disabling deterministic detection —
+/// unless the predicate is a registered single-valued attribute.
+fn incoming_observation_slot(
+    payload: &serde_json::Value,
+    subject: &str,
+    content: Option<&str>,
+) -> Option<crate::conflict::Slot> {
+    use crate::conflict::{attribute_cardinality, Cardinality, Slot};
+    let explicit = payload
+        .get("predicate")
+        .or_else(|| payload.get("attribute"))
+        .and_then(|v| v.as_str())
+        .zip(
+            payload
+                .get("value")
+                .or_else(|| payload.get("object"))
+                .and_then(|v| v.as_str()),
+        )
+        .map(|(predicate, value)| (predicate.to_owned(), value.to_owned()));
+    let (predicate, value) = explicit.or_else(|| content.and_then(parse_observation_slot))?;
+    if attribute_cardinality(&predicate) != Cardinality::Single {
+        return None;
+    }
+    Some(Slot {
+        subject: subject.to_owned(),
+        predicate,
+        value,
+    })
+}
+
+/// Parse a canonical leading `"<predicate>: <value>"` (or `=`) slot line from an
+/// observation's content. Returns it ONLY when the predicate is a registered
+/// single-valued attribute — the closed registry is what stops ordinary prose
+/// (`"note: shipped it"`) from being mistaken for a structured slot. The
+/// predicate is bounded to a short key (≤3 words) AND the value must be a single
+/// whitespace-free token, so that a prose sentence beginning with a registry word
+/// (`"state: nodes are draining gracefully"`) is never read as a slot — the
+/// registry alone can't tell a slot key from a sentence lead-in, so the
+/// single-token value is the decisive prose guard. A real single-valued slot
+/// value is a token (`active`, `us-east-1`, `v2.1`, `America/New_York`); a
+/// multi-word value must be supplied via explicit `predicate`/`value` fields.
+/// Because every *existing* observation is parsed through here, this also keeps
+/// an explicit-payload incoming candidate from ever matching a prose note.
+fn parse_observation_slot(content: &str) -> Option<(String, String)> {
+    use crate::conflict::{attribute_cardinality, Cardinality};
+    let first = content.lines().next()?.trim();
+    let (raw_predicate, raw_value) = first.split_once(':').or_else(|| first.split_once('='))?;
+    let predicate = raw_predicate.trim();
+    let value = raw_value.trim();
+    if predicate.is_empty()
+        || value.is_empty()
+        || predicate.split_whitespace().count() > 3
+        || value.split_whitespace().count() != 1
+        || attribute_cardinality(predicate) != Cardinality::Single
+    {
+        return None;
+    }
+    Some((predicate.to_owned(), value.to_owned()))
+}
+
+/// H2 deterministic (model-free) structural conflict detection — the Stage 1.2
+/// single-valued-slot path. Given a new observation's single-valued slot, find a
+/// same-entity active observation that asserts the same slot with a different
+/// value (via the tested [`crate::conflict::slot_conflict`] decision). Returns
+/// the prior observation id and the normalized predicate, or `None`. Needs no
+/// embedding model, so it is the conflict-detection floor on the default build.
+fn detect_structural_conflict(
+    connection: &Connection,
+    scope_chain: &[String],
+    entity_name: &str,
+    incoming: &crate::conflict::Slot,
+) -> Result<Option<(String, String)>> {
+    use crate::conflict::{normalize_predicate, slot_conflict, ConflictVerdict, Slot};
+
+    let entity_sql = scoped_query(
+        "SELECT id FROM entities WHERE name = ? AND scope IN ({scopes}) LIMIT 1",
+        scope_chain.len(),
+    );
+    let mut entity_params: Vec<&dyn rusqlite::ToSql> = vec![&entity_name];
+    entity_params.extend(scope_chain.iter().map(|s| s as &dyn rusqlite::ToSql));
+    let entity_id: Option<String> = connection
+        .query_row(&entity_sql, entity_params.as_slice(), |row| row.get(0))
+        .optional()?;
+    let Some(entity_id) = entity_id else {
+        return Ok(None);
+    };
+
+    let mut statement = connection.prepare(
+        "SELECT id, content FROM observations WHERE entity_id = ?1 AND valid_to IS NULL",
+    )?;
+    let rows = statement.query_map(params![entity_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (old_id, existing_content) = row?;
+        let Some((predicate, value)) = parse_observation_slot(&existing_content) else {
+            continue;
+        };
+        let existing = Slot {
+            subject: entity_name.to_owned(),
+            predicate,
+            value,
+        };
+        if slot_conflict(&existing, incoming) == ConflictVerdict::AutoSupersede {
+            return Ok(Some((old_id, normalize_predicate(&incoming.predicate))));
+        }
+    }
+    Ok(None)
+}
+
 /// H2 automated detection (real embedding model only): suggest a prior
 /// observation that a newly-proposed observation about the **same entity** likely
 /// supersedes, by embedding similarity above a threshold. The embedding gate only
@@ -3508,12 +3622,12 @@ pub fn propose_candidate(options: ProposeCandidateOptions) -> Result<CandidateMu
     let mut payload = options.payload;
     redact_json_value(&mut payload);
 
-    // H2 automated detection (real embedding model builds only): if a new
-    // observation about an existing entity isn't already marked as superseding a
-    // prior fact, suggest the most-similar same-entity observation as a
-    // `supersedes` hint. The candidate stays pending for human review; arbitration
-    // runs at approval. Best-effort — detection must never fail the proposal.
-    #[cfg(feature = "fastembed")]
+    // H2 conflict detection: if a new observation about an existing entity isn't
+    // already marked as superseding a prior fact, suggest the prior fact it
+    // supersedes as a `supersedes` hint. The candidate always stays pending for
+    // human review (`conflict_kind = "review"`); arbitration runs at approval —
+    // this is never an auto-applied write. Best-effort: detection must never fail
+    // the proposal.
     if record_type == "observation" && payload.get("supersedes").and_then(|v| v.as_str()).is_none()
     {
         let entity_name = payload
@@ -3527,17 +3641,45 @@ pub fn propose_candidate(options: ProposeCandidateOptions) -> Result<CandidateMu
             .or_else(|| payload.get("observe"))
             .and_then(|v| v.as_str())
             .map(str::to_owned);
-        if let (Some(name), Some(content)) = (entity_name, content) {
-            if !content.is_empty() {
-                if let Ok(Some((old_id, score))) = detect_observation_conflict(
-                    &connection,
-                    scope.chain().as_slice(),
-                    &name,
-                    &content,
-                ) {
+
+        if let Some(name) = entity_name {
+            // Stage 1.2 — deterministic single-valued-slot detection (Ritter
+            // EMNLP'08 functional predicates). Model-free, so it runs on the
+            // DEFAULT build. Fires only when the new observation expresses a
+            // registered single-valued slot — explicit `predicate`/`value` fields
+            // or a canonical `"<predicate>: <value>"` content line — and a
+            // same-entity active observation asserts that slot with a different
+            // value. The closed cardinality registry is the false-positive guard.
+            if let Some(slot) = incoming_observation_slot(&payload, &name, content.as_deref()) {
+                if let Ok(Some((old_id, predicate))) =
+                    detect_structural_conflict(&connection, scope.chain().as_slice(), &name, &slot)
+                {
                     payload["supersedes"] = serde_json::json!(old_id);
                     payload["conflict_kind"] = serde_json::json!("review");
-                    payload["conflict_similarity"] = serde_json::json!(score);
+                    payload["conflict_detector"] = serde_json::json!("slot");
+                    payload["conflict_predicate"] = serde_json::json!(predicate);
+                }
+            }
+
+            // Stage 0 fallback — embedding gate (real model builds only). Runs
+            // only if the deterministic path found nothing (supersedes still
+            // unset), narrowing the free-text / paraphrased observations the
+            // structural layer cannot see.
+            #[cfg(feature = "fastembed")]
+            if payload.get("supersedes").and_then(|v| v.as_str()).is_none() {
+                if let Some(content) = content.as_deref() {
+                    if !content.is_empty() {
+                        if let Ok(Some((old_id, score))) = detect_observation_conflict(
+                            &connection,
+                            scope.chain().as_slice(),
+                            &name,
+                            content,
+                        ) {
+                            payload["supersedes"] = serde_json::json!(old_id);
+                            payload["conflict_kind"] = serde_json::json!("review");
+                            payload["conflict_similarity"] = serde_json::json!(score);
+                        }
+                    }
                 }
             }
         }
@@ -10652,6 +10794,180 @@ mod tests {
                 .iter()
                 .any(|r| r.snippet.contains("us-east-1")),
             "stale observation must be suppressed after supersession"
+        );
+    }
+
+    #[test]
+    fn deterministic_slot_conflict_routes_supersedes_without_model() {
+        let (_temp, home, project_dir) = setup_project();
+        let scope = "example-project/core";
+
+        // Prior single-valued fact, stored as a canonical slot line.
+        let old = save_entity(SaveEntityOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            name: "auth-service".to_owned(),
+            entity_type: "service".to_owned(),
+            observe: Some("status: active".to_owned()),
+            category: "architecture".to_owned(),
+            scope: scope.to_owned(),
+            relate: None,
+        })
+        .unwrap();
+        let old_obs = old.observation_id.expect("old observation id");
+
+        // A new value for the same single-valued slot — explicit predicate/value,
+        // no embedding model required. Detection runs on the default build.
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "connector:test".to_owned(),
+            source: None,
+            record_type: "observation".to_owned(),
+            payload: serde_json::json!({
+                "entity_name": "auth-service",
+                "content": "status: deprecated",
+                "predicate": "status",
+                "value": "deprecated",
+                "category": "architecture",
+            }),
+            scope: scope.to_owned(),
+            confidence: 0.9,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            proposed
+                .candidate
+                .payload
+                .get("supersedes")
+                .and_then(|v| v.as_str()),
+            Some(old_obs.as_str()),
+            "deterministic detection should point supersedes at the prior single-valued fact"
+        );
+        assert_eq!(
+            proposed
+                .candidate
+                .payload
+                .get("conflict_detector")
+                .and_then(|v| v.as_str()),
+            Some("slot"),
+            "the deterministic detector must tag itself for the gate UX"
+        );
+        assert_eq!(
+            proposed
+                .candidate
+                .payload
+                .get("conflict_predicate")
+                .and_then(|v| v.as_str()),
+            Some("status")
+        );
+        assert_eq!(
+            proposed
+                .candidate
+                .payload
+                .get("conflict_kind")
+                .and_then(|v| v.as_str()),
+            Some("review"),
+            "deterministic conflicts route to review, never an auto-applied write"
+        );
+    }
+
+    #[test]
+    fn deterministic_slot_detection_ignores_multi_valued_predicates() {
+        let (_temp, home, project_dir) = setup_project();
+        let scope = "example-project/core";
+
+        // "language" is multi-valued — two values coexist, never a conflict.
+        save_entity(SaveEntityOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            name: "alice".to_owned(),
+            entity_type: "person".to_owned(),
+            observe: Some("language: english".to_owned()),
+            category: "general".to_owned(),
+            scope: scope.to_owned(),
+            relate: None,
+        })
+        .unwrap();
+
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "connector:test".to_owned(),
+            source: None,
+            record_type: "observation".to_owned(),
+            payload: serde_json::json!({
+                "entity_name": "alice",
+                "content": "language: french",
+                "predicate": "language",
+                "value": "french",
+                "category": "general",
+            }),
+            scope: scope.to_owned(),
+            confidence: 0.9,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+
+        assert!(
+            proposed.candidate.payload.get("supersedes").is_none(),
+            "a multi-valued attribute must never trigger a (false) supersession"
+        );
+    }
+
+    #[test]
+    fn deterministic_slot_detection_does_not_mis_parse_prose() {
+        // Regression: registry words like "state"/"status" also lead ordinary
+        // prose ("state: nodes are draining gracefully"). Such a sentence must
+        // NOT be read as a single-valued slot, or two unrelated notes would
+        // false-supersede. The single-token value guard is what prevents it.
+        let (_temp, home, project_dir) = setup_project();
+        let scope = "example-project/core";
+
+        save_entity(SaveEntityOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            name: "cluster-a".to_owned(),
+            entity_type: "service".to_owned(),
+            observe: Some("state: nodes are draining gracefully".to_owned()),
+            category: "general".to_owned(),
+            scope: scope.to_owned(),
+            relate: None,
+        })
+        .unwrap();
+
+        // Content-only (no explicit predicate/value) prose with the same lead word.
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "connector:test".to_owned(),
+            source: None,
+            record_type: "observation".to_owned(),
+            payload: serde_json::json!({
+                "entity_name": "cluster-a",
+                "content": "state: nodes rejoined after the network partition",
+                "category": "general",
+            }),
+            scope: scope.to_owned(),
+            confidence: 0.9,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+
+        assert!(
+            proposed.candidate.payload.get("supersedes").is_none(),
+            "prose beginning with a registry word must not be parsed as a slot"
         );
     }
 

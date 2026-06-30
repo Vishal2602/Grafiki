@@ -1,6 +1,13 @@
 # DESIGN: Grafiki H2 — Automated Conflict / Contradiction Resolution
 
-**Status:** Proposed (implementation-ready)
+**Status:** Implemented (v1). **Update 2026-06-30:** Stage 1.2 deterministic single-valued-slot
+detection (§4) is now wired into `propose_candidate` and runs on the **default build** (no embedding
+model) — `incoming_observation_slot`/`parse_observation_slot`/`detect_structural_conflict` in
+`memory.rs`, reusing the tested `conflict::slot_conflict` + cardinality registry. It sets a
+`supersedes` hint + `conflict_detector="slot"` (never an auto-applied write); the `fastembed`
+embedding gate now runs only as a fallback when the deterministic path finds nothing. A
+single-token-value guard in `parse_observation_slot` stops prose that merely begins with a registry
+word (`"state: nodes are draining…"`) from being mis-read as a slot.
 **Crate:** `crates/grafiki-core` (detection + resolution); `crates/grafiki-eval` (Arm D proof); `crates/grafiki-cli` + MCP surface (gate UX)
 **Depends on:** existing bitemporal supersession, candidate lifecycle, and embedding APIs in `grafiki-core`
 **Owner:** Lead engineer, memory
