@@ -242,7 +242,7 @@ enum Command {
         #[arg(long = "type", default_value = "all")]
         record_type: String,
 
-        /// Search mode: keyword, semantic, hybrid.
+        /// Search mode: keyword, semantic, hybrid, graph, or rerank.
         #[arg(long, value_enum, default_value_t = SearchModeArg::Keyword)]
         mode: SearchModeArg,
 
@@ -767,6 +767,11 @@ enum SearchModeArg {
     Keyword,
     Semantic,
     Hybrid,
+    /// Personalized-PageRank over the relations graph (H3; model-free). Also surfaces code symbols
+    /// indexed by `grafiki index-code`.
+    Graph,
+    /// Hybrid fuse → cross-encoder rerank (H4; needs a `--features fastembed` build, else degrades).
+    Rerank,
 }
 
 impl From<SearchModeArg> for CoreSearchMode {
@@ -775,6 +780,8 @@ impl From<SearchModeArg> for CoreSearchMode {
             SearchModeArg::Keyword => Self::Keyword,
             SearchModeArg::Semantic => Self::Semantic,
             SearchModeArg::Hybrid => Self::Hybrid,
+            SearchModeArg::Graph => Self::Graph,
+            SearchModeArg::Rerank => Self::Rerank,
         }
     }
 }
