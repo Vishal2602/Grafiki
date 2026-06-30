@@ -288,6 +288,11 @@ enum Command {
         #[arg(long, default_value = "cli")]
         agent: String,
 
+        /// Temporal/decay boost (0 = off): bias the briefing toward recent + frequently-reused
+        /// memory. (M-E2.)
+        #[arg(long, default_value_t = 0.0)]
+        temporal_weight: f64,
+
         /// Directory used for project detection.
         #[arg(long, default_value = ".")]
         path: PathBuf,
@@ -1885,6 +1890,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             scope,
             limit,
             agent,
+            temporal_weight,
             path,
             format,
         } => {
@@ -1896,6 +1902,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 scope,
                 limit,
                 agent: Some(agent),
+                temporal_weight,
             })?;
 
             match format {
@@ -6494,6 +6501,7 @@ fn http_ask(
             .get("agent")
             .cloned()
             .or_else(|| Some("http".to_owned())),
+        temporal_weight: 0.0,
     })?;
     json_response(&briefing)
 }
@@ -7970,6 +7978,7 @@ fn handle_mcp_tool_call(
                 scope: json_arg_string(&args, "scope", ""),
                 limit: json_arg_usize(&args, "limit", 8),
                 agent: json_optional_string(&args, "agent").or_else(|| Some("mcp".to_owned())),
+                temporal_weight: json_arg_f64(&args, "temporal_weight", 0.0),
             })?;
             // M-E5: flag injected instructions surfaced in the briefing answer.
             mcp_json_tool_result_guarded(&briefing, &[briefing.answer.as_str()])
@@ -8204,7 +8213,7 @@ fn handle_mcp_tool_call(
                 mode: CoreSearchMode::parse(&json_arg_string(&args, "mode", "keyword"))?,
                 scope: json_arg_string(&args, "scope", ""),
                 limit: json_arg_usize(&args, "limit", 10),
-                temporal_weight: 0.0,
+                temporal_weight: json_arg_f64(&args, "temporal_weight", 0.0),
             })?;
             // M-E5: flag injected instructions in retrieved snippets before handing them back.
             let snippets: Vec<&str> = report.results.iter().map(|r| r.snippet.as_str()).collect();
@@ -8446,7 +8455,8 @@ fn mcp_tools(read_only: bool) -> serde_json::Value {
                 "question": { "type": "string" },
                 "scope": { "type": "string", "default": "" },
                 "limit": { "type": "integer", "default": 8 },
-                "agent": { "type": "string", "default": "mcp" }
+                "agent": { "type": "string", "default": "mcp" },
+                "temporal_weight": { "type": "number", "default": 0, "description": "Bias the briefing toward recent + frequently-reused memory (0 = off)." }
             }),
             &["question"]
         ),
@@ -8624,9 +8634,10 @@ fn mcp_tools(read_only: bool) -> serde_json::Value {
             serde_json::json!({
                 "query": { "type": "string" },
                 "type": { "type": "string", "default": "all" },
-                "mode": { "type": "string", "enum": ["keyword", "semantic", "hybrid"], "default": "keyword" },
+                "mode": { "type": "string", "enum": ["keyword", "semantic", "hybrid", "graph", "rerank"], "default": "keyword" },
                 "scope": { "type": "string", "default": "" },
-                "limit": { "type": "integer", "default": 10 }
+                "limit": { "type": "integer", "default": 10 },
+                "temporal_weight": { "type": "number", "default": 0, "description": "Bias toward recent + frequently-reused memory (0 = off)." }
             }),
             &["query"]
         ),
@@ -9019,6 +9030,16 @@ fn json_arg_usize(args: &serde_json::Value, key: &str, default: usize) -> usize 
         .and_then(|value| match value {
             serde_json::Value::Number(value) => value.as_u64().map(|value| value as usize),
             serde_json::Value::String(value) => value.parse::<usize>().ok(),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
+fn json_arg_f64(args: &serde_json::Value, key: &str, default: f64) -> f64 {
+    args.get(key)
+        .and_then(|value| match value {
+            serde_json::Value::Number(value) => value.as_f64(),
+            serde_json::Value::String(value) => value.parse::<f64>().ok(),
             _ => None,
         })
         .unwrap_or(default)

@@ -276,6 +276,8 @@ pub struct AskMemoryOptions {
     pub scope: String,
     pub limit: usize,
     pub agent: Option<String>,
+    /// M-E2 temporal/decay boost for the briefing's retrieval (0.0 = off; see `crate::decay`).
+    pub temporal_weight: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2482,7 +2484,7 @@ pub fn ask_memory(options: AskMemoryOptions) -> Result<AgentMemoryBriefing> {
         mode: SearchMode::Hybrid,
         scope: scope.clone(),
         limit,
-        temporal_weight: 0.0,
+        temporal_weight: options.temporal_weight,
     })?;
     let pending_candidates = list_candidates(ListCandidatesOptions {
         project_name: options.project_name.clone(),
@@ -10017,6 +10019,7 @@ mod tests {
             scope,
             limit: 6,
             agent: Some("codex".to_owned()),
+            temporal_weight: 0.0,
         })
         .unwrap();
 

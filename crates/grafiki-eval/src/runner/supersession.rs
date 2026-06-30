@@ -231,6 +231,7 @@ fn run_item(item: &SupersessionItem) -> EvalResult<ItemOutcome> {
             scope: SCOPE.to_string(),
             limit: 10,
             agent: Some("eval".to_string()),
+            temporal_weight: 0.0,
         })?;
         let answer = briefing.answer.to_lowercase();
         !item
