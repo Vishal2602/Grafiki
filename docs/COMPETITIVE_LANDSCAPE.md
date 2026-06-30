@@ -192,7 +192,9 @@ Ranked by leverage. All keep the local-first / deterministic invariant.
    first. Strengthens H2 with zero ML. **Effort: S. Det: ✅. — DONE** (model-free Stage 1.2 slot
    detector wired into `propose_candidate` on the default build; `conflict_detector="slot"`; the
    `fastembed` embedding detector is now a fallback. Single-token-value guard prevents prose
-   mis-parse. Polarity/numeric checks remain deferred.)
+   mis-parse. Polarity/numeric object canonicalization also DONE — `conflict::values_equivalent`
+   folds `2`≡`2.0` and `true`≡`yes`≡`on` so restatements aren't mis-flagged as contradictions,
+   a pure precision guard that cannot raise the false-supersession rate.)
 4. **Veracity Bayesian confidence** `1 − 0.7ⁿ` + source tiers (mnemosyne `veracity_consolidation.py`)
    → the M-tier "calibrated candidate confidence" + active-learning review ordering. **Effort: S. Det: ✅.**
 5. **Optional local NLI contradiction signal** (DeBERTa-v3 via `candle`/`ort`) — feature-gated, scored

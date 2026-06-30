@@ -100,6 +100,43 @@ pub fn normalize_value(value: &str) -> String {
         .to_lowercase()
 }
 
+/// Map a recognized affirmative/negative boolean literal to its polarity.
+/// Deliberately a TIGHT closed set of pure boolean words — domain values like
+/// `active`/`alive`/`running` are absent, so they keep comparing as plain strings
+/// (`active` vs `inactive` stays a genuine conflict, not a folded "both true").
+fn canonical_bool(value: &str) -> Option<bool> {
+    match value.trim().to_lowercase().as_str() {
+        "true" | "yes" | "on" | "enabled" => Some(true),
+        "false" | "no" | "off" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether two attribute values are *equivalent* — an idempotent restatement, not
+/// a conflict. Beyond casing/whitespace ([`normalize_value`]) this canonicalizes
+/// objects before comparison (Ritter EMNLP'08, "canonicalize first"):
+/// - **numeric notation** — `"2"` ≡ `"2.0"`, `"8080"` ≡ `"08080"`; and
+/// - **boolean polarity** — `"true"` ≡ `"yes"` ≡ `"on"`, `"false"` ≡ `"no"`.
+///
+/// It only ever judges MORE pairs equal, so wiring it into [`slot_conflict`]
+/// strictly *reduces* (never creates) supersessions — a precision guard that
+/// cannot raise the false-supersession rate.
+pub fn values_equivalent(a: &str, b: &str) -> bool {
+    // Boolean polarity: fold yes/true/on/enabled and no/false/off/disabled.
+    if let (Some(pa), Some(pb)) = (canonical_bool(a), canonical_bool(b)) {
+        return pa == pb;
+    }
+    // Numeric: both parse as the same finite number (compare with a relative
+    // epsilon so `2` ≡ `2.0` without a brittle exact float compare).
+    if let (Ok(na), Ok(nb)) = (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
+        if na.is_finite() && nb.is_finite() {
+            let tolerance = f64::EPSILON * na.abs().max(nb.abs()).max(1.0);
+            return (na - nb).abs() <= tolerance;
+        }
+    }
+    normalize_value(a) == normalize_value(b)
+}
+
 /// Normalize an attribute/predicate name and fold a few common synonyms so the
 /// same slot under two spellings (`works_at` / `employer`) compares equal.
 pub fn normalize_predicate(predicate: &str) -> String {
@@ -140,8 +177,10 @@ pub fn slot_conflict(existing: &Slot, incoming: &Slot) -> ConflictVerdict {
     {
         return ConflictVerdict::NoConflict;
     }
-    // Same value → idempotent restatement, not a conflict.
-    if normalize_value(&existing.value) == normalize_value(&incoming.value) {
+    // Same value → idempotent restatement, not a conflict. Uses canonical
+    // equivalence so numeric/boolean restatements (`2` vs `2.0`, `true` vs `yes`)
+    // are not mistaken for a contradiction.
+    if values_equivalent(&existing.value, &incoming.value) {
         return ConflictVerdict::NoConflict;
     }
     match attribute_cardinality(&incoming.predicate) {
@@ -381,6 +420,54 @@ mod tests {
                 &slot("a", "timezone", "PST")
             ),
             ConflictVerdict::NoConflict
+        );
+    }
+
+    #[test]
+    fn values_equivalent_folds_numeric_and_boolean_notation() {
+        // Numeric notation.
+        assert!(values_equivalent("2", "2.0"));
+        assert!(values_equivalent("8080", "08080"));
+        assert!(values_equivalent("2.50", "2.5"));
+        assert!(!values_equivalent("2", "3"));
+        // Boolean polarity.
+        assert!(values_equivalent("true", "yes"));
+        assert!(values_equivalent("Enabled", "on"));
+        assert!(values_equivalent("false", "No"));
+        assert!(!values_equivalent("true", "false"));
+        // Domain values are NOT booleans — they must stay distinct.
+        assert!(!values_equivalent("active", "inactive"));
+        assert!(!values_equivalent("alive", "dead"));
+        // Plain strings still fold by casing/whitespace.
+        assert!(values_equivalent("New York", "new york"));
+    }
+
+    #[test]
+    fn numeric_and_boolean_restatement_is_not_a_false_conflict() {
+        // "version: 2" then "version: 2.0" is the same version — idempotent.
+        assert_eq!(
+            slot_conflict(&slot("app", "version", "2"), &slot("app", "version", "2.0")),
+            ConflictVerdict::NoConflict
+        );
+        // A real version bump still supersedes.
+        assert_eq!(
+            slot_conflict(&slot("app", "version", "2"), &slot("app", "version", "3")),
+            ConflictVerdict::AutoSupersede
+        );
+        // Polarity restatement on a single-valued slot is idempotent; a flip conflicts.
+        assert_eq!(
+            slot_conflict(
+                &slot("svc", "status", "enabled"),
+                &slot("svc", "status", "on")
+            ),
+            ConflictVerdict::NoConflict
+        );
+        assert_eq!(
+            slot_conflict(
+                &slot("svc", "status", "enabled"),
+                &slot("svc", "status", "disabled")
+            ),
+            ConflictVerdict::AutoSupersede
         );
     }
 
