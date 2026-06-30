@@ -6422,27 +6422,37 @@ fn redact_private_key_blocks(input: &str) -> String {
 fn redact_assignment_like_secrets(input: &str) -> String {
     let mut output = Vec::new();
     for line in input.lines() {
-        // Match the secret-key name in the KEY position (before the first `=`/`:`), NOT anywhere in
-        // the line — otherwise prose that merely mentions "token"/"secret" after a colon (e.g. a
-        // summary's "entities: …, Refresh Token Cache" or a "Keywords: …, token, …" line) would be
-        // wrongly nuked. The separator is whichever of `=`/`:` comes first.
-        let separator = match (line.find('='), line.find(':')) {
-            (Some(eq), Some(colon)) => Some(if eq <= colon { ('=', eq) } else { (':', colon) }),
-            (Some(eq), None) => Some(('=', eq)),
-            (None, Some(colon)) => Some((':', colon)),
-            (None, None) => None,
-        };
-        let redacted = match separator {
-            Some((ch, pos)) if key_looks_secret(&line[..pos]) => {
-                let prefix = line[..pos].trim_end();
-                Some(if ch == '=' {
-                    format!("{prefix}=[REDACTED_SECRET]")
-                } else {
-                    format!("{prefix}: [REDACTED_SECRET]")
-                })
+        // For each `=`/`:` separator, the KEY is the identifier token IMMEDIATELY before it. Redact
+        // from the earliest separator whose key is secret-named to end of line. Keying on the
+        // adjacent identifier (not "anywhere in the line", and not "only before the first
+        // separator") is both precise — prose like "entities: …, Refresh Token Cache" or
+        // "Keywords: …, token" has no secret-named key adjacent to a separator — and leak-safe for
+        // multi-field lines like "host: db, password=… ; token=…", where the secret key follows a
+        // benign one.
+        let mut cut: Option<(char, usize)> = None;
+        for (i, ch) in line.char_indices() {
+            if ch != '=' && ch != ':' {
+                continue;
             }
-            _ => None,
-        };
+            let before = line[..i].trim_end();
+            let key_start = before
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            let key = &before[key_start..];
+            if !key.is_empty() && key_looks_secret(key) {
+                cut = Some((ch, i));
+                break;
+            }
+        }
+        let redacted = cut.map(|(ch, i)| {
+            let prefix = line[..i].trim_end();
+            if ch == '=' {
+                format!("{prefix}=[REDACTED_SECRET]")
+            } else {
+                format!("{prefix}: [REDACTED_SECRET]")
+            }
+        });
         output.push(redacted.unwrap_or_else(|| line.to_owned()));
     }
     let joined = output.join("\n");
@@ -6603,7 +6613,12 @@ fn shannon_entropy(token: &str) -> f64 {
 /// lowercase-hex git SHAs/md5/uuids, ALL-CAPS constants, and natural words), and has Shannon
 /// entropy `≥ 3.5` bits/char (random-looking). Tuned against the redaction eval's benign cases.
 fn looks_high_entropy_secret(token: &str) -> bool {
-    const MIN_LEN: usize = 28;
+    // 32 chars is the floor for most real API keys/tokens; shorter mixed strings (e.g. a 28-char
+    // base64 data fragment) are more likely benign, so requiring ≥32 trims false positives. A
+    // genuinely random ≥32-char mixed-case+digit blob is still inherently ambiguous with a
+    // credential — when in doubt the seam errs toward redaction (a leak is worse than a corrupted
+    // blob), accepting rare base64-data over-redaction.
+    const MIN_LEN: usize = 32;
     const MIN_ENTROPY: f64 = 3.5;
     if token.chars().count() < MIN_LEN {
         return false;
@@ -11457,6 +11472,47 @@ mod tests {
                 text.contains(benign),
                 "benign token was over-redacted: {text}"
             );
+        }
+    }
+
+    #[test]
+    fn assignment_redactor_catches_secret_after_a_benign_field() {
+        // Multi-field lines: the secret key follows a benign one. The redactor must key on the
+        // identifier ADJACENT to each separator, so the credential is caught (no leak) while the
+        // benign leading field is preserved — and prose that merely mentions a secret word after a
+        // colon is NOT over-redacted.
+        let leaks = [
+            (
+                "Host: db.internal, password=hunter2plaintextvalue",
+                "hunter2plaintextvalue",
+            ),
+            (
+                "name=foo; api_key: AbCdEfGhIjKlMnOpQr",
+                "AbCdEfGhIjKlMnOpQr",
+            ),
+            (
+                "remote: gitlab.com, token=hunter2plaintextval",
+                "hunter2plaintextval",
+            ),
+        ];
+        for (line, secret) in leaks {
+            let (out, changed) = super::redact_text(line);
+            assert!(changed, "should redact: {line}");
+            assert!(!out.contains(secret), "secret leaked: {out}");
+            assert!(out.contains("[REDACTED_SECRET]"), "{out}");
+        }
+        // Precision: benign leading field preserved; prose mentioning a secret word is untouched.
+        let (kept, _) = super::redact_text("name=foo; api_key: AbCdEfGhIjKlMnOpQr");
+        assert!(
+            kept.contains("name=foo"),
+            "benign field must survive: {kept}"
+        );
+        for benign in [
+            "Community theme across 3 entities: Auth Service, JWT Library, Refresh Token Cache.",
+            "Keywords: auth, token, refresh, redis",
+        ] {
+            let (out, _) = super::redact_text(benign);
+            assert_eq!(out, benign, "must not over-redact prose: {out}");
         }
     }
 
