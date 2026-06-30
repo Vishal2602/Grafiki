@@ -117,6 +117,18 @@ mod rust {
         }
     }
 
+    /// Collision-resistant entity id for a qualified symbol path: a readable slug plus a short hash
+    /// of the EXACT path. `slugify` alone lowercases and collapses every non-alphanumeric run to a
+    /// dash, so `Foo`/`foo`, `Bar::baz`/`Bar_baz`, or `mod error`/`enum Error` would share an id and
+    /// silently merge (dropping a symbol + cross-wiring its edges). The hash makes distinct paths
+    /// distinct, while *intended* merges (an `impl` block and its struct, or several `impl`s on one
+    /// type) still share an id because they share the exact `qual` string — so this stays idempotent.
+    fn symbol_id(qual: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = format!("{:x}", Sha256::new_with_prefix(qual.as_bytes()).finalize());
+        format!("{}-{}", slugify(qual), &digest[..10])
+    }
+
     /// Emit a child symbol named `parent_qual::ident` and a `part_of` edge to `parent_id`.
     /// Returns the child's `(id, qual)` so callers can recurse into it.
     fn emit(
@@ -129,7 +141,7 @@ mod rust {
         file: &str,
     ) -> (String, String) {
         let qual = format!("{parent_qual}::{ident}");
-        let id = slugify(&qual);
+        let id = symbol_id(&qual);
         symbols.push(Symbol {
             id: id.clone(),
             name: qual.clone(),
@@ -264,7 +276,7 @@ mod rust {
                 // elsewhere); the type itself is part_of the file.
                 if let Some(name) = type_name(&im.self_ty) {
                     let tqual = format!("{parent_qual}::{name}");
-                    let tid = slugify(&tqual);
+                    let tid = symbol_id(&tqual);
                     symbols.push(Symbol {
                         id: tid.clone(),
                         name: tqual.clone(),
@@ -339,7 +351,7 @@ mod rust {
                 continue;
             };
             files_indexed += 1;
-            let file_id = slugify(rel);
+            let file_id = symbol_id(rel);
             symbols.push(Symbol {
                 id: file_id.clone(),
                 name: rel.clone(),
@@ -429,6 +441,8 @@ pub mod alpha {
         pub fn render(&self) {}
     }
     pub fn helper() {}
+    // Case-only clash with the struct above: must NOT merge into one entity (slug-collision guard).
+    pub fn widget() {}
 }
 pub fn top_level() {}
 "#,
@@ -502,6 +516,20 @@ pub fn top_level() {}
         assert!(
             reached.iter().any(|r| r.title.contains("Widget")),
             "render's type Widget should be reachable via part_of"
+        );
+
+        // Slug-collision guard: the struct `Widget` and the fn `widget` (case-only clash) must be
+        // TWO distinct entities, not silently merged into one.
+        let widgets = graph("widget");
+        assert!(
+            widgets.iter().any(|r| r.title.ends_with("::Widget")),
+            "the struct Widget must survive: {:?}",
+            widgets.iter().map(|r| r.title.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            widgets.iter().any(|r| r.title.ends_with("::widget")),
+            "the fn widget must survive distinctly: {:?}",
+            widgets.iter().map(|r| r.title.clone()).collect::<Vec<_>>()
         );
     }
 }
