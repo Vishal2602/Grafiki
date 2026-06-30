@@ -4023,10 +4023,24 @@ pub fn start_capture_session(options: StartCaptureOptions) -> Result<CaptureSess
         .consent_profile
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "local-explicit".to_owned());
-    let redaction_profile = options
+    // Validate the profile at the write boundary too (the config path already
+    // does), so an invalid value is rejected up front rather than silently
+    // normalized to Default only at read time.
+    let redaction_profile = match options
         .redaction_profile
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "default".to_owned());
+    {
+        Some(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            if !matches!(normalized.as_str(), "none" | "default" | "strict") {
+                return Err(GrafikiError::InvalidCaptureConfig(
+                    "redaction_profile must be one of: none, default, strict".to_owned(),
+                ));
+            }
+            normalized
+        }
+        None => "default".to_owned(),
+    };
 
     connection.execute(
         "
@@ -6565,31 +6579,44 @@ fn redact_text_with_profile(text: &mut String, profile: RedactionProfile) -> boo
 /// regex-free, mirroring the other redactors: for each `@`, expand to the maximal
 /// local/domain character runs and, if they form a well-formed `local@domain.tld`
 /// (non-empty local; dotted domain; ≥2-char alphabetic TLD), replace the span
-/// with `[REDACTED_EMAIL]`. Conservative — `@handle`, `user@`, `a@localhost`, and
-/// IP-literal domains are left alone — but, being the aggressive opt-in profile,
-/// it will over-redact lookalikes such as `image@2x.png`.
+/// with `[REDACTED_EMAIL]`. The local part is matched with **Unicode-aware** chars
+/// (`char::is_alphanumeric`), so RFC 6531 addresses like `café@x.com` / `用户@x.com`
+/// are covered, not partially leaked. Conservative — `@handle`, `user@`,
+/// `a@localhost`, and IP-literal domains are left alone — but, being the aggressive
+/// opt-in profile, it over-redacts lookalikes such as `image@2x.png`. Known limit:
+/// the domain side is ASCII-only, so a Unicode (non-punycode) domain under-redacts.
 fn redact_emails(input: &str) -> String {
     let bytes = input.as_bytes();
-    let is_local =
-        |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'+' | b'-');
+    // Local-part chars are Unicode-aware so a non-ASCII local part is captured
+    // whole (a partial match would leak a fragment); domain chars stay ASCII.
+    let is_local = |c: char| c.is_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-');
     let is_domain = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-');
 
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'@' {
-            let mut start = i;
-            while start > 0 && is_local(bytes[start - 1]) {
-                start -= 1;
-            }
             let mut end = i + 1;
             while end < bytes.len() && is_domain(bytes[end]) {
                 end += 1;
             }
-            if start < i && is_valid_email_domain(&bytes[i + 1..end]) {
-                spans.push((start, end));
-                i = end;
-                continue;
+            if is_valid_email_domain(&bytes[i + 1..end]) {
+                // Local part: scan chars left of `@` from the right (char_indices is
+                // boundary-safe, so the resulting byte offset is always a char
+                // boundary even across multi-byte locals).
+                let mut start = i;
+                for (idx, ch) in input[..i].char_indices().rev() {
+                    if is_local(ch) {
+                        start = idx;
+                    } else {
+                        break;
+                    }
+                }
+                if start < i {
+                    spans.push((start, end));
+                    i = end;
+                    continue;
+                }
             }
         }
         i += 1;
@@ -11868,6 +11895,14 @@ mod tests {
             super::redact_emails("ping alice@example.com or <bob.smith+ci@corp.io>."),
             "ping [REDACTED_EMAIL] or <[REDACTED_EMAIL]>."
         );
+        // UTF-8 (RFC 6531) local parts are captured WHOLE, never partially leaked.
+        for utf8 in ["café@example.com", "用户@example.com", "münch@example.com"] {
+            assert_eq!(
+                super::redact_emails(utf8),
+                "[REDACTED_EMAIL]",
+                "UTF-8 local part must be fully redacted: {utf8}"
+            );
+        }
         // Non-emails are left alone (precision).
         for benign in [
             "@handle",
