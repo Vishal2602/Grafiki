@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlite-vec = { workspace = true, optional = true }
+syn = { version = "2", features = ["full", "parsing"], optional = true }
 thiserror.workspace = true
 ulid.workspace = true
 
@@ -19,6 +20,8 @@ ulid.workspace = true
 default = []
 fastembed = ["dep:fastembed"]
 sqlite-vec = ["dep:sqlite-vec"]
+# M-E4: code-structure indexing (Rust via `syn`). Off by default to keep the lean build lean.
+code-index = ["dep:syn"]
 
 [dev-dependencies]
 tempfile.workspace = true

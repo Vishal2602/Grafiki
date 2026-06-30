@@ -63,6 +63,9 @@ pub enum GrafikiError {
     #[error("Embedding error: {0}")]
     Embedding(String),
 
+    #[error("Code indexing error: {0}")]
+    CodeIndex(String),
+
     #[error("Entity not found: {0}")]
     EntityNotFound(String),
 

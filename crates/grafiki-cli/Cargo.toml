@@ -19,6 +19,7 @@ serde_json.workspace = true
 default = []
 fastembed = ["grafiki-core/fastembed"]
 sqlite-vec = ["grafiki-core/sqlite-vec"]
+code-index = ["grafiki-core/code-index"]
 
 [dev-dependencies]
 tempfile.workspace = true

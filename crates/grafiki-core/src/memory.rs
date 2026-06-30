@@ -5098,7 +5098,7 @@ pub fn delete_context(options: DeleteContextOptions) -> Result<ContextReport> {
     })
 }
 
-fn resolve_and_open(
+pub(crate) fn resolve_and_open(
     project_name: Option<String>,
     start_dir: PathBuf,
     grafiki_home: Option<PathBuf>,
@@ -7203,7 +7203,7 @@ fn parse_json_list(value: Option<&str>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn slugify(name: &str) -> String {
+pub(crate) fn slugify(name: &str) -> String {
     let mut slug = String::new();
     let mut previous_dash = false;
 

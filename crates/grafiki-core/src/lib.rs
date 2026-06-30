@@ -8,6 +8,7 @@
     clippy::ptr_arg
 )]
 
+pub mod code_index;
 pub mod confidence;
 pub mod conflict;
 pub mod db;
@@ -24,6 +25,7 @@ pub mod session;
 pub mod transcript;
 pub mod ulid;
 
+pub use code_index::{index_code, IndexCodeOptions, IndexCodeReport};
 pub use conflict::{
     arbitrate, attribute_cardinality, key_conflict, slot_conflict, temporal_relation,
     ArbitrationBasis, Cardinality, ConflictVerdict, FactMeta, Slot, TemporalRelation, Winner,

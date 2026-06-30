@@ -23,7 +23,7 @@ use grafiki_core::{
     delete_decision, delete_entity, delete_observation, delete_relation, delete_state,
     edit_candidate, end_session, export_memory, generate_report, get_capture_status, get_context,
     get_embedding_status, get_graph, get_memory_record_detail, get_status, handoff_session,
-    import_agent_transcripts, import_memory, ingest_capture_event, init_project,
+    import_agent_transcripts, import_memory, index_code, ingest_capture_event, init_project,
     list_agent_queries, list_candidates, list_capture_events, list_context, list_events,
     list_sessions, list_state, load_capture_config, log_decision, process_embedding_jobs,
     propose_candidate, propose_capture_candidates, reject_candidate, run_reflection, save_entity,
@@ -38,7 +38,7 @@ use grafiki_core::{
     DeleteEntityOptions, DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions,
     EditCandidateOptions, EmbeddingStatusOptions, EmbeddingStatusReport, EndSessionOptions,
     EventListOptions, EvidenceInput, ExportOptions, GetContextOptions, GetMemoryRecordOptions,
-    GraphOptions, HandoffOptions, ImportAgentTranscriptsOptions, ImportOptions,
+    GraphOptions, HandoffOptions, ImportAgentTranscriptsOptions, ImportOptions, IndexCodeOptions,
     IngestCaptureEventOptions, InitOptions, ListAgentQueriesOptions, ListCandidatesOptions,
     ListCaptureEventsOptions, LogDecisionOptions, ProcessEmbeddingsOptions,
     ProcessEmbeddingsReport, ProjectReportOptions, ProjectResolveOptions, ProposeCandidateOptions,
@@ -389,6 +389,29 @@ enum Command {
         /// Re-propose even if an equivalent reflection candidate already exists.
         #[arg(long)]
         force: bool,
+
+        /// Directory used for project detection.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        #[arg(long, value_enum, default_value_t = OutputFormat::Plain)]
+        format: OutputFormat,
+    },
+
+    /// Index source code structure (Rust) into the memory graph so retrieval + graph search work
+    /// over symbols. Requires a build with `--features code-index`.
+    IndexCode {
+        /// Explicit project name. Defaults to .grafiki detection, then directory name.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Scope to write the code entities/relations into.
+        #[arg(long, default_value = "code")]
+        scope: String,
+
+        /// Directory to index (defaults to --path).
+        #[arg(long)]
+        root: Option<PathBuf>,
 
         /// Directory used for project detection.
         #[arg(long, default_value = ".")]
@@ -2282,6 +2305,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                     }
+                }
+            }
+        }
+        Command::IndexCode {
+            project,
+            scope,
+            root,
+            path,
+            format,
+        } => {
+            let report = index_code(IndexCodeOptions {
+                project_name: project,
+                start_dir: path.clone(),
+                grafiki_home: None,
+                root: root.unwrap_or(path),
+                scope,
+            })?;
+            match format {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+                OutputFormat::Plain | OutputFormat::Md => {
+                    println!(
+                        "Indexed {} {} file(s): {} code entities, {} part_of relations ({} skipped).",
+                        report.files_indexed,
+                        report.language,
+                        report.entities,
+                        report.relations,
+                        report.skipped_files,
+                    );
                 }
             }
         }

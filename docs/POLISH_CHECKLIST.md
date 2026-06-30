@@ -160,9 +160,17 @@ the `relations` table).
   prioritizes across the pending pool (fetch up to a 10k cap → re-rank → truncate, not just the newest
   window). CLI `grafiki candidates list --order active-learning`. Deterministic; off-by-default
   (Recent ⇒ unchanged). Core gate `active_learning_order_and_calibrated_confidence`. **M**
-- [ ] **M-E4 — Code-structure indexing.** Tree-sitter capture pass emits code
-  entities + def-ref/call/contains relations into the existing entity/relation tables
-  (so H3 works over symbols). (RepoGraph, code property graphs.) **M**
+- [x] **M-E4 — Code-structure indexing.** **DONE (Rust v1).** `grafiki_core::code_index` parses Rust
+  with the **pure-Rust `syn`** parser (no C grammars; feature `code-index`, off by default like
+  `fastembed`) and emits a **`file`** entity + a symbol entity per definition (module/struct/enum/union/
+  trait/fn/method/type/const/static, named `src/foo.rs::Bar::baz`, `metadata.kind`) + **`part_of`**
+  containment relations into the existing entity/relation tables — so H3 PPR + lexical/dense search work
+  over **symbols**. FK-safe + idempotent **deterministic structural import** (not the candidate gate);
+  no schema migration (symbols map to `file`/`module`/`concept`). CLI `grafiki index-code` (needs a
+  `--features code-index` build). Dogfood: grafiki-core/src → ~787 entities + ~769 relations. CI gate
+  `indexes_rust_symbols_and_graph_connects_them` (counts + idempotency + graph reaches co-located
+  symbols). **Deferred → M-E4b:** cross-file `calls` edges (name resolution), tree-sitter multi-language,
+  signatures-as-observations. See `docs/CODE_INDEX_DESIGN.md`. (RepoGraph.) **M**
 - [x] **M-E5 — MCP security hardening.** **DONE.** (1) **Read/write capability split**: `grafiki mcp
   --read-only` (or `GRAFIKI_MCP_READONLY`) exposes only the ~11 retrieval tools — the ~25
   mutating/curate tools are hidden from `tools/list` AND rejected on call (`tool_is_mutating`). (2)

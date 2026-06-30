@@ -24,6 +24,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy (core + cli)
         run: cargo clippy -p grafiki-core -p grafiki-cli --all-targets -- -D warnings
+      - name: Clippy (code-index feature)
+        run: cargo clippy -p grafiki-core -p grafiki-cli --all-targets --features code-index -- -D warnings
       - uses: actions/setup-node@v4
         with:
           node-version-file: apps/grafiki-desktop/.nvmrc
@@ -58,6 +60,9 @@ jobs:
       # oracle and the deterministic keyword-retrieval + redaction regression.
       - name: Test core + cli + eval
         run: cargo test -p grafiki-core -p grafiki-cli -p grafiki-eval
+      # M-E4 code indexing is feature-gated (pure-Rust `syn`, no C/ort), so exercise its gate here.
+      - name: Test code-index feature
+        run: cargo test -p grafiki-core --features code-index code_index
       # Cache the ort (ONNX Runtime) binary the `ort` crate downloads at build time.
       - name: Cache ONNX Runtime (ort)
         if: matrix.os == 'ubuntu-latest'
