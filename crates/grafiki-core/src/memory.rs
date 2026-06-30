@@ -4111,6 +4111,17 @@ pub fn ingest_capture_event(options: IngestCaptureEventOptions) -> Result<Captur
     };
 
     let id = new_ulid();
+    // C13: honor the capture session's stored redaction profile (was inert). An
+    // unreadable/legacy value falls back to Default — never to None.
+    let redaction_profile = RedactionProfile::parse(
+        &connection
+            .query_row(
+                "SELECT redaction_profile FROM capture_sessions WHERE id = ?1",
+                [&capture_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| "default".to_owned()),
+    );
     let mut title = options.title;
     let mut text = options.text;
     let mut payload = options
@@ -4123,22 +4134,22 @@ pub fn ingest_capture_event(options: IngestCaptureEventOptions) -> Result<Captur
         .transpose()?;
     let mut redacted = options.redacted;
     if let Some(value) = title.as_mut() {
-        if redact_sensitive_text(value) {
+        if redact_text_with_profile(value, redaction_profile) {
             redacted = true;
         }
     }
     if let Some(value) = text.as_mut() {
-        if redact_sensitive_text(value) {
+        if redact_text_with_profile(value, redaction_profile) {
             redacted = true;
         }
     }
     if let Some(value) = payload.as_mut() {
-        if redact_sensitive_text(value) {
+        if redact_text_with_profile(value, redaction_profile) {
             redacted = true;
         }
     }
     if let Some(value) = metadata.as_mut() {
-        if redact_sensitive_text(value) {
+        if redact_text_with_profile(value, redaction_profile) {
             redacted = true;
         }
     }
@@ -6502,6 +6513,119 @@ fn redact_sensitive_text(text: &mut String) -> bool {
         *text = redacted;
     }
     changed
+}
+
+/// The redaction policy for a capture session (C13). Stored per `capture_session`
+/// (`redaction_profile` column) and honored by [`ingest_capture_event`] — until
+/// now it was advertised but inert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedactionProfile {
+    /// No redaction of the raw capture log. The always-on candidate gate still
+    /// redacts at promotion (`redact_json_value`), so trusted memory is unaffected.
+    None,
+    /// Standard secret redaction (assignments, private-key blocks, token prefixes).
+    Default,
+    /// `Default` plus email-address (PII) redaction — an opt-in, more aggressive
+    /// pass that accepts occasional over-redaction.
+    Strict,
+}
+
+impl RedactionProfile {
+    /// Parse a stored profile string. Unknown/empty falls back to `Default` — a
+    /// typo (or a legacy value) must never silently DISABLE redaction.
+    fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => RedactionProfile::None,
+            "strict" => RedactionProfile::Strict,
+            _ => RedactionProfile::Default,
+        }
+    }
+}
+
+/// Apply a capture profile's redaction policy to `text`, returning whether it
+/// changed. `Default` matches the legacy behavior byte-for-byte, so existing
+/// captures and the redaction eval are unaffected.
+fn redact_text_with_profile(text: &mut String, profile: RedactionProfile) -> bool {
+    match profile {
+        RedactionProfile::None => false,
+        RedactionProfile::Default => redact_sensitive_text(text),
+        RedactionProfile::Strict => {
+            let mut changed = redact_sensitive_text(text);
+            let with_emails = redact_emails(text);
+            if &with_emails != text {
+                *text = with_emails;
+                changed = true;
+            }
+            changed
+        }
+    }
+}
+
+/// Redact email addresses (the `strict` profile's PII pass). Deterministic and
+/// regex-free, mirroring the other redactors: for each `@`, expand to the maximal
+/// local/domain character runs and, if they form a well-formed `local@domain.tld`
+/// (non-empty local; dotted domain; ≥2-char alphabetic TLD), replace the span
+/// with `[REDACTED_EMAIL]`. Conservative — `@handle`, `user@`, `a@localhost`, and
+/// IP-literal domains are left alone — but, being the aggressive opt-in profile,
+/// it will over-redact lookalikes such as `image@2x.png`.
+fn redact_emails(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let is_local =
+        |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'+' | b'-');
+    let is_domain = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-');
+
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'@' {
+            let mut start = i;
+            while start > 0 && is_local(bytes[start - 1]) {
+                start -= 1;
+            }
+            let mut end = i + 1;
+            while end < bytes.len() && is_domain(bytes[end]) {
+                end += 1;
+            }
+            if start < i && is_valid_email_domain(&bytes[i + 1..end]) {
+                spans.push((start, end));
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if spans.is_empty() {
+        return input.to_owned();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0;
+    for (start, end) in spans {
+        out.push_str(&input[cursor..start]);
+        out.push_str("[REDACTED_EMAIL]");
+        cursor = end;
+    }
+    out.push_str(&input[cursor..]);
+    out
+}
+
+/// Whether a domain byte-run is a plausible email domain: contains a dot, doesn't
+/// start/end with `.`/`-`, and ends in a ≥2-char all-alphabetic TLD.
+fn is_valid_email_domain(domain: &[u8]) -> bool {
+    if domain.len() < 4 || domain[0] == b'.' || domain[0] == b'-' {
+        return false;
+    }
+    let last = *domain.last().unwrap();
+    if last == b'.' || last == b'-' {
+        return false;
+    }
+    let Ok(domain) = std::str::from_utf8(domain) else {
+        return false;
+    };
+    if !domain.contains('.') {
+        return false;
+    }
+    let tld = domain.rsplit('.').next().unwrap_or("");
+    tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_alphabetic())
 }
 
 /// Recursively redact secrets from every string value in a JSON document,
@@ -9304,21 +9428,22 @@ mod tests {
         delete_decision, delete_entity, delete_observation, delete_relation, delete_state,
         edit_candidate, end_session, export_memory, generate_report, get_context,
         get_embedding_status, get_graph, get_status, handoff_session, hybrid_search_results,
-        import_memory, list_candidates, list_context, list_decisions, list_events,
-        list_observations, list_relations, list_sessions, list_state, log_decision,
+        import_memory, ingest_capture_event, list_candidates, list_context, list_decisions,
+        list_events, list_observations, list_relations, list_sessions, list_state, log_decision,
         process_embedding_jobs, propose_candidate, reject_candidate, resolve_and_open, save_entity,
-        search_memory, update_context, update_decision, update_entity, update_observation,
-        update_relation, update_session, upsert_state, AddContextOptions, ApproveCandidateOptions,
-        AskMemoryOptions, BulkCandidateReviewOptions, CandidateOrder, ContextListOptions,
-        DecisionListOptions, DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions,
-        DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions,
-        EmbeddingStatusOptions, EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions,
-        ExtractionCandidate, GetContextOptions, GraphOptions, HandoffOptions, ImportOptions,
-        ListCandidatesOptions, LogDecisionOptions, ObservationListOptions,
-        ProcessEmbeddingsOptions, ProjectReportOptions, ProposeCandidateOptions,
-        RejectCandidateOptions, RelationListOptions, SaveEntityOptions, SearchMemoryOptions,
-        SearchMode, SearchReport, SearchResult, SessionLogOptions, StateListOptions, StatusOptions,
-        UpdateContextOptions, UpdateDecisionOptions, UpdateEntityOptions, UpdateObservationOptions,
+        search_memory, start_capture_session, update_context, update_decision, update_entity,
+        update_observation, update_relation, update_session, upsert_state, AddContextOptions,
+        ApproveCandidateOptions, AskMemoryOptions, BulkCandidateReviewOptions, CandidateOrder,
+        ContextListOptions, DecisionListOptions, DeleteContextOptions, DeleteDecisionOptions,
+        DeleteEntityOptions, DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions,
+        EditCandidateOptions, EmbeddingStatusOptions, EndSessionOptions, EventListOptions,
+        EvidenceInput, ExportOptions, ExtractionCandidate, GetContextOptions, GraphOptions,
+        HandoffOptions, ImportOptions, IngestCaptureEventOptions, ListCandidatesOptions,
+        LogDecisionOptions, ObservationListOptions, ProcessEmbeddingsOptions, ProjectReportOptions,
+        ProposeCandidateOptions, RejectCandidateOptions, RelationListOptions, SaveEntityOptions,
+        SearchMemoryOptions, SearchMode, SearchReport, SearchResult, SessionLogOptions,
+        StartCaptureOptions, StateListOptions, StatusOptions, UpdateContextOptions,
+        UpdateDecisionOptions, UpdateEntityOptions, UpdateObservationOptions,
         UpdateRelationOptions, UpdateSessionOptions, UpsertStateOptions,
     };
 
@@ -11732,6 +11857,135 @@ mod tests {
         assert!(text.contains("[REDACTED_ANTHROPIC_KEY]"));
         // Newline structure is preserved (no whitespace collapse).
         assert_eq!(text.lines().count(), 7);
+    }
+
+    // --- C13: redaction-profile (none / default / strict) ------------------
+
+    #[test]
+    fn redact_emails_is_precise() {
+        // Real addresses, including ones embedded in punctuation, are redacted.
+        assert_eq!(
+            super::redact_emails("ping alice@example.com or <bob.smith+ci@corp.io>."),
+            "ping [REDACTED_EMAIL] or <[REDACTED_EMAIL]>."
+        );
+        // Non-emails are left alone (precision).
+        for benign in [
+            "@handle",
+            "user@",
+            "a@localhost",
+            "see foo @ bar",
+            "x@1.2.3.4",
+        ] {
+            assert_eq!(
+                super::redact_emails(benign),
+                benign,
+                "must not redact non-email: {benign}"
+            );
+        }
+    }
+
+    #[test]
+    fn redaction_profile_parse_falls_back_to_default() {
+        assert_eq!(
+            super::RedactionProfile::parse("none"),
+            super::RedactionProfile::None
+        );
+        assert_eq!(
+            super::RedactionProfile::parse("STRICT"),
+            super::RedactionProfile::Strict
+        );
+        // Unknown / empty must NEVER disable redaction.
+        for raw in ["", "default", "typo", "  "] {
+            assert_eq!(
+                super::RedactionProfile::parse(raw),
+                super::RedactionProfile::Default,
+                "unknown profile {raw:?} must fall back to Default"
+            );
+        }
+    }
+
+    #[test]
+    fn redaction_profile_dispatch_layers_correctly() {
+        let secret = "api_key=AbCdEf0123456789AbCdEf0123456789";
+        let email = "contact dev@example.com";
+
+        // None: nothing is touched (raw capture log; the gate still redacts later).
+        let mut t = format!("{secret}\n{email}");
+        assert!(!super::redact_text_with_profile(
+            &mut t,
+            super::RedactionProfile::None
+        ));
+        assert!(t.contains("AbCdEf0123456789"));
+        assert!(t.contains("dev@example.com"));
+
+        // Default: secret redacted, email left (PII is opt-in only).
+        let mut t = format!("{secret}\n{email}");
+        assert!(super::redact_text_with_profile(
+            &mut t,
+            super::RedactionProfile::Default
+        ));
+        assert!(!t.contains("AbCdEf0123456789"));
+        assert!(t.contains("dev@example.com"));
+
+        // Strict: both secret AND email redacted.
+        let mut t = format!("{secret}\n{email}");
+        assert!(super::redact_text_with_profile(
+            &mut t,
+            super::RedactionProfile::Strict
+        ));
+        assert!(!t.contains("AbCdEf0123456789"));
+        assert!(!t.contains("dev@example.com"));
+        assert!(t.contains("[REDACTED_EMAIL]"));
+    }
+
+    #[test]
+    fn capture_ingest_honors_strict_profile_for_pii() {
+        let (_temp, home, project_dir) = setup_project();
+        let started = start_capture_session(StartCaptureOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            scope: "example-project".to_owned(),
+            source_app: Some("test".to_owned()),
+            consent_profile: None,
+            redaction_profile: Some("strict".to_owned()),
+        })
+        .unwrap();
+
+        let event = ingest_capture_event(IngestCaptureEventOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            capture_id: Some(started.capture.id.clone()),
+            source_type: "terminal".to_owned(),
+            source: None,
+            title: Some("ping alice@example.com".to_owned()),
+            text: Some("reach me at alice@example.com".to_owned()),
+            payload: None,
+            metadata: None,
+            scope: "example-project".to_owned(),
+            privacy_level: None,
+            captured_at: None,
+            redacted: false,
+        })
+        .unwrap();
+
+        assert!(event.event.redacted, "strict capture must flag redaction");
+        assert!(
+            !event
+                .event
+                .text
+                .as_deref()
+                .unwrap_or("")
+                .contains("alice@example.com"),
+            "strict profile must redact the email in captured text"
+        );
+        assert!(event
+            .event
+            .text
+            .as_deref()
+            .unwrap_or("")
+            .contains("[REDACTED_EMAIL]"));
     }
 
     // --- M-E6: entropy-gated + additional-prefix secret detection ----------

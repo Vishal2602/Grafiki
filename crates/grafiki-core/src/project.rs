@@ -261,7 +261,11 @@ pub fn update_capture_config(options: UpdateCaptureConfigOptions) -> Result<Capt
     remove_items(&mut config.blocked_apps, options.remove_blocked_apps);
 
     if let Some(redaction_profile) = options.redaction_profile {
-        config.redaction_profile = non_empty_config_value("redaction_profile", redaction_profile)?;
+        config.redaction_profile = validate_enum_config_value(
+            "redaction_profile",
+            redaction_profile,
+            &["none", "default", "strict"],
+        )?;
     }
     if let Some(terminal_output) = options.terminal_output {
         config.terminal_output = validate_enum_config_value(
@@ -620,8 +624,11 @@ fn write_capture_config(config_path: &Path, config: &CaptureConfig) -> Result<()
 
 fn normalize_capture_config(config: &mut CaptureConfig) -> Result<()> {
     config.version = 1;
-    config.redaction_profile =
-        non_empty_config_value("redaction_profile", config.redaction_profile.clone())?;
+    config.redaction_profile = validate_enum_config_value(
+        "redaction_profile",
+        config.redaction_profile.clone(),
+        &["none", "default", "strict"],
+    )?;
     config.terminal_output = validate_enum_config_value(
         "terminal_output",
         config.terminal_output.clone(),
@@ -679,16 +686,6 @@ fn dedupe_items(items: &mut Vec<String>) {
 fn normalize_list_item(value: String) -> Option<String> {
     let value = value.trim().trim_end_matches('/').to_owned();
     (!value.is_empty()).then_some(value)
-}
-
-fn non_empty_config_value(key: &str, value: String) -> Result<String> {
-    let value = value.trim().to_owned();
-    if value.is_empty() {
-        return Err(GrafikiError::InvalidCaptureConfig(format!(
-            "{key} cannot be empty"
-        )));
-    }
-    Ok(value)
 }
 
 fn validate_enum_config_value(key: &str, value: String, allowed: &[&str]) -> Result<String> {

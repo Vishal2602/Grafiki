@@ -54,8 +54,14 @@ Effort key: **S** ≈ <½ day · **M** ≈ ½–2 days · **L** ≈ multi-day.
 - [ ] **C12 — Embedding housekeeping.** Delete orphan `vec0` rows on record delete; prune stale
   vectors on provider/dimension switch; reuse the ONNX provider in the daemon worker instead of
   rebuilding it every 2s. `memory.rs` / `main.rs`. **S–M**
-- [ ] **C13 — `redaction_profile`.** Stored/advertised but unused — implement none/default/strict
-  or remove it from config/CLI/MCP. `memory.rs` + `project.rs`. **M**
+- [x] **C13 — `redaction_profile`.** **DONE.** Was stored/advertised but inert; now honored by
+  `ingest_capture_event`: `none` skips redaction of the raw capture log (the always-on candidate
+  gate still redacts at promotion), `default` is the standard secret redaction (byte-identical to
+  before → eval baselines unchanged), `strict` adds a deterministic, regex-free email/PII pass
+  (`redact_emails`, the opt-in version of M-E6's deferred PII item). Config-set now validates to
+  `{none,default,strict}` (`validate_enum_config_value`); an unknown/legacy stored value falls back
+  to `Default` at read time (a typo never disables redaction). `memory.rs` + `project.rs`. 4 unit
+  tests + CLI smoke. **M**
 - [ ] **C14 — Misc audit P2s.** MCP stdin size cap + protocol-version negotiation; chunked
   `Transfer-Encoding`; daemon PID-reuse race; entity `LIKE` wildcard escaping; empty/colliding
   slug ids; `add_context` can't update an existing key. **S each**
