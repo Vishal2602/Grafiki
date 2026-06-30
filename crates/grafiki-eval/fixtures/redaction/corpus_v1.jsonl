@@ -30,3 +30,5 @@
 {"text":"AIzaShort12 is just a label","gold_secrets":[],"benign":true,"context":"transcript"}
 {"text":"My secret: I really like clean code","gold_secrets":[],"benign":true,"context":"false-positive-secret-colon"}
 {"template":"Internal label {S} used in a test fixture","assemble":["AKIA","NOTAREALKEY12345"],"benign":true,"context":"false-positive-akia-prefix"}
+{"template":"rotated the value {S} today","assemble":["Zk7Qp2Lm9Rt4Xy8","Bc3Vn6Ws1Dh5Fg0Aj"],"secret_type":"high_entropy","benign":false,"context":"config"}
+{"template":"deploy {S} for outbound mail","assemble":["SG.","AbCdEfGhIjKlMnOpQrStUv"],"secret_type":"sendgrid","benign":false,"context":"config"}

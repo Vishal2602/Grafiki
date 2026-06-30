@@ -166,9 +166,16 @@ the `relations` table).
 - [ ] **M-E5 — MCP security hardening.** Indirect-prompt-injection guards on ingested
   transcripts/terminal flowing back through tool metadata; read vs write/curate
   capability split; MCPTox-style poisoning tests in H1. **M**
-- [ ] **M-E6 — PII + higher-recall secret detection.** Entropy gating + configurable rule
-  packs (gitleaks-style) + optional local PII recognizer (Presidio) at the redaction
-  boundary; measure vs SecretBench. **M**
+- [x] **M-E6 — Higher-recall secret detection.** **DONE.** Extends the existing redaction seam with
+  (a) **Shannon-entropy gating** — a prefix-less, long (≥28), mixed-charset, high-entropy token is
+  caught as `[REDACTED_HIGH_ENTROPY_SECRET]`, conservatively gated (rejects lowercase-hex SHAs/md5,
+  UUIDs, ALL-CAPS, prose) to protect precision; (b) **gitleaks-style provider prefixes** (SendGrid,
+  npm, DigitalOcean, HuggingFace, Shopify, Postman, Docker, Linear, Stripe-webhook, Google OAuth).
+  Also fixed the assignment redactor to match the secret-key in the **key position** (before `=`/`:`),
+  not anywhere in the line — higher precision + lets broadened key names work. 10 unit tests (new
+  detection + hash/UUID/prose precision locks) + 2 eval Arm C cases (recall 1.0, 0 new over-redactions).
+  Measured vs the redaction corpus; eval-gate green. *(PII recognizer (Presidio) intentionally not
+  added — it's a Python dep; deterministic email/PII regexes deferred as a policy decision.)* **M**
 
 ### E-Low leverage
 

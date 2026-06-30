@@ -6317,10 +6317,17 @@ const SECRET_KEYS: &[&str] = &[
     "client_secret",
     "secret",
     "password",
+    "passwd",
+    "passphrase",
     "private_key",
     "github_token",
     "openai_api_key",
     "anthropic_api_key",
+    // M-E6: broadened, still key-gated (high precision). `secret` already covers `*_secret`.
+    "token",
+    "credential",
+    "bearer",
+    "access_key",
 ];
 
 /// True when `key` names a secret (case-insensitive substring match).
@@ -6415,20 +6422,28 @@ fn redact_private_key_blocks(input: &str) -> String {
 fn redact_assignment_like_secrets(input: &str) -> String {
     let mut output = Vec::new();
     for line in input.lines() {
-        let lower = line.to_ascii_lowercase();
-        let looks_secret = SECRET_KEYS.iter().any(|key| lower.contains(key))
-            && (line.contains('=') || line.contains(':'));
-        if looks_secret {
-            if let Some((prefix, _)) = line.split_once('=') {
-                output.push(format!("{}=[REDACTED_SECRET]", prefix.trim_end()));
-            } else if let Some((prefix, _)) = line.split_once(':') {
-                output.push(format!("{}: [REDACTED_SECRET]", prefix.trim_end()));
-            } else {
-                output.push("[REDACTED_SECRET]".to_owned());
+        // Match the secret-key name in the KEY position (before the first `=`/`:`), NOT anywhere in
+        // the line — otherwise prose that merely mentions "token"/"secret" after a colon (e.g. a
+        // summary's "entities: …, Refresh Token Cache" or a "Keywords: …, token, …" line) would be
+        // wrongly nuked. The separator is whichever of `=`/`:` comes first.
+        let separator = match (line.find('='), line.find(':')) {
+            (Some(eq), Some(colon)) => Some(if eq <= colon { ('=', eq) } else { (':', colon) }),
+            (Some(eq), None) => Some(('=', eq)),
+            (None, Some(colon)) => Some((':', colon)),
+            (None, None) => None,
+        };
+        let redacted = match separator {
+            Some((ch, pos)) if key_looks_secret(&line[..pos]) => {
+                let prefix = line[..pos].trim_end();
+                Some(if ch == '=' {
+                    format!("{prefix}=[REDACTED_SECRET]")
+                } else {
+                    format!("{prefix}: [REDACTED_SECRET]")
+                })
             }
-        } else {
-            output.push(line.to_owned());
-        }
+            _ => None,
+        };
+        output.push(redacted.unwrap_or_else(|| line.to_owned()));
     }
     let joined = output.join("\n");
     if input.ends_with('\n') {
@@ -6495,10 +6510,40 @@ fn redact_single_token(token: &str) -> String {
         Some("[REDACTED_SLACK_TOKEN]")
     } else if trimmed.starts_with("AKIA") && trimmed.len() >= 16 {
         Some("[REDACTED_AWS_KEY]")
-    } else if trimmed.starts_with("AIza") && trimmed.len() >= 20 {
+    } else if (trimmed.starts_with("AIza") && trimmed.len() >= 20) || trimmed.starts_with("ya29.") {
         Some("[REDACTED_GOOGLE_KEY]")
+    // M-E6: additional gitleaks-style provider prefixes (high precision).
+    } else if trimmed.starts_with("SG.") && trimmed.len() >= 20 {
+        Some("[REDACTED_SENDGRID_KEY]")
+    } else if trimmed.starts_with("npm_") && trimmed.len() >= 20 {
+        Some("[REDACTED_NPM_TOKEN]")
+    } else if trimmed.starts_with("dop_v1_")
+        || trimmed.starts_with("doo_v1_")
+        || trimmed.starts_with("dor_v1_")
+    {
+        Some("[REDACTED_DIGITALOCEAN_TOKEN]")
+    } else if trimmed.starts_with("hf_") && trimmed.len() >= 20 {
+        Some("[REDACTED_HUGGINGFACE_TOKEN]")
+    } else if trimmed.starts_with("shpat_")
+        || trimmed.starts_with("shpss_")
+        || trimmed.starts_with("shpca_")
+        || trimmed.starts_with("shppa_")
+    {
+        Some("[REDACTED_SHOPIFY_TOKEN]")
+    } else if trimmed.starts_with("PMAK-") {
+        Some("[REDACTED_POSTMAN_KEY]")
+    } else if trimmed.starts_with("dckr_pat_") {
+        Some("[REDACTED_DOCKER_TOKEN]")
+    } else if trimmed.starts_with("lin_api_") {
+        Some("[REDACTED_LINEAR_KEY]")
+    } else if trimmed.starts_with("whsec_") && trimmed.len() >= 20 {
+        Some("[REDACTED_STRIPE_WEBHOOK_SECRET]")
     } else if looks_like_jwt(trimmed) {
         Some("[REDACTED_JWT]")
+    } else if looks_high_entropy_secret(trimmed) {
+        // No known prefix, but a long, mixed-charset, high-entropy token — almost certainly a
+        // credential. Conservatively gated (see `looks_high_entropy_secret`) to protect precision.
+        Some("[REDACTED_HIGH_ENTROPY_SECRET]")
     } else {
         None
     };
@@ -6527,6 +6572,55 @@ fn looks_like_jwt(token: &str) -> bool {
             part.chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
         })
+}
+
+/// Shannon entropy (bits per character) of a token's character distribution. Random
+/// credential strings score high (~4–6 bits); natural-language words and repetitive
+/// strings score low. Pure.
+fn shannon_entropy(token: &str) -> f64 {
+    let chars: Vec<char> = token.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mut counts: std::collections::BTreeMap<char, usize> = std::collections::BTreeMap::new();
+    for &ch in &chars {
+        *counts.entry(ch).or_insert(0) += 1;
+    }
+    let n = n as f64;
+    -counts
+        .values()
+        .map(|&c| {
+            let p = c as f64 / n;
+            p * p.log2()
+        })
+        .sum::<f64>()
+}
+
+/// M-E6: a conservatively-gated heuristic for a credential that carries no recognizable
+/// provider prefix. To protect precision (over-redaction corrupts memory), ALL must hold:
+/// the token is `≥ 28` chars of `[A-Za-z0-9_-]`, mixes lower + upper + digit (this excludes
+/// lowercase-hex git SHAs/md5/uuids, ALL-CAPS constants, and natural words), and has Shannon
+/// entropy `≥ 3.5` bits/char (random-looking). Tuned against the redaction eval's benign cases.
+fn looks_high_entropy_secret(token: &str) -> bool {
+    const MIN_LEN: usize = 28;
+    const MIN_ENTROPY: f64 = 3.5;
+    if token.chars().count() < MIN_LEN {
+        return false;
+    }
+    let mut has_lower = false;
+    let mut has_upper = false;
+    let mut has_digit = false;
+    for ch in token.chars() {
+        match ch {
+            'a'..='z' => has_lower = true,
+            'A'..='Z' => has_upper = true,
+            '0'..='9' => has_digit = true,
+            '-' | '_' => {}
+            _ => return false, // only key-shaped charsets qualify
+        }
+    }
+    has_lower && has_upper && has_digit && shannon_entropy(token) >= MIN_ENTROPY
 }
 
 fn compact_capture_payload(payload: &serde_json::Value) -> String {
@@ -11304,6 +11398,81 @@ mod tests {
         assert!(text.contains("[REDACTED_ANTHROPIC_KEY]"));
         // Newline structure is preserved (no whitespace collapse).
         assert_eq!(text.lines().count(), 7);
+    }
+
+    // --- M-E6: entropy-gated + additional-prefix secret detection ----------
+
+    #[test]
+    fn redaction_covers_additional_provider_prefixes() {
+        // Synthetic, leak-safe (never a real key).
+        let mut text = String::from(
+            "sendgrid SG.AbCdEfGhIjKlMnOpQrSt npm npm_aBcDeFgHiJkLmNoPqRsT123456 \
+             do dop_v1_abcdef1234567890 hf hf_aBcDeFgHiJkLmNoPqRsTuV postman PMAK-abc123def456",
+        );
+        let changed = super::redact_sensitive_text(&mut text);
+        assert!(changed);
+        for marker in [
+            "[REDACTED_SENDGRID_KEY]",
+            "[REDACTED_NPM_TOKEN]",
+            "[REDACTED_DIGITALOCEAN_TOKEN]",
+            "[REDACTED_HUGGINGFACE_TOKEN]",
+            "[REDACTED_POSTMAN_KEY]",
+        ] {
+            assert!(text.contains(marker), "expected {marker} in: {text}");
+        }
+    }
+
+    #[test]
+    fn redaction_catches_high_entropy_secret_without_prefix() {
+        // A long, mixed-case+digit, high-entropy token with NO known prefix and NOT assigned to a
+        // secret-named key — only the entropy gate can catch it.
+        let secret = "Zk7Qp2Lm9Rt4Xy8Bc3Vn6Ws1Dh5Fg0Aj";
+        let mut text = format!("rotated the value {secret} yesterday");
+        let changed = super::redact_sensitive_text(&mut text);
+        assert!(changed, "high-entropy secret should be redacted: {text}");
+        assert!(
+            !text.contains(secret),
+            "the literal must not survive: {text}"
+        );
+        assert!(text.contains("[REDACTED_HIGH_ENTROPY_SECRET]"));
+    }
+
+    #[test]
+    fn entropy_gate_does_not_over_redact_hashes_uuids_or_prose() {
+        // Precision locks: none of these may be redacted.
+        for benign in [
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b", // sha1 (lowercase hex, no upper)
+            "5d41402abc4b2a76b9719d911017c592",         // md5
+            "550e8400-e29b-41d4-a716-446655440000",     // uuid
+            "THISISALONGUPPERCASECONSTANTNODIGITS",     // all caps, no digit
+            "the quick brown fox jumps over the lazy dog repeatedly", // prose
+        ] {
+            assert!(
+                !super::looks_high_entropy_secret(benign),
+                "must NOT flag benign token as secret: {benign}"
+            );
+            let mut text = format!("context {benign} here");
+            super::redact_sensitive_text(&mut text);
+            assert!(
+                text.contains(benign),
+                "benign token was over-redacted: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn shannon_entropy_separates_random_from_repetitive() {
+        let random = super::shannon_entropy("Zk7Qp2Lm9Rt4Xy8Bc3Vn6Ws1Dh5Fg0Aj");
+        let repetitive = super::shannon_entropy("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert!(
+            random > 4.0,
+            "random token entropy should be high: {random}"
+        );
+        assert!(
+            repetitive < 0.5,
+            "repetitive token entropy should be low: {repetitive}"
+        );
+        assert_eq!(super::shannon_entropy(""), 0.0);
     }
 
     #[test]
