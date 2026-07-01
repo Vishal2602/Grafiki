@@ -51,9 +51,12 @@ Effort key: **S** ≈ <½ day · **M** ≈ ½–2 days · **L** ≈ multi-day.
 
 - [x] **C11 — HTTP token hygiene.** Daemon passes `--token` via argv (visible in `ps`) and accepts
   `?token=`; move to env/stdin and drop the query param. `main.rs`. **S**
-- [ ] **C12 — Embedding housekeeping.** Delete orphan `vec0` rows on record delete; prune stale
-  vectors on provider/dimension switch; reuse the ONNX provider in the daemon worker instead of
-  rebuilding it every 2s. `memory.rs` / `main.rs`. **S–M**
+- [~] **C12 — Embedding housekeeping.** ~~Reuse the ONNX provider in the daemon worker instead of
+  rebuilding it every 2s~~ (**DONE**: `spawn_embedding_worker` now gates on a cheap
+  `pending_embedding_count` COUNT and only builds the provider — which loads the ONNX model — when
+  there's actually work, so an *idle* daemon no longer reloads the model every poll; test
+  `pending_embedding_count_reflects_the_queue`). Still open: delete orphan `vec0` rows on record
+  delete; prune stale vectors on provider/dimension switch. `memory.rs` / `main.rs`. **S–M**
 - [x] **C13 — `redaction_profile`.** **DONE.** Was stored/advertised but inert; now honored by
   `ingest_capture_event`: `none` skips redaction of the raw capture log (the always-on candidate
   gate still redacts at promotion), `default` is the standard secret redaction (byte-identical to

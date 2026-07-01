@@ -2913,6 +2913,24 @@ fn embedding_vector_backend_label() -> &'static str {
     }
 }
 
+/// Cheap "is there embedding work to do?" check — counts pending jobs WITHOUT
+/// constructing the (expensive) embedding provider. The daemon worker gates on
+/// this so an idle daemon does not reload the ONNX model every poll (C12): loading
+/// the model is only worth it when there is actually a job to run.
+pub fn pending_embedding_count(
+    project_name: Option<String>,
+    start_dir: PathBuf,
+    grafiki_home: Option<PathBuf>,
+) -> Result<usize> {
+    let (_project, connection) = resolve_and_open(project_name, start_dir, grafiki_home)?;
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM embedding_jobs WHERE status = 'pending'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count.max(0) as usize)
+}
+
 pub fn process_embedding_jobs(
     options: ProcessEmbeddingsOptions,
 ) -> Result<ProcessEmbeddingsReport> {
@@ -9480,21 +9498,22 @@ mod tests {
         get_embedding_status, get_graph, get_status, handoff_session, hybrid_search_results,
         import_memory, ingest_capture_event, list_candidates, list_context, list_decisions,
         list_events, list_observations, list_relations, list_sessions, list_state, log_decision,
-        process_embedding_jobs, propose_candidate, reject_candidate, resolve_and_open, save_entity,
-        search_memory, start_capture_session, update_context, update_decision, update_entity,
-        update_observation, update_relation, update_session, upsert_state, AddContextOptions,
-        ApproveCandidateOptions, AskMemoryOptions, BulkCandidateReviewOptions, CandidateOrder,
-        ContextListOptions, DecisionListOptions, DeleteContextOptions, DeleteDecisionOptions,
-        DeleteEntityOptions, DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions,
-        EditCandidateOptions, EmbeddingStatusOptions, EndSessionOptions, EventListOptions,
-        EvidenceInput, ExportOptions, ExtractionCandidate, GetContextOptions, GraphOptions,
-        HandoffOptions, ImportOptions, IngestCaptureEventOptions, ListCandidatesOptions,
-        LogDecisionOptions, ObservationListOptions, ProcessEmbeddingsOptions, ProjectReportOptions,
-        ProposeCandidateOptions, RejectCandidateOptions, RelationListOptions, SaveEntityOptions,
-        SearchMemoryOptions, SearchMode, SearchReport, SearchResult, SessionLogOptions,
-        StartCaptureOptions, StateListOptions, StatusOptions, UpdateContextOptions,
-        UpdateDecisionOptions, UpdateEntityOptions, UpdateObservationOptions,
-        UpdateRelationOptions, UpdateSessionOptions, UpsertStateOptions,
+        pending_embedding_count, process_embedding_jobs, propose_candidate, reject_candidate,
+        resolve_and_open, save_entity, search_memory, start_capture_session, update_context,
+        update_decision, update_entity, update_observation, update_relation, update_session,
+        upsert_state, AddContextOptions, ApproveCandidateOptions, AskMemoryOptions,
+        BulkCandidateReviewOptions, CandidateOrder, ContextListOptions, DecisionListOptions,
+        DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions, DeleteObservationOptions,
+        DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions, EmbeddingStatusOptions,
+        EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions, ExtractionCandidate,
+        GetContextOptions, GraphOptions, HandoffOptions, ImportOptions, IngestCaptureEventOptions,
+        ListCandidatesOptions, LogDecisionOptions, ObservationListOptions,
+        ProcessEmbeddingsOptions, ProjectReportOptions, ProposeCandidateOptions,
+        RejectCandidateOptions, RelationListOptions, SaveEntityOptions, SearchMemoryOptions,
+        SearchMode, SearchReport, SearchResult, SessionLogOptions, StartCaptureOptions,
+        StateListOptions, StatusOptions, UpdateContextOptions, UpdateDecisionOptions,
+        UpdateEntityOptions, UpdateObservationOptions, UpdateRelationOptions, UpdateSessionOptions,
+        UpsertStateOptions,
     };
 
     fn setup_project() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -12287,6 +12306,36 @@ mod tests {
             "rationale secret must be redacted before persistence"
         );
         assert!(dump.contains("REDACTED"));
+    }
+
+    #[test]
+    fn pending_embedding_count_reflects_the_queue() {
+        let (_temp, home, project_dir) = setup_project();
+
+        // Fresh project: nothing queued, so the daemon worker will skip (no model
+        // load) rather than spin up the embedding provider every poll.
+        assert_eq!(
+            pending_embedding_count(None, project_dir.clone(), Some(home.clone())).unwrap(),
+            0
+        );
+
+        // Saving a record enqueues an embedding job → there is now work to do.
+        save_entity(SaveEntityOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            name: "Auth Service".to_owned(),
+            entity_type: "service".to_owned(),
+            observe: Some("JWT refresh uses rotating tokens".to_owned()),
+            category: "architecture".to_owned(),
+            scope: "example-project/core".to_owned(),
+            relate: None,
+        })
+        .unwrap();
+        assert!(
+            pending_embedding_count(None, project_dir, Some(home)).unwrap() > 0,
+            "saving a record must enqueue embedding work the worker will pick up"
+        );
     }
 
     #[test]

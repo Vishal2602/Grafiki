@@ -25,12 +25,12 @@ use grafiki_core::{
     get_embedding_status, get_graph, get_memory_record_detail, get_status, handoff_session,
     import_agent_transcripts, import_memory, index_code, ingest_capture_event, init_project,
     list_agent_queries, list_candidates, list_capture_events, list_context, list_events,
-    list_sessions, list_state, load_capture_config, log_decision, process_embedding_jobs,
-    propose_candidate, propose_capture_candidates, reject_candidate, run_reflection, save_entity,
-    search_memory, start_capture_session, start_session, stop_capture_session,
-    update_capture_config, update_context, update_decision, update_entity, update_observation,
-    update_relation, update_session, upsert_state, AddContextOptions, AgentMemoryBriefing,
-    AgentTranscriptImportReport, ApproveCandidateOptions, AskMemoryOptions,
+    list_sessions, list_state, load_capture_config, log_decision, pending_embedding_count,
+    process_embedding_jobs, propose_candidate, propose_capture_candidates, reject_candidate,
+    run_reflection, save_entity, search_memory, start_capture_session, start_session,
+    stop_capture_session, update_capture_config, update_context, update_decision, update_entity,
+    update_observation, update_relation, update_session, upsert_state, AddContextOptions,
+    AgentMemoryBriefing, AgentTranscriptImportReport, ApproveCandidateOptions, AskMemoryOptions,
     BulkCandidateReviewOptions, BulkCandidateReviewReport, CandidateMutationReport, CandidateOrder,
     CaptureCandidateReport, CaptureConfigOptions, CaptureConfigReport, CaptureEvent,
     CaptureEventReport, CaptureSessionReport, CaptureSourceUpdates, CaptureStatusOptions,
@@ -6196,15 +6196,24 @@ fn serve_http(
 fn spawn_embedding_worker(project: Option<String>, path: PathBuf) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(2));
-        if let Err(error) = process_embedding_jobs(ProcessEmbeddingsOptions {
-            project_name: project.clone(),
-            start_dir: path.clone(),
-            grafiki_home: None,
-            scope: "*".to_owned(),
-            limit: 100,
-            rebuild: false,
-        }) {
-            eprintln!("Embedding worker skipped batch: {error}");
+        // C12: gate on a cheap pending-jobs COUNT before doing anything. Building
+        // the embedding provider loads the ONNX model, so an idle daemon (the
+        // common case) must NOT pay that cost every poll — only when there is work.
+        match pending_embedding_count(project.clone(), path.clone(), None) {
+            Ok(0) => continue,
+            Ok(_) => {
+                if let Err(error) = process_embedding_jobs(ProcessEmbeddingsOptions {
+                    project_name: project.clone(),
+                    start_dir: path.clone(),
+                    grafiki_home: None,
+                    scope: "*".to_owned(),
+                    limit: 100,
+                    rebuild: false,
+                }) {
+                    eprintln!("Embedding worker skipped batch: {error}");
+                }
+            }
+            Err(error) => eprintln!("Embedding worker skipped batch: {error}"),
         }
     });
 }
