@@ -610,21 +610,56 @@ function MemoryPane(props: {
   );
 }
 
+type TerminalSessionRef = { id: string; launch: string };
+
+function terminalStorageKey(projectRoot: string) {
+  return `grafiki-terminal:${projectRoot}`;
+}
+
+function loadTerminalSession(projectRoot: string): TerminalSessionRef | null {
+  try {
+    const raw = localStorage.getItem(terminalStorageKey(projectRoot));
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as TerminalSessionRef;
+    return typeof parsed?.id === "string" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 function TerminalPane(props: { projectRoot: string }) {
-  // null = show the launcher; "" = plain shell; "claude"/"codex"/... = run that agent.
-  const [launch, setLaunch] = useState<string | null>(null);
+  // The session id is STABLE and persisted per project: switching tabs detaches
+  // the UI but the PTY (and the agent inside it) keeps running; coming back
+  // reattaches and replays scrollback. Only "End session" kills the process.
+  const [session, setSession] = useState<TerminalSessionRef | null>(() =>
+    loadTerminalSession(props.projectRoot),
+  );
   const [error, setError] = useState<string | null>(null);
+  const [ended, setEnded] = useState(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  // Set when the launcher just created `session`, so the effect spawns instead
+  // of attaching. A ref (not state): StrictMode remounts must attach, not respawn.
+  const spawnRef = useRef(false);
 
   useEffect(() => {
-    if (launch === null || !containerRef.current) {
+    setSession(loadTerminalSession(props.projectRoot));
+    setError(null);
+    setEnded(false);
+  }, [props.projectRoot]);
+
+  useEffect(() => {
+    if (!session || !containerRef.current) {
       return;
     }
-    const id = `term-${Math.random().toString(36).slice(2, 10)}`;
+    const id = session.id;
+    const launch = session.launch;
     const term = new XTerm({
       fontFamily: '"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace',
       fontSize: 13,
       cursorBlink: true,
+      scrollback: 5000,
       theme: { background: "#16181c", foreground: "#e8e6e0", cursor: "#ff7a33" },
     });
     const fit = new FitAddon();
@@ -635,26 +670,6 @@ function TerminalPane(props: { projectRoot: string }) {
     const channel = new Channel<number[]>();
     channel.onmessage = (bytes) => term.write(new Uint8Array(bytes));
 
-    // Always spawn the login shell (full PATH); if an agent was chosen, type it in.
-    invoke("terminal_open", {
-      id,
-      cwd: props.projectRoot,
-      command: "",
-      rows: term.rows,
-      cols: term.cols,
-      onOutput: channel,
-    }).catch((openError) => setError(String(openError)));
-
-    let launchTimer: number | undefined;
-    if (launch) {
-      launchTimer = window.setTimeout(() => {
-        void invoke("terminal_write", { id, data: `${launch}\r` });
-      }, 700);
-    }
-
-    const onData = term.onData((data) => {
-      void invoke("terminal_write", { id, data });
-    });
     const resize = () => {
       try {
         fit.fit();
@@ -663,22 +678,114 @@ function TerminalPane(props: { projectRoot: string }) {
       }
       void invoke("terminal_resize", { id, rows: term.rows, cols: term.cols });
     };
+
+    let launchTimer: number | undefined;
+    // Type the chosen agent into the fresh shell exactly once per session
+    // (sessionStorage guard survives StrictMode's dev double-mount).
+    const launchGuard = `grafiki-terminal-launched:${id}`;
+    const scheduleLaunch = () => {
+      if (!launch || sessionStorage.getItem(launchGuard)) {
+        return;
+      }
+      launchTimer = window.setTimeout(() => {
+        if (!sessionStorage.getItem(launchGuard)) {
+          sessionStorage.setItem(launchGuard, "1");
+          void invoke("terminal_write", { id, data: `${launch}\r` });
+        }
+      }, 700);
+    };
+
+    let cancelled = false;
+    const connect = async () => {
+      try {
+        if (spawnRef.current) {
+          spawnRef.current = false;
+          // Spawn the login shell (full PATH); the agent is typed in after.
+          await invoke("terminal_open", {
+            id,
+            cwd: props.projectRoot,
+            command: "",
+            rows: term.rows,
+            cols: term.cols,
+            onOutput: channel,
+          });
+          if (!cancelled) {
+            scheduleLaunch();
+          }
+          return;
+        }
+        const reply = await invoke<{ found: boolean; exited: boolean; cwd: string }>(
+          "terminal_attach",
+          { id, onOutput: channel },
+        );
+        if (cancelled) {
+          return;
+        }
+        if (!reply.found) {
+          // The app was relaunched and the PTY is gone: back to the launcher.
+          localStorage.removeItem(terminalStorageKey(props.projectRoot));
+          sessionStorage.removeItem(launchGuard);
+          setSession(null);
+          return;
+        }
+        if (reply.exited) {
+          setEnded(true);
+          return;
+        }
+        // Reattached to a live session: sync the PTY to the new pane size and
+        // finish the launch typing if a dev remount interrupted it.
+        resize();
+        scheduleLaunch();
+      } catch (connectError) {
+        if (!cancelled) {
+          setError(String(connectError));
+        }
+      }
+    };
+    void connect();
+
+    const onData = term.onData((data) => {
+      void invoke("terminal_write", { id, data });
+    });
     const observer = new ResizeObserver(resize);
     observer.observe(containerRef.current);
     term.focus();
 
     return () => {
+      cancelled = true;
       if (launchTimer) {
         window.clearTimeout(launchTimer);
       }
       observer.disconnect();
       onData.dispose();
-      void invoke("terminal_close", { id });
+      // Detach ONLY — the session (and the agent) keeps running in the pool.
+      void invoke("terminal_detach", { id });
       term.dispose();
     };
-  }, [launch, props.projectRoot]);
+  }, [session, props.projectRoot]);
 
-  if (launch === null) {
+  const endSession = () => {
+    if (session) {
+      void invoke("terminal_close", { id: session.id });
+      localStorage.removeItem(terminalStorageKey(props.projectRoot));
+      sessionStorage.removeItem(`grafiki-terminal-launched:${session.id}`);
+    }
+    setSession(null);
+    setEnded(false);
+    setError(null);
+  };
+
+  const startSession = (cmd: string) => {
+    const id = `term-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+    const next = { id, launch: cmd };
+    localStorage.setItem(terminalStorageKey(props.projectRoot), JSON.stringify(next));
+    spawnRef.current = true;
+    setEnded(false);
+    setError(null);
+    setSession(next);
+  };
+
+  if (session === null) {
     const options = [
       { label: "Claude Code", cmd: "claude" },
       { label: "Codex", cmd: "codex" },
@@ -699,7 +806,7 @@ function TerminalPane(props: { projectRoot: string }) {
         </div>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           {options.map((option) => (
-            <button key={option.label} onClick={() => setLaunch(option.cmd)} style={{ padding: "9px 18px" }}>
+            <button key={option.label} onClick={() => startSession(option.cmd)} style={{ padding: "9px 18px" }}>
               {option.label}
             </button>
           ))}
@@ -712,11 +819,12 @@ function TerminalPane(props: { projectRoot: string }) {
     <div className="view-stack" style={{ display: "flex", flexDirection: "column", height: "100%", gap: 8 }}>
       <div className="toolbar-row" style={{ alignItems: "center", gap: 10 }}>
         <span className="muted" style={{ fontSize: 12 }}>
-          {launch ? `Running: ${launch}` : "Shell"} · {props.projectRoot || "this project"} ·
-          capturing
+          {session.launch ? `Running: ${session.launch}` : "Shell"} ·{" "}
+          {props.projectRoot || "this project"} · capturing
+          {ended ? " · session ended" : ""}
         </span>
-        <button style={{ marginLeft: "auto", padding: "4px 10px" }} onClick={() => setLaunch(null)}>
-          New session
+        <button style={{ marginLeft: "auto", padding: "4px 10px" }} onClick={endSession}>
+          {ended ? "New session" : "End session"}
         </button>
       </div>
       {error ? <p style={{ color: "var(--danger, #ff6b6b)" }}>{error}</p> : null}

@@ -3,6 +3,12 @@
 //! own the PTY we see every byte and know the folder — so a session run inside
 //! Grafiki (e.g. `claude`) is captured automatically, no daemon or transcript
 //! discovery. Captured output → `capture_events` → the usual extraction/review.
+//!
+//! Sessions are DETACHED, not owned by the UI: the PTY keeps running (and keeps
+//! being captured) when the pane unmounts — switching tabs must never kill the
+//! agent. The UI attaches/detaches an output channel; on reattach the scrollback
+//! buffer is replayed so the terminal picks up where it left off. Only an explicit
+//! `terminal_close` (or child exit) ends a session.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -17,6 +23,38 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tauri::ipc::Channel;
 use tauri::State;
 
+/// Cap on the replayable scrollback kept per session (raw bytes incl. ANSI).
+const SCROLLBACK_MAX: usize = 512 * 1024;
+/// Capture is flushed to `capture_events` whenever this much output accumulates.
+const CAPTURE_FLUSH_THRESHOLD: usize = 64 * 1024;
+
+/// State shared between the reader thread and the Tauri commands. One mutex
+/// guards scrollback + the attached channel so replay-then-attach is atomic
+/// (no byte can slip between the replayed snapshot and the live stream).
+struct TermShared {
+    scrollback: Vec<u8>,
+    channel: Option<Channel<Vec<u8>>>,
+    capture: Vec<u8>,
+    exited: bool,
+}
+
+impl TermShared {
+    /// Append output, trimming the front of the scrollback (to a newline
+    /// boundary, so a replay doesn't start mid escape sequence) once over cap.
+    fn push_scrollback(&mut self, bytes: &[u8]) {
+        self.scrollback.extend_from_slice(bytes);
+        if self.scrollback.len() > SCROLLBACK_MAX {
+            let overflow = self.scrollback.len() - SCROLLBACK_MAX;
+            let cut = self.scrollback[overflow..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|pos| overflow + pos + 1)
+                .unwrap_or(overflow);
+            self.scrollback.drain(..cut);
+        }
+    }
+}
+
 /// A live hosted terminal session.
 struct TerminalSession {
     writer: Box<dyn Write + Send>,
@@ -25,13 +63,20 @@ struct TerminalSession {
     /// Grafiki capture session id (`None` when the folder isn't a Grafiki project).
     capture_id: Option<String>,
     project_root: String,
-    /// Output accumulated for capture (flushed on threshold + on close).
-    buffer: Arc<Mutex<Vec<u8>>>,
+    shared: Arc<Mutex<TermShared>>,
 }
 
 /// Tauri managed state: all live terminal sessions by id.
 #[derive(Default)]
 pub struct TerminalRegistry(Mutex<HashMap<String, TerminalSession>>);
+
+/// What `terminal_attach` tells the UI about a session it asked for.
+#[derive(serde::Serialize)]
+pub struct AttachReply {
+    pub found: bool,
+    pub exited: bool,
+    pub cwd: String,
+}
 
 fn pty_size(rows: u16, cols: u16) -> PtySize {
     PtySize {
@@ -42,8 +87,22 @@ fn pty_size(rows: u16, cols: u16) -> PtySize {
     }
 }
 
+/// Replay the scrollback through `channel` and install it as the live output
+/// sink, atomically with respect to the reader thread.
+fn attach_channel(shared: &Arc<Mutex<TermShared>>, channel: Channel<Vec<u8>>) -> bool {
+    let mut state = shared.lock().unwrap();
+    if !state.scrollback.is_empty() && channel.send(state.scrollback.clone()).is_err() {
+        return false;
+    }
+    let exited = state.exited;
+    state.channel = Some(channel);
+    !exited
+}
+
 /// Open a hosted terminal: spawn `command` in `cwd` inside a PTY, stream its bytes
 /// to `on_output`, and capture the session into `cwd`'s Grafiki project (if any).
+/// If a LIVE session with this id already exists, reattach to it instead (open is
+/// idempotent — a double mount must never spawn or kill anything).
 #[tauri::command]
 pub fn terminal_open(
     registry: State<TerminalRegistry>,
@@ -54,6 +113,22 @@ pub fn terminal_open(
     cols: u16,
     on_output: Channel<Vec<u8>>,
 ) -> Result<String, String> {
+    {
+        let mut sessions = registry.0.lock().unwrap();
+        if let Some(existing) = sessions.get(&id) {
+            if !existing.shared.lock().unwrap().exited {
+                attach_channel(&existing.shared, on_output);
+                return Ok(id);
+            }
+            // Exited leftover under this id: drop it and spawn fresh below.
+            let stale = sessions.remove(&id);
+            drop(sessions);
+            if let Some(stale) = stale {
+                finish_session(stale);
+            }
+        }
+    }
+
     let pair = native_pty_system()
         .openpty(pty_size(rows, cols))
         .map_err(|error| error.to_string())?;
@@ -97,11 +172,18 @@ pub fn terminal_open(
     .ok()
     .map(|report| report.capture.id);
 
-    let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let shared = Arc::new(Mutex::new(TermShared {
+        scrollback: Vec::new(),
+        channel: Some(on_output),
+        capture: Vec::new(),
+        exited: false,
+    }));
 
-    // Reader thread: stream output to the UI and tee it into the capture buffer.
+    // Reader thread: drain the PTY for the session's whole life — buffering
+    // scrollback + teeing capture even while no UI is attached. A send failure
+    // only detaches the channel; it never stops the session.
     {
-        let buffer = buffer.clone();
+        let shared = shared.clone();
         let capture_id = capture_id.clone();
         let project_root = cwd.clone();
         std::thread::spawn(move || {
@@ -111,25 +193,51 @@ pub fn terminal_open(
                     Ok(0) | Err(_) => break, // child exited or the pty closed
                     Ok(n) => {
                         let bytes = &chunk[..n];
-                        if on_output.send(bytes.to_vec()).is_err() {
-                            break; // UI went away
-                        }
-                        if capture_id.is_some() {
-                            let flush = {
-                                let mut buffered = buffer.lock().unwrap();
-                                buffered.extend_from_slice(bytes);
-                                if buffered.len() > 64 * 1024 {
-                                    Some(std::mem::take(&mut *buffered))
+                        let flush = {
+                            let mut state = shared.lock().unwrap();
+                            state.push_scrollback(bytes);
+                            if let Some(channel) = &state.channel {
+                                if channel.send(bytes.to_vec()).is_err() {
+                                    state.channel = None; // UI went away; keep draining
+                                }
+                            }
+                            if capture_id.is_some() {
+                                state.capture.extend_from_slice(bytes);
+                                if state.capture.len() > CAPTURE_FLUSH_THRESHOLD {
+                                    Some(std::mem::take(&mut state.capture))
                                 } else {
                                     None
                                 }
-                            };
-                            if let Some(raw) = flush {
-                                flush_capture(&project_root, &capture_id, raw);
+                            } else {
+                                None
                             }
+                        };
+                        if let Some(raw) = flush {
+                            flush_capture(&project_root, &capture_id, raw);
                         }
                     }
                 }
+            }
+            // Session over: mark exited, tell any attached UI, flush the tail of
+            // the capture and close the capture session.
+            let remainder = {
+                let mut state = shared.lock().unwrap();
+                state.exited = true;
+                let marker = b"\r\n\x1b[2m[session ended]\x1b[0m\r\n";
+                state.push_scrollback(marker);
+                if let Some(channel) = &state.channel {
+                    let _ = channel.send(marker.to_vec());
+                }
+                std::mem::take(&mut state.capture)
+            };
+            if let Some(capture) = capture_id {
+                flush_capture(&project_root, &Some(capture.clone()), remainder);
+                let _ = stop_capture_session(StopCaptureOptions {
+                    project_name: None,
+                    start_dir: PathBuf::from(&project_root),
+                    grafiki_home: None,
+                    capture_id: capture,
+                });
             }
         });
     }
@@ -142,10 +250,48 @@ pub fn terminal_open(
             child,
             capture_id,
             project_root: cwd,
-            buffer,
+            shared,
         },
     );
     Ok(id)
+}
+
+/// Reattach the UI to an existing session: replay its scrollback through
+/// `on_output`, then stream live bytes. `found: false` means no such session
+/// (the caller can revive or start fresh).
+#[tauri::command]
+pub fn terminal_attach(
+    registry: State<TerminalRegistry>,
+    id: String,
+    on_output: Channel<Vec<u8>>,
+) -> Result<AttachReply, String> {
+    let sessions = registry.0.lock().unwrap();
+    match sessions.get(&id) {
+        Some(session) => {
+            let alive = attach_channel(&session.shared, on_output);
+            Ok(AttachReply {
+                found: true,
+                exited: !alive,
+                cwd: session.project_root.clone(),
+            })
+        }
+        None => Ok(AttachReply {
+            found: false,
+            exited: false,
+            cwd: String::new(),
+        }),
+    }
+}
+
+/// Detach the UI from a session WITHOUT stopping it: the PTY keeps running and
+/// being captured in the background. Called when the pane unmounts (tab switch).
+#[tauri::command]
+pub fn terminal_detach(registry: State<TerminalRegistry>, id: String) -> Result<(), String> {
+    let sessions = registry.0.lock().unwrap();
+    if let Some(session) = sessions.get(&id) {
+        session.shared.lock().unwrap().channel = None;
+    }
+    Ok(())
 }
 
 /// Send keystrokes (or paste) to the hosted shell.
@@ -184,25 +330,33 @@ pub fn terminal_resize(
     Ok(())
 }
 
-/// Close the terminal: kill the child, flush the remaining output to capture, and
-/// stop the capture session.
+/// EXPLICITLY end a session: kill the child, flush the remaining output to
+/// capture, and stop the capture session. This is a user action ("End session"),
+/// never a side effect of navigation.
 #[tauri::command]
 pub fn terminal_close(registry: State<TerminalRegistry>, id: String) -> Result<(), String> {
     let session = registry.0.lock().unwrap().remove(&id);
-    if let Some(mut session) = session {
-        let _ = session.child.kill();
-        let raw = std::mem::take(&mut *session.buffer.lock().unwrap());
-        if let Some(capture_id) = session.capture_id.clone() {
-            flush_capture(&session.project_root, &session.capture_id, raw);
-            let _ = stop_capture_session(StopCaptureOptions {
-                project_name: None,
-                start_dir: PathBuf::from(&session.project_root),
-                grafiki_home: None,
-                capture_id,
-            });
-        }
+    if let Some(session) = session {
+        finish_session(session);
     }
     Ok(())
+}
+
+/// Kill + flush + stop-capture for a session that is being discarded. The reader
+/// thread also flushes on EOF, but `ingest_capture_event` dedups by content hash,
+/// so double flushing the same bytes is harmless.
+fn finish_session(mut session: TerminalSession) {
+    let _ = session.child.kill();
+    let raw = std::mem::take(&mut session.shared.lock().unwrap().capture);
+    if let Some(capture_id) = session.capture_id.clone() {
+        flush_capture(&session.project_root, &session.capture_id, raw);
+        let _ = stop_capture_session(StopCaptureOptions {
+            project_name: None,
+            start_dir: PathBuf::from(&session.project_root),
+            grafiki_home: None,
+            capture_id,
+        });
+    }
 }
 
 /// Persist a chunk of terminal output as a capture event (ANSI-stripped). Silent
@@ -280,7 +434,7 @@ fn strip_ansi(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_ansi;
+    use super::{strip_ansi, TermShared, SCROLLBACK_MAX};
 
     #[test]
     fn strips_color_and_cursor_sequences_but_keeps_text() {
@@ -291,5 +445,25 @@ mod tests {
         assert!(out.contains("ok"));
         assert!(!out.contains('\x1b'));
         assert!(!out.contains('\r'));
+    }
+
+    #[test]
+    fn scrollback_caps_and_trims_to_newline_boundary() {
+        let mut shared = TermShared {
+            scrollback: Vec::new(),
+            channel: None,
+            capture: Vec::new(),
+            exited: false,
+        };
+        // Fill well past the cap with recognizable lines.
+        for i in 0..40_000 {
+            shared.push_scrollback(format!("line {i}\n").as_bytes());
+        }
+        assert!(shared.scrollback.len() <= SCROLLBACK_MAX);
+        // The buffer starts at a line boundary (not mid-line).
+        let text = String::from_utf8_lossy(&shared.scrollback);
+        assert!(text.starts_with("line "));
+        // The newest line is retained.
+        assert!(text.ends_with("line 39999\n"));
     }
 }

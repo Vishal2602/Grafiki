@@ -2214,6 +2214,8 @@ pub fn run() {
             search_project_memory,
             chat_with_memory,
             terminal::terminal_open,
+            terminal::terminal_attach,
+            terminal::terminal_detach,
             terminal::terminal_write,
             terminal::terminal_resize,
             terminal::terminal_close,
