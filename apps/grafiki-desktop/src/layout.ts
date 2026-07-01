@@ -10,21 +10,11 @@ const LAYOUT_VERSION = 2;
 // Known pane kinds (must match PaneKind in types.ts). Used to reject panes from a
 // tampered/old URL hash before they reach the renderer.
 const PANE_KINDS: ReadonlySet<string> = new Set([
-  "overview",
-  "search",
   "chat",
   "terminal",
-  "graph",
   "candidates",
-  "relations",
-  "sessions",
-  "state",
-  "decisions",
-  "context",
   "settings",
   "detail",
-  "capture",
-  "agent",
 ]);
 
 export function createDefaultLayout(): LayoutState {
@@ -95,15 +85,9 @@ export function decodeLayout(value: string | null): LayoutState | null {
   }
 }
 
-export function titleForPane(pane: Pick<PaneState, "kind" | "query" | "recordId" | "captureType" | "recordType">) {
-  if (pane.kind === "search") {
-    const type = pane.recordType && pane.recordType !== "all" ? `${pane.recordType} ` : "";
-    return pane.query ? `Search: ${type}${pane.query}` : "Search";
-  }
+export function titleForPane(pane: Pick<PaneState, "kind" | "recordId">) {
   if (pane.kind === "detail") return pane.recordId ? `Detail: ${pane.recordId}` : "Detail";
-  if (pane.kind === "capture") return pane.captureType ? `New ${pane.captureType}` : "Capture";
-  if (pane.kind === "candidates") return "Memory Review";
-  if (pane.kind === "agent") return "Agent Activity";
+  if (pane.kind === "candidates") return "Review";
   const kind = pane.kind ?? "";
   if (!kind) return "Pane";
   return kind[0].toUpperCase() + kind.slice(1);

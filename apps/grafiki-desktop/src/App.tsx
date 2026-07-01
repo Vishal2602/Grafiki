@@ -7,15 +7,12 @@ import {
 import {
   Activity,
   AlertTriangle,
-  BrainCircuit,
   CheckCircle2,
   CircleDot,
   Database,
   Download,
-  FileClock,
   FileText,
   FolderOpen,
-  GitBranch,
   History,
   LayoutDashboard,
   MessageSquare,
@@ -25,15 +22,12 @@ import {
   Pencil,
   Plus,
   RefreshCcw,
-  Search as SearchIcon,
   Settings,
   ShieldQuestion,
   Sparkles,
-  SplitSquareHorizontal,
   Trash2,
   Upload,
   X,
-  RadioTower,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
@@ -46,28 +40,17 @@ import {
   chatWithMemory,
   deleteMemoryRecord,
   editCandidate,
-  endSession,
   exportMemoryToFile,
   getCaptureConfig,
   getDaemonStatus,
-  getMemoryGraph,
   getMemoryRecord,
   getProjectSnapshot,
-  handoffSession,
   importMemoryFromFile,
   initializeProject,
-  listAgentActivity,
-  listProjectContext,
-  listProjectDecisions,
-  listProjectRelations,
-  listProjectSessions,
-  listProjectState,
   listCandidates,
   pickProjectFolder,
   processProjectEmbeddings,
-  searchProjectMemory,
   startDaemon,
-  startSession,
   stopDaemon,
   rejectCandidate,
   updateMemoryRecord,
@@ -84,34 +67,25 @@ import {
   titleForPane,
 } from "./layout";
 import type {
-  AgentQueryLogItem,
   CaptureConfigReport,
   CaptureSourceConfig,
   ChatReply,
-  ContextSummary,
   DaemonStatus,
-  DecisionItem,
   EvidenceLink,
   ExtractionCandidate,
-  GraphRelation,
-  GraphReport,
-  HandoffSessionResult,
   MemoryRecordDetail,
   PaneKind,
   PaneState,
   ProjectSnapshot,
-  SearchMode,
   SearchResult,
-  SessionLogItem,
-  StateItem,
   LayoutState,
 } from "./types";
 
 const PROJECT_ROOT_KEY = "grafiki.desktop.projectRoot";
 
-// Ultra-minimal nav (Wispr/Granola feel): the core loop only. The other panes
-// (overview/search/graph/agent/relations/sessions/state/decisions/context) still
-// exist and render if reached — they're just off the sidebar to keep it clean.
+// Ultra-minimal nav (Wispr/Granola feel): the whole app is this core loop.
+// `detail` is reachable too (opened from a chat citation or an approved memory),
+// it's just not a sidebar destination.
 const navItems: Array<{ kind: PaneKind; label: string; icon: typeof LayoutDashboard }> = [
   { kind: "terminal", label: "Terminal", icon: TerminalSquare },
   { kind: "chat", label: "Chat", icon: MessageSquare },
@@ -170,8 +144,6 @@ const sessionTypes = [
   "other",
 ];
 const sessionStatuses = ["active", "completed", "handed-off", "abandoned"];
-const endStatuses = ["completed", "handed-off", "abandoned"];
-const searchRecordTypes = ["all", "entity", "observation", "decision", "context", "state", "session"];
 
 const transition = {
   quick: { duration: 0.14, ease: [0.2, 0, 0.2, 1] },
@@ -331,19 +303,6 @@ export default function App() {
     setSnapshot(next);
   }
 
-  function handleSessionChanged(result: { record_type: string; id: string; title: string; scope: string; message: string }) {
-    setSelectedResult({
-      record_type: result.record_type,
-      id: result.id,
-      title: result.title,
-      snippet: result.message,
-      scope: result.scope,
-      score: null,
-    });
-    setInspectorOpen(true);
-    refreshSnapshot();
-  }
-
   function updatePane(id: string, patch: Partial<PaneState>) {
     setLayout((current) => ({
       ...current,
@@ -384,13 +343,6 @@ export default function App() {
       return;
     }
     if (result) openResultInPane(result);
-  }
-
-  function openGraphForEntity(entityId: string) {
-    openPane("graph", {
-      entityId,
-      title: `Graph: ${entityId}`,
-    });
   }
 
   return (
@@ -441,7 +393,6 @@ export default function App() {
                   setInspectorOpen(true);
                 }}
                 onOpenResult={openResultInPane}
-                onSessionChanged={handleSessionChanged}
                 onProjectRootChange={setProjectRoot}
                 onInitializeProject={initializeCurrentProject}
                 onMemoryChanged={refreshSnapshot}
@@ -461,7 +412,6 @@ export default function App() {
             recordDetailLoading={recordDetailLoading}
             recordDetailError={recordDetailError}
             onOpenDetail={openSelectedDetail}
-            onOpenGraph={openGraphForEntity}
             onClose={() => setInspectorOpen(false)}
             reduceMotion={reduceMotion}
           />
@@ -585,7 +535,6 @@ function MemoryPane(props: {
   onUpdate: (patch: Partial<PaneState>) => void;
   onSelectResult: (result: SearchResult) => void;
   onOpenResult: (result: SearchResult) => void;
-  onSessionChanged: (result: { record_type: string; id: string; title: string; scope: string; message: string }) => void;
   onProjectRootChange: (path: string) => void;
   onInitializeProject: (path?: string) => Promise<void>;
   onMemoryChanged: () => Promise<ProjectSnapshot>;
@@ -615,19 +564,7 @@ function MemoryPane(props: {
       </header>
 
       <div className="pane-body">
-        {pane.kind === "overview" ? <OverviewPane snapshot={props.snapshot} /> : null}
-        {pane.kind === "search" ? (
-          <SearchPane
-            pane={pane}
-            snapshot={props.snapshot}
-            projectRoot={props.projectRoot}
-            reduceMotion={props.reduceMotion}
-            onUpdate={props.onUpdate}
-            onSelectResult={props.onSelectResult}
-            onOpenResult={props.onOpenResult}
-            onMemoryChanged={props.onMemoryChanged}
-          />
-        ) : null}
+        {pane.kind === "terminal" ? <TerminalPane projectRoot={props.projectRoot} /> : null}
         {pane.kind === "chat" ? (
           <ChatPane
             pane={pane}
@@ -637,73 +574,12 @@ function MemoryPane(props: {
             onOpenResult={props.onOpenResult}
           />
         ) : null}
-        {pane.kind === "terminal" ? <TerminalPane projectRoot={props.projectRoot} /> : null}
-        {pane.kind === "graph" ? (
-          <GraphPane pane={pane} snapshot={props.snapshot} startDir={props.projectRoot} onUpdate={props.onUpdate} />
-        ) : null}
         {pane.kind === "candidates" ? (
           <CandidatesPane
             snapshot={props.snapshot}
             startDir={props.projectRoot}
             reduceMotion={props.reduceMotion}
             active={props.active}
-            onSelectResult={props.onSelectResult}
-            onOpenResult={props.onOpenResult}
-            onMemoryChanged={props.onMemoryChanged}
-          />
-        ) : null}
-        {pane.kind === "agent" ? (
-          <AgentActivityPane
-            snapshot={props.snapshot}
-            startDir={props.projectRoot}
-            reduceMotion={props.reduceMotion}
-          />
-        ) : null}
-        {pane.kind === "relations" ? (
-          <RelationsPane
-            snapshot={props.snapshot}
-            startDir={props.projectRoot}
-            reduceMotion={props.reduceMotion}
-            onSelectResult={props.onSelectResult}
-            onOpenResult={props.onOpenResult}
-            onMemoryChanged={props.onMemoryChanged}
-          />
-        ) : null}
-        {pane.kind === "sessions" ? (
-          <SessionsPane
-            snapshot={props.snapshot}
-            startDir={props.projectRoot}
-            reduceMotion={props.reduceMotion}
-            onSelectResult={props.onSelectResult}
-            onOpenResult={props.onOpenResult}
-            onSessionChanged={props.onSessionChanged}
-          />
-        ) : null}
-        {pane.kind === "state" ? (
-          <StatePane
-            snapshot={props.snapshot}
-            startDir={props.projectRoot}
-            reduceMotion={props.reduceMotion}
-            onSelectResult={props.onSelectResult}
-            onOpenResult={props.onOpenResult}
-            onMemoryChanged={props.onMemoryChanged}
-          />
-        ) : null}
-        {pane.kind === "decisions" ? (
-          <DecisionsPane
-            snapshot={props.snapshot}
-            startDir={props.projectRoot}
-            reduceMotion={props.reduceMotion}
-            onSelectResult={props.onSelectResult}
-            onOpenResult={props.onOpenResult}
-            onMemoryChanged={props.onMemoryChanged}
-          />
-        ) : null}
-        {pane.kind === "context" ? (
-          <ContextPane
-            snapshot={props.snapshot}
-            startDir={props.projectRoot}
-            reduceMotion={props.reduceMotion}
             onSelectResult={props.onSelectResult}
             onOpenResult={props.onOpenResult}
             onMemoryChanged={props.onMemoryChanged}
@@ -731,63 +607,6 @@ function MemoryPane(props: {
         ) : null}
       </div>
     </motion.article>
-  );
-}
-
-function OverviewPane({ snapshot }: { snapshot: ProjectSnapshot | null }) {
-  const report = snapshot?.report;
-  const status = snapshot?.status;
-
-  return (
-    <div className="view-stack">
-      <motion.section
-        className="briefing-panel"
-        initial={{ opacity: 0, y: 8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={transition.quick}
-      >
-        <div className="briefing-copy">
-          <span className="record-type">Next session brief</span>
-          <h3>{snapshot?.project?.project ?? "Project memory"}</h3>
-          <p>
-            Review active state, durable decisions, and retrieval freshness before another AI
-            session starts work.
-          </p>
-        </div>
-        <div className="briefing-stats">
-          <Metric label="Entities" value={report?.entity_count ?? 0} />
-          <Metric label="Relations" value={report?.relation_count ?? 0} />
-          <Metric label="Observations" value={report?.observation_count ?? 0} />
-          <Metric label="Decisions" value={report?.decision_count ?? 0} />
-        </div>
-      </motion.section>
-
-      {snapshot?.error ? (
-        <section className="notice warn">
-          <AlertTriangle size={18} />
-          <span>{snapshot.error}</span>
-        </section>
-      ) : null}
-
-      <motion.section className="dense-list" layout>
-        <ListHeading title="Active Memory" icon={Activity} />
-        {(status?.active_state.length ? status.active_state : ["No active state recorded"]).map((item) => (
-          <Row key={item} title={item} meta="state" />
-        ))}
-        {(status?.active_sessions.length ? status.active_sessions : ["No active session"]).map((item) => (
-          <Row key={item} title={item} meta="session" />
-        ))}
-      </motion.section>
-
-      <motion.section className="dense-list" layout>
-        <ListHeading title="Suggested Queries" icon={SearchIcon} />
-        {(report?.suggested_queries.length ? report.suggested_queries : ["What should the next session know?"]).map(
-          (query) => (
-            <Row key={query} title={query} meta="query" />
-          ),
-        )}
-      </motion.section>
-    </div>
   );
 }
 
@@ -1087,785 +906,6 @@ function ChatPane(props: {
           </button>
         </div>
       </div>
-    </div>
-  );
-}
-
-function SearchPane(props: {
-  pane: PaneState;
-  snapshot: ProjectSnapshot | null;
-  projectRoot: string;
-  reduceMotion: boolean;
-  onUpdate: (patch: Partial<PaneState>) => void;
-  onSelectResult: (result: SearchResult) => void;
-  onOpenResult: (result: SearchResult) => void;
-  onMemoryChanged: () => Promise<ProjectSnapshot>;
-}) {
-  const [query, setQuery] = useState(props.pane.query ?? "");
-  const [mode, setMode] = useState<SearchMode>(props.pane.mode ?? "hybrid");
-  const [recordType, setRecordType] = useState(props.pane.recordType ?? "all");
-  const [searchScope, setSearchScope] = useState(props.pane.scope ?? props.snapshot?.scope ?? "");
-  const [results, setResults] = useState<SearchResult[]>([]);
-  const [semanticAvailable, setSemanticAvailable] = useState(false);
-  const [searching, setSearching] = useState(false);
-  const [maintenanceBusy, setMaintenanceBusy] = useState(false);
-  const [maintenanceMessage, setMaintenanceMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const embedding = props.snapshot?.embedding;
-  const runtime = embedding?.runtime;
-
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      props.onUpdate({
-        query,
-        mode,
-        recordType,
-        scope: searchScope,
-        title: titleForPane({ kind: "search", query, recordType }),
-      });
-
-      if (!query.trim()) {
-        setResults([]);
-        setSemanticAvailable(Boolean(runtime && runtime.indexed_records > 0));
-        return;
-      }
-
-      setSearching(true);
-      searchProjectMemory({
-        startDir: props.projectRoot,
-        query,
-        mode,
-        scope: searchScope,
-        recordType,
-        limit: 20,
-      })
-        .then((report) => {
-          setResults(report.results);
-          setSemanticAvailable(report.semantic_available);
-          setError(report.fallback ?? null);
-        })
-        .catch((searchError) => {
-          setResults([]);
-          setSemanticAvailable(false);
-          setError(String(searchError));
-        })
-        .finally(() => {
-          setSearching(false);
-        });
-    }, 180);
-
-    return () => window.clearTimeout(timer);
-  }, [query, mode, recordType, searchScope, props.projectRoot, runtime?.indexed_records]);
-
-  async function processSearchEmbeddings(rebuild: boolean) {
-    setMaintenanceBusy(true);
-    setMaintenanceMessage(null);
-    setError(null);
-    try {
-      const result = await processProjectEmbeddings({
-        startDir: props.projectRoot,
-        scope: rebuild ? searchScope || "*" : searchScope || props.snapshot?.scope || "*",
-        rebuild,
-        limit: 100,
-      });
-      setMaintenanceMessage(
-        `${rebuild ? "Rebuilt" : "Processed"} embeddings: ${result.processed} processed, ${result.pending_remaining} pending.`,
-      );
-      await props.onMemoryChanged();
-    } catch (embeddingError) {
-      setError(String(embeddingError));
-    } finally {
-      setMaintenanceBusy(false);
-    }
-  }
-
-  return (
-    <div className="view-stack search-view">
-      <div className="search-box">
-        <SearchIcon size={17} />
-        <input
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          placeholder="Search project memory"
-          autoComplete="off"
-        />
-      </div>
-
-      <div className="toolbar-row">
-        <Segmented
-          value={mode}
-          options={["hybrid", "keyword", "semantic"]}
-          onChange={(next) => setMode(next as SearchMode)}
-        />
-        <label className="compact-select">
-          <span>Type</span>
-          <select value={recordType} onChange={(event) => setRecordType(event.target.value)}>
-            {searchRecordTypes.map((option) => (
-              <option key={option} value={option}>
-                {option}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
-
-      <div className="search-filter-row">
-        <label>
-          <span>Scope</span>
-          <input value={searchScope} onChange={(event) => setSearchScope(event.target.value)} placeholder="global or project/module" />
-        </label>
-        <div className="retrieval-health">
-          <strong>{results.length}</strong>
-          <span>{searching ? "searching" : semanticAvailable ? "semantic ready" : "keyword path"}</span>
-        </div>
-      </div>
-
-      <section className="retrieval-panel">
-        <div>
-          <span className="record-type">Retrieval Index</span>
-          <strong>{runtime ? `${runtime.fresh_records}/${runtime.embeddable_records} fresh` : "No index status"}</strong>
-          <p>
-            {runtime
-              ? `${runtime.provider} / ${runtime.vector_backend} / ${runtime.missing_or_stale_records} stale`
-              : "Initialize a Grafiki project to inspect embedding freshness."}
-          </p>
-        </div>
-        <div className="retrieval-actions">
-          <button
-            className="button secondary"
-            onClick={() => processSearchEmbeddings(false)}
-            disabled={maintenanceBusy || !props.projectRoot.trim()}
-          >
-            <Sparkles size={15} />
-            Process
-          </button>
-          <button
-            className="button secondary"
-            onClick={() => processSearchEmbeddings(true)}
-            disabled={maintenanceBusy || !props.projectRoot.trim()}
-          >
-            <RefreshCcw size={15} />
-            Rebuild
-          </button>
-        </div>
-      </section>
-
-      {error ? (
-        <section className="notice compact">
-          <AlertTriangle size={16} />
-          <span>{error}</span>
-        </section>
-      ) : null}
-      {maintenanceMessage ? <section className="notice compact good">{maintenanceMessage}</section> : null}
-
-      <motion.section className="result-list" layout>
-        <AnimatePresence mode="popLayout">
-          {results.map((result, index) => (
-          <motion.button
-            key={result.id}
-            layout
-            className="result-row"
-            onClick={() => props.onSelectResult(result)}
-            onDoubleClick={() => props.onOpenResult(result)}
-            initial={props.reduceMotion ? false : { opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={props.reduceMotion ? undefined : { opacity: 0, y: -4 }}
-            transition={{ ...transition.quick, delay: props.reduceMotion ? 0 : index * 0.025 }}
-            whileHover={props.reduceMotion ? undefined : { x: 2 }}
-            whileTap={props.reduceMotion ? undefined : { scale: 0.995 }}
-          >
-            <span className="record-type">{result.record_type}</span>
-            <strong>{result.title}</strong>
-            <span>{result.snippet}</span>
-            <footer>
-              <code>{result.scope || "global"}</code>
-              <span>{typeof result.score === "number" ? result.score.toFixed(2) : "keyword"}</span>
-            </footer>
-          </motion.button>
-          ))}
-        </AnimatePresence>
-      </motion.section>
-
-      {!searching && query.trim() && results.length === 0 ? (
-        <section className="notice compact">
-          <SearchIcon size={16} />
-          <span>
-            No matches for &ldquo;{query.trim()}&rdquo;.
-            {mode !== "keyword" && !semanticAvailable
-              ? " Semantic search has no index yet — click Rebuild to enable semantic matches."
-              : ""}
-          </span>
-        </section>
-      ) : null}
-    </div>
-  );
-}
-
-function GraphPane(props: {
-  pane: PaneState;
-  snapshot: ProjectSnapshot | null;
-  startDir: string;
-  onUpdate: (patch: Partial<PaneState>) => void;
-}) {
-  const report = props.snapshot?.report;
-  const candidates = useMemo(() => {
-    const nodes = [...(report?.god_nodes ?? []), ...(report?.orphan_entities ?? [])];
-    return nodes.filter((node, index) => nodes.findIndex((candidate) => candidate.id === node.id) === index);
-  }, [report]);
-  const root = props.pane.entityId ?? candidates[0]?.id ?? "";
-  const [graph, setGraph] = useState<GraphReport | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!root) {
-      setGraph(null);
-      return;
-    }
-
-    let cancelled = false;
-    setError(null);
-    getMemoryGraph({ startDir: props.startDir, entityId: root, depth: 2 })
-      .then((next) => {
-        if (!cancelled) setGraph(next);
-      })
-      .catch((graphError) => {
-        if (!cancelled) {
-          setGraph(null);
-          setError(String(graphError));
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [root, props.startDir]);
-
-  const entityNames = new Map(graph?.entities.map((entity) => [entity.id, entity.name]) ?? []);
-  const rows =
-    graph?.relations.map((relation) => ({
-      from: entityNames.get(relation.from_entity) ?? relation.from_entity,
-      relation: relation.relation,
-      to: entityNames.get(relation.to_entity) ?? relation.to_entity,
-    })) ?? [];
-
-  return (
-    <motion.div
-      className="relationship-ledger"
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={transition.quick}
-    >
-      <header>
-        <span className="record-type">Relationship ledger</span>
-        <strong>{root ? entityNames.get(root) ?? root : "No entity selected"}</strong>
-      </header>
-      {candidates.length ? (
-        <div className="graph-toolbar">
-          <select value={root} onChange={(event) => props.onUpdate({ entityId: event.target.value })}>
-            {candidates.map((node) => (
-              <option key={node.id} value={node.id}>
-                {node.name} - {node.entity_type}
-              </option>
-            ))}
-          </select>
-          <span>{graph ? `${graph.entities.length} entities / ${graph.relations.length} relations` : "Loading"}</span>
-        </div>
-      ) : null}
-      {error ? (
-        <section className="notice compact">
-          <AlertTriangle size={16} />
-          <span>{error}</span>
-        </section>
-      ) : null}
-      <div className="relation-table">
-        {(rows.length
-          ? rows
-          : [
-              { from: "Project", relation: "contains", to: `${report?.entity_count ?? 0} entities` },
-              { from: "Entities", relation: "linked by", to: `${report?.relation_count ?? 0} relations` },
-              { from: "Sessions", relation: "recall", to: `${report?.observation_count ?? 0} observations` },
-              { from: "Decisions", relation: "shape", to: `${report?.decision_count ?? 0} active records` },
-            ]
-        ).map((row) => (
-          <motion.div
-            className="relation-row"
-            key={`${row.from}-${row.relation}-${row.to}`}
-            layout
-            whileHover={{ x: 2 }}
-            transition={transition.quick}
-          >
-            <code>{row.from}</code>
-            <span>{row.relation}</span>
-            <code>{row.to}</code>
-          </motion.div>
-        ))}
-      </div>
-    </motion.div>
-  );
-}
-
-function SessionsPane(props: {
-  snapshot: ProjectSnapshot | null;
-  startDir: string;
-  reduceMotion: boolean;
-  onSelectResult: (result: SearchResult) => void;
-  onOpenResult: (result: SearchResult) => void;
-  onSessionChanged: (result: { record_type: string; id: string; title: string; scope: string; message: string }) => void;
-}) {
-  const sessions = props.snapshot?.status?.active_sessions ?? [];
-  const [history, setHistory] = useState<SessionLogItem[]>([]);
-  const [sessionType, setSessionType] = useState("codex");
-  const [goal, setGoal] = useState("");
-  const [scope, setScope] = useState("");
-  const [endStatus, setEndStatus] = useState("completed");
-  const [summary, setSummary] = useState("");
-  const [accomplishments, setAccomplishments] = useState("");
-  const [remaining, setRemaining] = useState("");
-  const [filesChanged, setFilesChanged] = useState("");
-  const [loadingHistory, setLoadingHistory] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [handoffReview, setHandoffReview] = useState<{ report: HandoffSessionResult; title: string } | null>(null);
-
-  async function loadHistory() {
-    setLoadingHistory(true);
-    setError(null);
-    try {
-      setHistory(await listProjectSessions({ startDir: props.startDir }));
-    } catch (listError) {
-      setError(String(listError));
-    } finally {
-      setLoadingHistory(false);
-    }
-  }
-
-  useEffect(() => {
-    loadHistory();
-  }, [props.startDir, props.snapshot]);
-
-  async function start(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!goal.trim() || busy) return;
-    setBusy(true);
-    setMessage(null);
-    setError(null);
-    try {
-      const report = await startSession({
-        startDir: props.startDir,
-        sessionType,
-        goal,
-        scope,
-      });
-      setHandoffReview(null);
-      setMessage(`Started ${report.session_type} session.`);
-      props.onSessionChanged({
-        record_type: "session",
-        id: report.session_id,
-        title: report.goal,
-        scope: report.scope,
-        message: report.briefing,
-      });
-      await loadHistory();
-      setGoal("");
-    } catch (sessionError) {
-      setError(String(sessionError));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function end(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (busy) return;
-    setBusy(true);
-    setMessage(null);
-    setError(null);
-    try {
-      const report = await endSession({
-        startDir: props.startDir,
-        status: endStatus,
-        summary,
-        accomplishments,
-        remaining,
-        filesChanged,
-      });
-      setHandoffReview(null);
-      setMessage(`Ended session ${report.session_id}.`);
-      props.onSessionChanged({
-        record_type: "session",
-        id: report.session_id,
-        title: report.session_id,
-        scope: "",
-        message: report.summary || `Session ended with status ${report.status}.`,
-      });
-      await loadHistory();
-      setSummary("");
-      setAccomplishments("");
-      setRemaining("");
-      setFilesChanged("");
-    } catch (sessionError) {
-      setError(String(sessionError));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function endSelected(session: SessionLogItem) {
-    if (busy) return;
-    if (!(await confirmDialog(`End session "${session.goal || session.id}" as completed?`, { okLabel: "End" }))) return;
-    setBusy(true);
-    setMessage(null);
-    setError(null);
-    try {
-      const report = await endSession({
-        startDir: props.startDir,
-        sessionId: session.id,
-        status: "completed",
-        summary: session.summary ?? "",
-        accomplishments: session.accomplishments.join(", "),
-        remaining: session.remaining.join(", "),
-        filesChanged: session.files_changed.join(", "),
-      });
-      setHandoffReview(null);
-      setMessage(`Ended session ${report.session_id}.`);
-      props.onSessionChanged({
-        record_type: "session",
-        id: report.session_id,
-        title: session.goal || report.session_id,
-        scope: session.scope,
-        message: report.summary || `Session ended with status ${report.status}.`,
-      });
-      await loadHistory();
-    } catch (sessionError) {
-      setError(String(sessionError));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handoffSelected(session: SessionLogItem) {
-    if (busy) return;
-    if (!(await confirmDialog(`Create a handoff from "${session.goal || session.id}"?`, { kind: "info", okLabel: "Create" }))) return;
-    setBusy(true);
-    setMessage(null);
-    setError(null);
-    try {
-      const report = await handoffSession({
-        startDir: props.startDir,
-        sessionId: session.id,
-      });
-      setHandoffReview({ report, title: session.goal || report.child_session_id });
-      setMessage(`Created handoff session ${report.child_session_id}.`);
-      props.onSessionChanged({
-        record_type: "session",
-        id: report.child_session_id,
-        title: session.goal || report.child_session_id,
-        scope: report.scope,
-        message: report.handoff_context,
-      });
-      await loadHistory();
-    } catch (sessionError) {
-      setError(String(sessionError));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function copyHandoffContext() {
-    if (!handoffReview) return;
-    setMessage(null);
-    setError(null);
-    try {
-      await navigator.clipboard.writeText(handoffReview.report.handoff_context);
-      setMessage("Copied handoff context.");
-    } catch (clipboardError) {
-      setError(String(clipboardError));
-    }
-  }
-
-  function openHandoffSession(id: string, label: string) {
-    if (!handoffReview) return;
-    props.onOpenResult({
-      record_type: "session",
-      id,
-      title: label,
-      scope: handoffReview.report.scope,
-      snippet: handoffReview.report.handoff_context,
-    });
-  }
-
-  return (
-    <div className="view-stack">
-      <EntityList
-        title="Active Sessions"
-        icon={History}
-        rows={sessions.length ? sessions : ["No active session"]}
-        meta="handoff chain"
-      />
-
-      <MemoryListHeader
-        title="Session History"
-        icon={History}
-        loading={loadingHistory}
-        onRefresh={loadHistory}
-      />
-      <section className="record-list">
-        {history.length ? (
-          history.map((session, index) => {
-            const result = sessionToSearchResult(session);
-            return (
-              <MemoryRecordRow
-                key={session.id}
-                type="session"
-                title={session.goal || session.id}
-                body={sessionBody(session)}
-                scope={session.scope}
-                meta={`${session.status} / ${session.session_type}`}
-                index={index}
-                reduceMotion={props.reduceMotion}
-                onSelect={() => props.onSelectResult(result)}
-                onOpen={() => props.onOpenResult(result)}
-                onEdit={() => props.onOpenResult(result)}
-                onHandoff={session.status === "active" ? () => handoffSelected(session) : undefined}
-                onComplete={session.status === "active" ? () => endSelected(session) : undefined}
-              />
-            );
-          })
-        ) : (
-          <EmptyRecordList text="No sessions recorded." />
-        )}
-      </section>
-
-      {message ? <section className="notice compact good">{message}</section> : null}
-      {error ? (
-        <section className="notice compact">
-          <AlertTriangle size={16} />
-          <span>{error}</span>
-        </section>
-      ) : null}
-
-      {handoffReview ? (
-        <motion.section
-          className="handoff-review"
-          layout
-          initial={props.reduceMotion ? false : { opacity: 0, y: 8 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={transition.quick}
-        >
-          <header>
-            <div>
-              <span className="record-type">Handoff Review</span>
-              <strong>{handoffReview.title}</strong>
-            </div>
-            <code>{handoffReview.report.scope || "global"}</code>
-          </header>
-          <div className="handoff-review-facts">
-            <div>
-              <span>Parent</span>
-              <code>{handoffReview.report.parent_session_id}</code>
-            </div>
-            <div>
-              <span>Child</span>
-              <code>{handoffReview.report.child_session_id}</code>
-            </div>
-            <div>
-              <span>Project</span>
-              <code>{handoffReview.report.project}</code>
-            </div>
-          </div>
-          <pre>{handoffReview.report.handoff_context}</pre>
-          <div className="handoff-review-actions">
-            <button className="button secondary" type="button" onClick={copyHandoffContext}>
-              <FileText size={15} />
-              Copy Context
-            </button>
-            <button
-              className="button secondary"
-              type="button"
-              onClick={() => openHandoffSession(handoffReview.report.parent_session_id, "Parent Session")}
-            >
-              <History size={15} />
-              Open Parent
-            </button>
-            <button
-              className="button primary"
-              type="button"
-              onClick={() => openHandoffSession(handoffReview.report.child_session_id, "Child Session")}
-            >
-              <SplitSquareHorizontal size={15} />
-              Open Child
-            </button>
-          </div>
-        </motion.section>
-      ) : null}
-
-      <form className="capture-form" onSubmit={start}>
-        <ListHeading title="Start Session" icon={Plus} />
-        <div className="metadata-grid">
-          <label>
-            <span>Type</span>
-            <select value={sessionType} onChange={(event) => setSessionType(event.target.value)}>
-              {sessionTypes.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            <span>Scope</span>
-            <input value={scope} onChange={(event) => setScope(event.target.value)} placeholder="project/module" />
-          </label>
-        </div>
-        <label>
-          <span>Goal</span>
-          <textarea value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="What should this session accomplish?" />
-        </label>
-        <div className="form-actions">
-          <button className="button primary" disabled={!goal.trim() || busy}>
-            Start
-          </button>
-        </div>
-      </form>
-
-      <form className="capture-form" onSubmit={end}>
-        <ListHeading title="End Latest Active Session" icon={CheckCircle2} />
-        <div className="metadata-grid">
-          <label>
-            <span>Status</span>
-            <select value={endStatus} onChange={(event) => setEndStatus(event.target.value)}>
-              {endStatuses.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-        <label>
-          <span>Summary</span>
-          <textarea value={summary} onChange={(event) => setSummary(event.target.value)} placeholder="What changed, what remains, and what should the next session know?" />
-        </label>
-        <div className="metadata-grid">
-          <label>
-            <span>Accomplishments</span>
-            <input
-              value={accomplishments}
-              onChange={(event) => setAccomplishments(event.target.value)}
-              placeholder="comma separated"
-            />
-          </label>
-          <label>
-            <span>Remaining</span>
-            <input value={remaining} onChange={(event) => setRemaining(event.target.value)} placeholder="comma separated" />
-          </label>
-          <label>
-            <span>Files Changed</span>
-            <input
-              value={filesChanged}
-              onChange={(event) => setFilesChanged(event.target.value)}
-              placeholder="comma separated paths"
-            />
-          </label>
-        </div>
-        <div className="form-actions">
-          <button className="button secondary" disabled={busy}>
-            End Session
-          </button>
-        </div>
-      </form>
-    </div>
-  );
-}
-
-function DecisionsPane(props: {
-  snapshot: ProjectSnapshot | null;
-  startDir: string;
-  reduceMotion: boolean;
-  onSelectResult: (result: SearchResult) => void;
-  onOpenResult: (result: SearchResult) => void;
-  onMemoryChanged: () => Promise<ProjectSnapshot>;
-}) {
-  const [decisions, setDecisions] = useState<DecisionItem[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  async function load() {
-    setLoading(true);
-    setError(null);
-    try {
-      setDecisions(await listProjectDecisions({ startDir: props.startDir }));
-    } catch (listError) {
-      setError(String(listError));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    load();
-  }, [props.startDir, props.snapshot]);
-
-  async function remove(decision: DecisionItem) {
-    if (!(await confirmDialog(`Delete decision "${decision.title}"?`, { okLabel: "Delete" }))) return;
-    setMessage(null);
-    setError(null);
-    try {
-      const result = await deleteMemoryRecord({
-        startDir: props.startDir,
-        recordType: "decision",
-        id: decision.id,
-      });
-      setDecisions((current) => current.filter((candidate) => candidate.id !== decision.id));
-      setMessage(result.message);
-      await props.onMemoryChanged();
-    } catch (deleteError) {
-      setError(String(deleteError));
-    }
-  }
-
-  return (
-    <div className="view-stack">
-      <MemoryListHeader
-        title="Decisions"
-        icon={GitBranch}
-        loading={loading}
-        onRefresh={load}
-      />
-      {message ? <section className="notice compact good">{message}</section> : null}
-      {error ? (
-        <section className="notice compact">
-          <AlertTriangle size={16} />
-          <span>{error}</span>
-        </section>
-      ) : null}
-      <section className="record-list">
-        {decisions.length ? (
-          decisions.map((decision, index) => {
-            const result = decisionToSearchResult(decision);
-            return (
-              <MemoryRecordRow
-                key={decision.id}
-                type="decision"
-                title={decision.title}
-                body={decision.reasoning || "No reasoning recorded yet."}
-                scope={decision.scope}
-                meta={decision.status}
-                index={index}
-                reduceMotion={props.reduceMotion}
-                onSelect={() => props.onSelectResult(result)}
-                onOpen={() => props.onOpenResult(result)}
-                onEdit={() => props.onOpenResult(result)}
-                onDelete={() => remove(decision)}
-              />
-            );
-          })
-        ) : (
-          <EmptyRecordList text="No decisions recorded." />
-        )}
-      </section>
     </div>
   );
 }
@@ -2415,557 +1455,6 @@ function CandidatesPane(props: {
           })
         ) : (
           <EmptyRecordList text="No candidates in this view." />
-        )}
-      </section>
-    </div>
-  );
-}
-
-function AgentActivityPane(props: {
-  snapshot: ProjectSnapshot | null;
-  startDir: string;
-  reduceMotion: boolean;
-}) {
-  const [queries, setQueries] = useState<AgentQueryLogItem[]>([]);
-  const [scope, setScope] = useState(props.snapshot?.scope ?? "");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  async function load() {
-    setLoading(true);
-    setError(null);
-    try {
-      setQueries(
-        await listAgentActivity({
-          startDir: props.startDir,
-          scope,
-          limit: 80,
-        }),
-      );
-    } catch (activityError) {
-      setError(String(activityError));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    load();
-  }, [props.startDir, props.snapshot, scope]);
-
-  return (
-    <div className="view-stack">
-      <MemoryListHeader title="Agent Activity" icon={RadioTower} loading={loading} onRefresh={load} />
-      <div className="toolbar-row candidate-toolbar">
-        <label className="compact-input">
-          <span>Scope</span>
-          <input value={scope} onChange={(event) => setScope(event.target.value)} placeholder="global or project/module" />
-        </label>
-        <span className="subtle">{queries.length} queries</span>
-      </div>
-      {error ? (
-        <section className="notice compact">
-          <AlertTriangle size={16} />
-          <span>{error}</span>
-        </section>
-      ) : null}
-      <section className="record-list candidate-list">
-        {queries.length ? (
-          queries.map((query, index) => (
-            <MemoryRecordRow
-              key={query.id}
-              type={query.agent}
-              title={query.question}
-              body={`${query.returned_ids.length ? query.returned_ids.join(", ") : "No trusted memory returned"}${
-                query.fallback ? ` / ${query.fallback}` : ""
-              }`}
-              scope={query.scope}
-              meta={`${query.retrieval_mode} / ${query.latency_ms}ms / ${query.created_at}`}
-              index={index}
-              reduceMotion={props.reduceMotion}
-              onSelect={() => undefined}
-              onOpen={() => undefined}
-            />
-          ))
-        ) : (
-          <EmptyRecordList text="No agent queries recorded yet." />
-        )}
-      </section>
-    </div>
-  );
-}
-
-function RelationsPane(props: {
-  snapshot: ProjectSnapshot | null;
-  startDir: string;
-  reduceMotion: boolean;
-  onSelectResult: (result: SearchResult) => void;
-  onOpenResult: (result: SearchResult) => void;
-  onMemoryChanged: () => Promise<ProjectSnapshot>;
-}) {
-  const [relations, setRelations] = useState<GraphRelation[]>([]);
-  const [filter, setFilter] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  async function load() {
-    setLoading(true);
-    setError(null);
-    try {
-      setRelations(
-        await listProjectRelations({
-          startDir: props.startDir,
-          relation: filter,
-        }),
-      );
-    } catch (listError) {
-      setError(String(listError));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    load();
-  }, [props.startDir, props.snapshot, filter]);
-
-  async function remove(relation: GraphRelation) {
-    if (!(await confirmDialog(`Remove relation "${relation.from_entity} ${relation.relation} ${relation.to_entity}"?`, { okLabel: "Remove" }))) return;
-    setMessage(null);
-    setError(null);
-    try {
-      const result = await deleteMemoryRecord({
-        startDir: props.startDir,
-        recordType: "relation",
-        id: relation.id,
-      });
-      setRelations((current) => current.filter((candidate) => candidate.id !== relation.id));
-      setMessage(result.message);
-      await props.onMemoryChanged();
-    } catch (deleteError) {
-      setError(String(deleteError));
-    }
-  }
-
-  return (
-    <div className="view-stack">
-      <MemoryListHeader
-        title="Relations"
-        icon={GitBranch}
-        loading={loading}
-        onRefresh={load}
-      />
-      <div className="toolbar-row">
-        <label className="compact-select">
-          <span>Type</span>
-          <select value={filter || "all"} onChange={(event) => setFilter(event.target.value === "all" ? "" : event.target.value)}>
-            {["all", ...relationTypes].map((option) => (
-              <option key={option} value={option}>
-                {option}
-              </option>
-            ))}
-          </select>
-        </label>
-        <span className="subtle">{props.snapshot?.report?.relation_count ?? 0} graph links</span>
-      </div>
-      {message ? <section className="notice compact good">{message}</section> : null}
-      {error ? (
-        <section className="notice compact">
-          <AlertTriangle size={16} />
-          <span>{error}</span>
-        </section>
-      ) : null}
-      <section className="record-list">
-        {relations.length ? (
-          relations.map((relation, index) => {
-            const result = relationToSearchResult(relation);
-            return (
-              <MemoryRecordRow
-                key={relation.id}
-                type="relation"
-                title={`${relation.from_entity} ${relation.relation} ${relation.to_entity}`}
-                body={`weight ${relation.weight.toFixed(2)} confidence ${relation.confidence.toFixed(2)} source ${relation.source_type}`}
-                scope="relationship graph"
-                meta={relation.id}
-                index={index}
-                reduceMotion={props.reduceMotion}
-                onSelect={() => props.onSelectResult(result)}
-                onOpen={() => props.onOpenResult(result)}
-                onEdit={() => props.onOpenResult(result)}
-                onDelete={() => remove(relation)}
-              />
-            );
-          })
-        ) : (
-          <EmptyRecordList text="No relations recorded." />
-        )}
-      </section>
-    </div>
-  );
-}
-
-function StatePane(props: {
-  snapshot: ProjectSnapshot | null;
-  startDir: string;
-  reduceMotion: boolean;
-  onSelectResult: (result: SearchResult) => void;
-  onOpenResult: (result: SearchResult) => void;
-  onMemoryChanged: () => Promise<ProjectSnapshot>;
-}) {
-  const [items, setItems] = useState<StateItem[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [editing, setEditing] = useState<StateItem | null>(null);
-  const [editTitle, setEditTitle] = useState("");
-  const [editScope, setEditScope] = useState("");
-  const [editStatus, setEditStatus] = useState("in-progress");
-  const [editPriority, setEditPriority] = useState("medium");
-  const [saving, setSaving] = useState(false);
-
-  async function load() {
-    setLoading(true);
-    setError(null);
-    try {
-      setItems(await listProjectState({ startDir: props.startDir }));
-    } catch (listError) {
-      setError(String(listError));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    load();
-  }, [props.startDir, props.snapshot]);
-
-  async function remove(item: StateItem) {
-    if (!(await confirmDialog(`Delete state item "${item.title}"?`, { okLabel: "Delete" }))) return;
-    setMessage(null);
-    setError(null);
-    try {
-      const result = await deleteMemoryRecord({
-        startDir: props.startDir,
-        recordType: "state",
-        id: item.key,
-      });
-      setItems((current) => current.filter((candidate) => candidate.key !== item.key));
-      setMessage(result.message);
-      await props.onMemoryChanged();
-    } catch (deleteError) {
-      setError(String(deleteError));
-    }
-  }
-
-  function beginEdit(item: StateItem) {
-    setEditing(item);
-    setEditTitle(item.title);
-    setEditScope(item.scope);
-    setEditStatus(item.status);
-    setEditPriority(item.priority);
-    setMessage(null);
-    setError(null);
-  }
-
-  async function saveEdit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!editing || !editTitle.trim() || saving) return;
-    setSaving(true);
-    setMessage(null);
-    setError(null);
-    try {
-      const result = await updateMemoryRecord({
-        startDir: props.startDir,
-        recordType: "state",
-        id: editing.key,
-        title: editTitle,
-        scope: editScope,
-        status: editStatus,
-        priority: editPriority,
-      });
-      setMessage(result.message);
-      setEditing(null);
-      await load();
-      await props.onMemoryChanged();
-    } catch (editError) {
-      setError(String(editError));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <div className="view-stack">
-      <MemoryListHeader
-        title="State"
-        icon={Activity}
-        loading={loading}
-        onRefresh={load}
-      />
-      {message ? <section className="notice compact good">{message}</section> : null}
-      {error ? (
-        <section className="notice compact">
-          <AlertTriangle size={16} />
-          <span>{error}</span>
-        </section>
-      ) : null}
-      {editing ? (
-        <form className="inline-edit-form" onSubmit={saveEdit}>
-          <ListHeading title={`Edit ${editing.key}`} icon={Pencil} />
-          <label>
-            <span>Title</span>
-            <input value={editTitle} onChange={(event) => setEditTitle(event.target.value)} />
-          </label>
-          <div className="metadata-grid">
-            <label>
-              <span>Status</span>
-              <select value={editStatus} onChange={(event) => setEditStatus(event.target.value)}>
-                {stateStatuses.map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Priority</span>
-              <select value={editPriority} onChange={(event) => setEditPriority(event.target.value)}>
-                {statePriorities.map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-            </label>
-          </div>
-          <label>
-            <span>Scope</span>
-            <input value={editScope} onChange={(event) => setEditScope(event.target.value)} />
-          </label>
-          <div className="form-actions">
-            <button type="button" className="button secondary" onClick={() => setEditing(null)}>
-              Cancel
-            </button>
-            <button className="button primary" disabled={saving || !editTitle.trim()}>
-              Save
-            </button>
-          </div>
-        </form>
-      ) : null}
-      <section className="record-list">
-        {items.length ? (
-          items.map((item, index) => {
-            const result = stateToSearchResult(item);
-            return (
-              <MemoryRecordRow
-                key={item.key}
-                type="state"
-                title={item.title}
-                body={`${item.status} priority ${item.priority}${item.owner ? `, owned by ${item.owner}` : ""}`}
-                scope={item.scope}
-                meta={item.key}
-                index={index}
-                reduceMotion={props.reduceMotion}
-                onSelect={() => props.onSelectResult(result)}
-                onOpen={() => props.onOpenResult(result)}
-                onEdit={() => beginEdit(item)}
-                onDelete={() => remove(item)}
-              />
-            );
-          })
-        ) : (
-          <EmptyRecordList text="No state items recorded." />
-        )}
-      </section>
-    </div>
-  );
-}
-
-function ContextPane(props: {
-  snapshot: ProjectSnapshot | null;
-  startDir: string;
-  reduceMotion: boolean;
-  onSelectResult: (result: SearchResult) => void;
-  onOpenResult: (result: SearchResult) => void;
-  onMemoryChanged: () => Promise<ProjectSnapshot>;
-}) {
-  const [documents, setDocuments] = useState<ContextSummary[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [editing, setEditing] = useState<ContextSummary | null>(null);
-  const [editTitle, setEditTitle] = useState("");
-  const [editScope, setEditScope] = useState("");
-  const [editCategory, setEditCategory] = useState("reference");
-  const [editContent, setEditContent] = useState("");
-  const [loadingEdit, setLoadingEdit] = useState(false);
-  const [saving, setSaving] = useState(false);
-
-  async function load() {
-    setLoading(true);
-    setError(null);
-    try {
-      setDocuments(await listProjectContext({ startDir: props.startDir }));
-    } catch (listError) {
-      setError(String(listError));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    load();
-  }, [props.startDir, props.snapshot]);
-
-  async function remove(document: ContextSummary) {
-    if (!(await confirmDialog(`Delete context "${document.title}"?`, { okLabel: "Delete" }))) return;
-    setMessage(null);
-    setError(null);
-    try {
-      const result = await deleteMemoryRecord({
-        startDir: props.startDir,
-        recordType: "context",
-        id: document.key,
-      });
-      setDocuments((current) => current.filter((candidate) => candidate.key !== document.key));
-      setMessage(result.message);
-      await props.onMemoryChanged();
-    } catch (deleteError) {
-      setError(String(deleteError));
-    }
-  }
-
-  async function beginEdit(document: ContextSummary) {
-    setLoadingEdit(true);
-    setEditing(document);
-    setEditTitle(document.title);
-    setEditScope(document.scope);
-    setEditCategory(document.category);
-    setEditContent("");
-    setMessage(null);
-    setError(null);
-    try {
-      const detail = await getMemoryRecord({
-        startDir: props.startDir,
-        recordType: "context",
-        id: document.key,
-        scope: document.scope,
-      });
-      setEditContent(detail.body);
-    } catch (detailError) {
-      setError(String(detailError));
-    } finally {
-      setLoadingEdit(false);
-    }
-  }
-
-  async function saveEdit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!editing || !editTitle.trim() || !editContent.trim() || saving) return;
-    setSaving(true);
-    setMessage(null);
-    setError(null);
-    try {
-      const result = await updateMemoryRecord({
-        startDir: props.startDir,
-        recordType: "context",
-        id: editing.key,
-        title: editTitle,
-        scope: editScope,
-        category: editCategory,
-        content: editContent,
-      });
-      setMessage(result.message);
-      setEditing(null);
-      await load();
-      await props.onMemoryChanged();
-    } catch (editError) {
-      setError(String(editError));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <div className="view-stack">
-      <MemoryListHeader
-        title="Context"
-        icon={FileText}
-        loading={loading}
-        onRefresh={load}
-      />
-      {message ? <section className="notice compact good">{message}</section> : null}
-      {error ? (
-        <section className="notice compact">
-          <AlertTriangle size={16} />
-          <span>{error}</span>
-        </section>
-      ) : null}
-      {editing ? (
-        <form className="inline-edit-form" onSubmit={saveEdit}>
-          <ListHeading title={`Edit ${editing.key}`} icon={Pencil} />
-          <label>
-            <span>Title</span>
-            <input value={editTitle} onChange={(event) => setEditTitle(event.target.value)} />
-          </label>
-          <div className="metadata-grid">
-            <label>
-              <span>Category</span>
-              <select value={editCategory} onChange={(event) => setEditCategory(event.target.value)}>
-                {contextCategories.map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Scope</span>
-              <input value={editScope} onChange={(event) => setEditScope(event.target.value)} />
-            </label>
-          </div>
-          <label>
-            <span>Content</span>
-            <textarea
-              value={editContent}
-              onChange={(event) => setEditContent(event.target.value)}
-              placeholder={loadingEdit ? "Loading context" : "Trusted context content"}
-            />
-          </label>
-          <div className="form-actions">
-            <button type="button" className="button secondary" onClick={() => setEditing(null)}>
-              Cancel
-            </button>
-            <button className="button primary" disabled={saving || loadingEdit || !editTitle.trim() || !editContent.trim()}>
-              Save
-            </button>
-          </div>
-        </form>
-      ) : null}
-      <section className="record-list">
-        {documents.length ? (
-          documents.map((document, index) => {
-            const result = contextToSearchResult(document);
-            return (
-              <MemoryRecordRow
-                key={document.key}
-                type="context"
-                title={document.title}
-                body={`${document.category} context, version ${document.version}`}
-                scope={document.scope}
-                meta={document.key}
-                index={index}
-                reduceMotion={props.reduceMotion}
-                onSelect={() => props.onSelectResult(result)}
-                onOpen={() => props.onOpenResult(result)}
-                onEdit={() => beginEdit(document)}
-                onDelete={() => remove(document)}
-              />
-            );
-          })
-        ) : (
-          <EmptyRecordList text="No context documents recorded." />
         )}
       </section>
     </div>
@@ -3877,7 +2366,6 @@ function Inspector(props: {
   recordDetailLoading: boolean;
   recordDetailError: string | null;
   onOpenDetail: () => void;
-  onOpenGraph: (entityId: string) => void;
   onClose: () => void;
   reduceMotion: boolean;
 }) {
@@ -3913,9 +2401,6 @@ function Inspector(props: {
           <code>{selectedId}</code>
           <div className="inspector-actions">
             <button onClick={props.onOpenDetail}>Detail</button>
-            {detail?.focus_entity_id ? (
-              <button onClick={() => props.onOpenGraph(detail.focus_entity_id ?? "")}>Graph</button>
-            ) : null}
             {selectedId ? <button onClick={() => navigator.clipboard?.writeText(selectedId)}>Copy ID</button> : null}
           </div>
         </section>
@@ -4059,31 +2544,6 @@ function PromptModal(props: { config: PromptConfig; reduceMotion: boolean; onClo
   );
 }
 
-function Metric({ label, value }: { label: string; value: number }) {
-  return (
-    <motion.div className="metric" layout whileHover={{ y: -1 }} transition={transition.quick}>
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </motion.div>
-  );
-}
-
-function EntityList(props: {
-  title: string;
-  icon: typeof History;
-  rows: string[];
-  meta: string;
-}) {
-  return (
-    <section className="dense-list">
-      <ListHeading title={props.title} icon={props.icon} />
-      {props.rows.map((row) => (
-        <Row key={row} title={row} meta={props.meta} />
-      ))}
-    </section>
-  );
-}
-
 function MemoryListHeader(props: {
   title: string;
   icon: typeof Activity;
@@ -4101,103 +2561,6 @@ function MemoryListHeader(props: {
         <RefreshCcw size={15} className={props.loading ? "spin" : ""} />
       </button>
     </section>
-  );
-}
-
-function MemoryRecordRow(props: {
-  type: string;
-  title: string;
-  body: string;
-  scope: string;
-  meta: string;
-  index: number;
-  reduceMotion: boolean;
-  onSelect: () => void;
-  onOpen: () => void;
-  onEdit?: () => void;
-  onHandoff?: () => void;
-  onComplete?: () => void;
-  onDelete?: () => void;
-  disabled?: boolean;
-}) {
-  return (
-    <motion.article
-      className={`record-list-row ${props.disabled ? "busy" : ""}`}
-      onClick={() => {
-        if (!props.disabled) props.onSelect();
-      }}
-      onDoubleClick={() => {
-        if (!props.disabled) props.onOpen();
-      }}
-      initial={props.reduceMotion ? false : { opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ ...transition.quick, delay: props.reduceMotion ? 0 : props.index * 0.025 }}
-      whileHover={props.reduceMotion ? undefined : { x: 2 }}
-    >
-      <div>
-        <span className="record-type">{props.type}</span>
-        <strong>{props.title}</strong>
-        <p>{props.body}</p>
-        <footer>
-          <code>{props.scope || "global"}</code>
-          <code>{props.meta}</code>
-        </footer>
-      </div>
-      <div className="record-row-actions">
-        {props.onHandoff ? (
-          <button
-            className="icon-button"
-            title={`Handoff ${props.type}`}
-            disabled={props.disabled}
-            onClick={(event) => {
-              event.stopPropagation();
-              props.onHandoff?.();
-            }}
-          >
-            <FileClock size={15} />
-          </button>
-        ) : null}
-        {props.onComplete ? (
-          <button
-            className="icon-button success"
-            title={`Complete ${props.type}`}
-            disabled={props.disabled}
-            onClick={(event) => {
-              event.stopPropagation();
-              props.onComplete?.();
-            }}
-          >
-            <CheckCircle2 size={15} />
-          </button>
-        ) : null}
-        {props.onEdit ? (
-          <button
-            className="icon-button"
-            title={`Edit ${props.type}`}
-            disabled={props.disabled}
-            onClick={(event) => {
-              event.stopPropagation();
-              props.onEdit?.();
-            }}
-          >
-            <Pencil size={15} />
-          </button>
-        ) : null}
-        {props.onDelete ? (
-          <button
-            className="icon-button danger"
-            title={`Delete ${props.type}`}
-            disabled={props.disabled}
-            onClick={(event) => {
-              event.stopPropagation();
-              props.onDelete?.();
-            }}
-          >
-            <Trash2 size={15} />
-          </button>
-        ) : null}
-      </div>
-    </motion.article>
   );
 }
 
@@ -4337,69 +2700,6 @@ function payloadValue(value: unknown): string {
   return "";
 }
 
-function contextToSearchResult(document: ContextSummary): SearchResult {
-  return {
-    record_type: "context",
-    id: document.key,
-    title: document.title,
-    snippet: `${document.category} context, version ${document.version}`,
-    scope: document.scope,
-    score: null,
-  };
-}
-
-function stateToSearchResult(item: StateItem): SearchResult {
-  return {
-    record_type: "state",
-    id: item.key,
-    title: item.title,
-    snippet: `${item.status} priority ${item.priority}${item.owner ? `, owned by ${item.owner}` : ""}`,
-    scope: item.scope,
-    score: null,
-  };
-}
-
-function decisionToSearchResult(decision: DecisionItem): SearchResult {
-  return {
-    record_type: "decision",
-    id: decision.id,
-    title: decision.title,
-    snippet: decision.reasoning || decision.status,
-    scope: decision.scope,
-    score: null,
-  };
-}
-
-function relationToSearchResult(relation: GraphRelation): SearchResult {
-  return {
-    record_type: "relation",
-    id: relation.id,
-    title: `${relation.from_entity} ${relation.relation} ${relation.to_entity}`,
-    snippet: `weight ${relation.weight.toFixed(2)}, confidence ${relation.confidence.toFixed(2)}, source ${relation.source_type}`,
-    scope: "",
-    score: null,
-  };
-}
-
-function sessionToSearchResult(session: SessionLogItem): SearchResult {
-  return {
-    record_type: "session",
-    id: session.id,
-    title: session.goal || session.id,
-    snippet: sessionBody(session),
-    scope: session.scope,
-    score: null,
-  };
-}
-
-function sessionBody(session: SessionLogItem): string {
-  if (session.summary) return session.summary;
-  if (session.handoff_context) return session.handoff_context.split("\n").find((line) => line.trim()) || "Handoff ready.";
-  if (session.remaining.length) return `Remaining: ${session.remaining.slice(0, 3).join(", ")}`;
-  if (session.accomplishments.length) return `Accomplished: ${session.accomplishments.slice(0, 3).join(", ")}`;
-  return `${session.session_type} session is ${session.status}`;
-}
-
 function ListHeading({ title, icon: Icon }: { title: string; icon: typeof Activity }) {
   return (
     <header className="list-heading">
@@ -4428,22 +2728,3 @@ function Setting({ label, value, mono = false }: { label: string; value: string;
   );
 }
 
-function Segmented(props: {
-  value: string;
-  options: string[];
-  onChange: (value: string) => void;
-}) {
-  return (
-    <div className="segmented">
-      {props.options.map((option) => (
-        <button
-          key={option}
-          className={props.value === option ? "active" : ""}
-          onClick={() => props.onChange(option)}
-        >
-          {option}
-        </button>
-      ))}
-    </div>
-  );
-}

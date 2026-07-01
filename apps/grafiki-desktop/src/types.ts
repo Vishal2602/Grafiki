@@ -1,19 +1,9 @@
 export type PaneKind =
-  | "overview"
-  | "search"
   | "chat"
   | "terminal"
-  | "graph"
   | "candidates"
-  | "relations"
-  | "sessions"
-  | "state"
-  | "decisions"
-  | "context"
   | "settings"
-  | "detail"
-  | "capture"
-  | "agent";
+  | "detail";
 
 export type SearchMode = "keyword" | "semantic" | "hybrid";
 
