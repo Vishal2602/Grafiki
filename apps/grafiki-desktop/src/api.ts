@@ -12,6 +12,7 @@ import type {
   CaptureConfigUpdateInput,
   CaptureMemoryInput,
   CaptureMemoryResult,
+  ChatReply,
   ContextSummary,
   DaemonStartResult,
   DaemonStatus,
@@ -116,6 +117,54 @@ export async function searchProjectMemory(input: {
       scope: input.scope ?? "",
       limit: input.limit ?? 20,
       recordType: input.recordType ?? "all",
+    },
+  });
+}
+
+export async function chatWithMemory(input: {
+  startDir?: string;
+  question: string;
+  scope?: string;
+  limit?: number;
+  model?: string;
+  ollamaUrl?: string;
+}): Promise<ChatReply> {
+  if (!hasTauri()) {
+    const hits = mockSearchResults.filter((result) =>
+      `${result.title} ${result.snippet}`.toLowerCase().includes(input.question.toLowerCase()),
+    );
+    if (hits.length === 0) {
+      return {
+        question: input.question,
+        scope: input.scope ?? "",
+        answer: "I don't have anything in your memory about that yet.",
+        citations: [],
+        used_memory: false,
+      };
+    }
+    return {
+      question: input.question,
+      scope: input.scope ?? "",
+      answer: `Based on your memory:\n${hits.map((h, i) => `[${i + 1}] ${h.snippet}`).join("\n")}`,
+      citations: hits.map((h, i) => ({
+        index: i + 1,
+        record_type: h.record_type,
+        id: h.id,
+        title: h.title,
+        snippet: h.snippet,
+      })),
+      used_memory: true,
+    };
+  }
+
+  return invoke<ChatReply>("chat_with_memory", {
+    request: {
+      question: input.question,
+      startDir: input.startDir ?? "",
+      scope: input.scope ?? "",
+      limit: input.limit ?? 8,
+      model: input.model ?? null,
+      ollamaUrl: input.ollamaUrl ?? null,
     },
   });
 }

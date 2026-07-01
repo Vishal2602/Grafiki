@@ -12,6 +12,7 @@ const LAYOUT_VERSION = 2;
 const PANE_KINDS: ReadonlySet<string> = new Set([
   "overview",
   "search",
+  "chat",
   "graph",
   "candidates",
   "relations",

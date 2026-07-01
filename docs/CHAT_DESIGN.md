@@ -1,6 +1,14 @@
 # DESIGN: Grafiki — "Chat with your memory" (local, grounded RAG)
 
-**Status:** Phases 1–2 DONE (chat core + CLI + MCP + local-model provider); Phases 3–4 proposed.
+**Status:** Phases 1–2 DONE + Phase 3 desktop chat pane DONE; the app-bundled runtime and Phase 4 proposed.
+**Update 2026-07-01 (Phase 3 UI):** the **desktop chat pane** shipped — a `chat_with_memory` Tauri
+command (`apps/grafiki-desktop/src-tauri/src/lib.rs`, same Ollama+extractive-fallback logic as the
+CLI), an `chatWithMemory` API binding, and a `ChatPane` React view (new `"chat"` nav item) that shows
+grounded answers, clickable **citations** (open the cited record), a "Use local AI" toggle
+(default `gemma3:1b`), and the abstain/injection notices. Verified: `cargo check`/clippy clean +
+frontend `tsc && vite build` clean (live rendering is user-verified). REMAINING for the full
+self-contained vision: an app-bundled model runtime (download the .gguf through the setup UI, no
+separate Ollama) — implements the same `ChatProvider` seam.
 **Update 2026-07-01 (Phase 2):** local-model generation shipped via **Ollama** —
 `chat::build_grounded_messages` (the anti-hallucination system prompt: answer only from the numbered
 memories, cite `[n]`, abstain with `NO_MEMORY_ANSWER`, treat memories as untrusted data) +

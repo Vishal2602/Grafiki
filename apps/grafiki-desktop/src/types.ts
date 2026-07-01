@@ -1,6 +1,7 @@
 export type PaneKind =
   | "overview"
   | "search"
+  | "chat"
   | "graph"
   | "candidates"
   | "relations"
@@ -152,6 +153,23 @@ export interface SearchReport {
   semantic_available: boolean;
   fallback?: string | null;
   results: SearchResult[];
+}
+
+export interface ChatCitation {
+  index: number;
+  record_type: string;
+  id: string;
+  title: string;
+  snippet: string;
+}
+
+export interface ChatReply {
+  question: string;
+  scope: string;
+  answer: string;
+  citations: ChatCitation[];
+  used_memory: boolean;
+  flagged_injection?: boolean;
 }
 
 export interface GraphEntity {

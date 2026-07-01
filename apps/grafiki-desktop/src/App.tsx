@@ -21,6 +21,7 @@ import {
   GitBranch,
   History,
   LayoutDashboard,
+  MessageSquare,
   Network,
   PanelRight,
   Pencil,
@@ -41,6 +42,7 @@ import {
   approveCandidate,
   autoCaptureMemory,
   bulkReviewCandidates,
+  chatWithMemory,
   captureScreenSnapshot,
   captureMemory,
   deleteMemoryRecord,
@@ -94,6 +96,7 @@ import type {
   CaptureSourceConfig,
   CaptureMemoryResult,
   CaptureType,
+  ChatReply,
   ContextSummary,
   DaemonStatus,
   DecisionItem,
@@ -119,6 +122,7 @@ const PROJECT_ROOT_KEY = "grafiki.desktop.projectRoot";
 const navItems: Array<{ kind: PaneKind; label: string; hotkey: string; icon: typeof LayoutDashboard }> = [
   { kind: "overview", label: "Overview", hotkey: "O", icon: LayoutDashboard },
   { kind: "search", label: "Search", hotkey: "/", icon: SearchIcon },
+  { kind: "chat", label: "Chat", hotkey: "K", icon: MessageSquare },
   { kind: "graph", label: "Graph", hotkey: "G", icon: Network },
   { kind: "candidates", label: "Review", hotkey: "V", icon: ShieldQuestion },
   { kind: "agent", label: "Agent Activity", hotkey: "A", icon: RadioTower },
@@ -824,6 +828,15 @@ function MemoryPane(props: {
             onMemoryChanged={props.onMemoryChanged}
           />
         ) : null}
+        {pane.kind === "chat" ? (
+          <ChatPane
+            pane={pane}
+            snapshot={props.snapshot}
+            projectRoot={props.projectRoot}
+            onUpdate={props.onUpdate}
+            onOpenResult={props.onOpenResult}
+          />
+        ) : null}
         {pane.kind === "graph" ? (
           <GraphPane pane={pane} snapshot={props.snapshot} startDir={props.projectRoot} onUpdate={props.onUpdate} />
         ) : null}
@@ -981,6 +994,188 @@ function OverviewPane({ snapshot }: { snapshot: ProjectSnapshot | null }) {
           ),
         )}
       </motion.section>
+    </div>
+  );
+}
+
+function ChatPane(props: {
+  pane: PaneState;
+  snapshot: ProjectSnapshot | null;
+  projectRoot: string;
+  onUpdate: (patch: Partial<PaneState>) => void;
+  onOpenResult: (result: SearchResult) => void;
+}) {
+  const [question, setQuestion] = useState("");
+  const [scope, setScope] = useState(props.pane.scope ?? props.snapshot?.scope ?? "");
+  const [useModel, setUseModel] = useState(false);
+  const [model, setModel] = useState("gemma3:1b");
+  const [turns, setTurns] = useState<
+    Array<{ question: string; reply: ChatReply | null; error: string | null }>
+  >([]);
+  const [sending, setSending] = useState(false);
+
+  async function ask() {
+    const q = question.trim();
+    if (!q || sending) return;
+    setSending(true);
+    setQuestion("");
+    setTurns((prev) => [...prev, { question: q, reply: null, error: null }]);
+    props.onUpdate({ title: `Chat: ${q}`, scope });
+    try {
+      const reply = await chatWithMemory({
+        startDir: props.projectRoot,
+        question: q,
+        scope,
+        model: useModel ? model : undefined,
+      });
+      setTurns((prev) =>
+        prev.map((turn, index) => (index === prev.length - 1 ? { ...turn, reply } : turn)),
+      );
+    } catch (chatError) {
+      setTurns((prev) =>
+        prev.map((turn, index) =>
+          index === prev.length - 1 ? { ...turn, error: String(chatError) } : turn,
+        ),
+      );
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return (
+    <div
+      className="view-stack chat-view"
+      style={{ display: "flex", flexDirection: "column", height: "100%", gap: 12 }}
+    >
+      <div
+        style={{
+          flex: 1,
+          overflowY: "auto",
+          display: "flex",
+          flexDirection: "column",
+          gap: 16,
+        }}
+      >
+        {turns.length === 0 ? (
+          <p className="muted" style={{ margin: "auto", textAlign: "center", maxWidth: 380 }}>
+            Ask your memory anything. Answers are built only from what Grafiki has stored — with
+            sources — and it tells you honestly when it doesn't know.
+          </p>
+        ) : null}
+        {turns.map((turn, index) => (
+          <div key={index} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div
+              style={{
+                alignSelf: "flex-end",
+                background: "rgba(255,255,255,0.06)",
+                padding: "8px 12px",
+                borderRadius: 10,
+                maxWidth: "80%",
+              }}
+            >
+              {turn.question}
+            </div>
+            <div style={{ alignSelf: "flex-start", maxWidth: "92%" }}>
+              {turn.reply ? (
+                <>
+                  <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.5 }}>{turn.reply.answer}</div>
+                  {turn.reply.citations.length > 0 ? (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+                      {turn.reply.citations.map((citation) => (
+                        <button
+                          key={citation.index}
+                          title={citation.snippet}
+                          onClick={() =>
+                            props.onOpenResult({
+                              record_type: citation.record_type,
+                              id: citation.id,
+                              title: citation.title,
+                              snippet: citation.snippet,
+                              scope,
+                            })
+                          }
+                          style={{
+                            fontSize: 12,
+                            padding: "3px 8px",
+                            borderRadius: 999,
+                            border: "1px solid rgba(255,255,255,0.15)",
+                            background: "transparent",
+                            cursor: "pointer",
+                          }}
+                        >
+                          [{citation.index}] {citation.title || citation.record_type}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                  {turn.reply.flagged_injection ? (
+                    <p className="muted" style={{ marginTop: 6, fontSize: 12 }}>
+                      ⚠ Some retrieved memory looks like it contains instructions — treated as data,
+                      not commands.
+                    </p>
+                  ) : null}
+                </>
+              ) : turn.error ? (
+                <p style={{ color: "var(--danger, #ff6b6b)" }}>{turn.error}</p>
+              ) : (
+                <p className="muted">Thinking…</p>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <div className="toolbar-row" style={{ gap: 12, alignItems: "center" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <input
+              type="checkbox"
+              checked={useModel}
+              onChange={(event) => setUseModel(event.target.checked)}
+            />
+            <span>Use local AI</span>
+          </label>
+          {useModel ? (
+            <input
+              value={model}
+              onChange={(event) => setModel(event.target.value)}
+              placeholder="gemma3:1b"
+              style={{ width: 150 }}
+              title="Local model served by Ollama (e.g. gemma3:1b). Needs Ollama running."
+            />
+          ) : null}
+          <label className="compact-select" style={{ marginLeft: "auto" }}>
+            <span>Scope</span>
+            <input
+              value={scope}
+              onChange={(event) => setScope(event.target.value)}
+              placeholder="global or project/module"
+            />
+          </label>
+        </div>
+        <div className="search-box">
+          <MessageSquare size={17} />
+          <input
+            value={question}
+            onChange={(event) => setQuestion(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                void ask();
+              }
+            }}
+            placeholder="Ask your memory…"
+            autoComplete="off"
+          />
+          <button
+            onClick={() => void ask()}
+            disabled={sending || !question.trim()}
+            style={{ padding: "6px 14px" }}
+          >
+            {sending ? "…" : "Ask"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

@@ -10,7 +10,8 @@ use std::{
 use tauri::{AppHandle, Manager, RunEvent, State};
 
 use grafiki_core::{
-    add_context, approve_candidate, bulk_review_candidates, delete_context, delete_decision,
+    add_context, approve_candidate, bulk_review_candidates, chat, chat_with_provider,
+    delete_context, delete_decision,
     delete_entity, delete_observation, delete_relation, delete_state, edit_candidate,
     export_memory, generate_report, get_capture_status, get_context, get_embedding_status,
     get_graph, get_status, handoff_session, import_agent_transcripts, import_memory,
@@ -21,7 +22,8 @@ use grafiki_core::{
     start_capture_session, start_session, stop_capture_session, update_capture_config,
     update_context, update_decision, update_entity, update_observation, update_relation,
     update_session, upsert_state, AddContextOptions, AgentQueryLogItem,
-    AgentTranscriptImportReport, ApproveCandidateOptions, BulkCandidateReviewOptions,
+    AgentTranscriptImportReport, ApproveCandidateOptions, ChatOptions, ChatReply,
+    OllamaProvider, BulkCandidateReviewOptions,
     BulkCandidateReviewReport, CandidateMutationReport, CandidateOrder, CaptureCandidateReport,
     CaptureConfigOptions, CaptureConfigReport, CaptureEvent, CaptureEventReport,
     CaptureSessionReport, CaptureSourceUpdates, CaptureStatusOptions, CaptureStatusReport,
@@ -75,6 +77,17 @@ struct SnapshotRequest {
 struct InitProjectRequest {
     project_dir: String,
     project_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatRequest {
+    start_dir: Option<String>,
+    question: String,
+    scope: Option<String>,
+    limit: Option<usize>,
+    model: Option<String>,
+    ollama_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -659,6 +672,32 @@ fn search_project_memory(request: SearchRequest) -> Result<SearchReport, String>
         temporal_weight: 0.0,
     })
     .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn chat_with_memory(request: ChatRequest) -> Result<ChatReply, String> {
+    let options = ChatOptions {
+        project_name: None,
+        start_dir: resolve_start_dir(request.start_dir),
+        grafiki_home: None,
+        question: request.question,
+        scope: request.scope.unwrap_or_default(),
+        limit: request.limit.unwrap_or(8),
+        temporal_weight: 0.0,
+    };
+    // With a local model, phrase a conversational answer via Ollama; if it's
+    // unreachable, fall back to the deterministic extractive answer so the user
+    // still gets their memory (retrieval already succeeded).
+    match clean_optional(request.model) {
+        Some(model) => {
+            let provider = OllamaProvider::new(clean_optional(request.ollama_url), Some(model));
+            match chat_with_provider(options.clone(), &provider) {
+                Ok(reply) => Ok(reply),
+                Err(_) => chat(options).map_err(|error| error.to_string()),
+            }
+        }
+        None => chat(options).map_err(|error| error.to_string()),
+    }
 }
 
 #[tauri::command]
@@ -2171,6 +2210,7 @@ pub fn run() {
             get_project_snapshot,
             initialize_project,
             search_project_memory,
+            chat_with_memory,
             start_grafiki_session,
             end_grafiki_session,
             handoff_grafiki_session,
