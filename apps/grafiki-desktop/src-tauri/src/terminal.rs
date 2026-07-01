@@ -172,6 +172,17 @@ pub struct AttachReply {
     pub found: bool,
     pub exited: bool,
     pub cwd: String,
+    /// A Grafiki capture session is recording this terminal.
+    pub capturing: bool,
+}
+
+/// What `terminal_open` (and a revive's spawn) tells the UI.
+#[derive(serde::Serialize)]
+pub struct OpenReply {
+    pub id: String,
+    /// A Grafiki capture session is recording this terminal (`false` when the
+    /// folder isn't an initialized Grafiki project).
+    pub capturing: bool,
 }
 
 /// What `terminal_revive` tells the UI about a disk-restored session.
@@ -180,6 +191,7 @@ pub struct ReviveReply {
     pub found: bool,
     pub launch: String,
     pub cwd: String,
+    pub capturing: bool,
 }
 
 fn pty_size(rows: u16, cols: u16) -> PtySize {
@@ -219,7 +231,7 @@ pub fn terminal_open(
     rows: u16,
     cols: u16,
     on_output: Channel<Vec<u8>>,
-) -> Result<String, String> {
+) -> Result<OpenReply, String> {
     spawn_session(
         &registry, id, cwd, command, launch, rows, cols, on_output, None,
     )
@@ -243,6 +255,7 @@ pub fn terminal_revive(
             found: false,
             launch: String::new(),
             cwd: String::new(),
+            capturing: false,
         });
     };
     let mut preamble = Vec::new();
@@ -253,7 +266,7 @@ pub fn terminal_revive(
         preamble.extend_from_slice(descriptor.tail.replace('\n', "\r\n").as_bytes());
         preamble.extend_from_slice(b"\r\n\x1b[2m\xe2\x94\x80\xe2\x94\x80 end of previous session \xe2\x94\x80\xe2\x94\x80 resuming\x1b[0m\r\n");
     }
-    spawn_session(
+    let opened = spawn_session(
         &registry,
         id,
         descriptor.cwd.clone(),
@@ -268,6 +281,7 @@ pub fn terminal_revive(
         found: true,
         launch: descriptor.launch,
         cwd: descriptor.cwd,
+        capturing: opened.capturing,
     })
 }
 
@@ -283,13 +297,14 @@ fn spawn_session(
     cols: u16,
     on_output: Channel<Vec<u8>>,
     preamble: Option<Vec<u8>>,
-) -> Result<String, String> {
+) -> Result<OpenReply, String> {
     {
         let mut sessions = registry.0.lock().unwrap();
         if let Some(existing) = sessions.get(&id) {
             if !existing.shared.lock().unwrap().exited {
                 attach_channel(&existing.shared, on_output);
-                return Ok(id);
+                let capturing = existing.capture_id.is_some();
+                return Ok(OpenReply { id, capturing });
             }
             // Exited leftover under this id: drop it and spawn fresh below.
             let stale = sessions.remove(&id);
@@ -299,6 +314,16 @@ fn spawn_session(
             }
         }
     }
+
+    // No project folder configured yet → the user's home dir, never "" (an
+    // empty cwd makes the PTY spawn fail or land in an undefined directory).
+    let cwd = if cwd.trim().is_empty() {
+        std::env::var_os("HOME")
+            .map(|home| home.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".to_owned())
+    } else {
+        cwd
+    };
 
     let pair = native_pty_system()
         .openpty(pty_size(rows, cols))
@@ -432,6 +457,7 @@ fn spawn_session(
     // producing output can be revived into its folder.
     persist_tail(&id, &cwd, &launch, &shared);
 
+    let capturing = capture_id.is_some();
     registry.0.lock().unwrap().insert(
         id.clone(),
         TerminalSession {
@@ -444,7 +470,7 @@ fn spawn_session(
             shared,
         },
     );
-    Ok(id)
+    Ok(OpenReply { id, capturing })
 }
 
 /// Reattach the UI to an existing session: replay its scrollback through
@@ -464,12 +490,14 @@ pub fn terminal_attach(
                 found: true,
                 exited: !alive,
                 cwd: session.project_root.clone(),
+                capturing: session.capture_id.is_some(),
             })
         }
         None => Ok(AttachReply {
             found: false,
             exited: false,
             cwd: String::new(),
+            capturing: false,
         }),
     }
 }

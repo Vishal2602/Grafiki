@@ -702,6 +702,14 @@ fn chat_with_memory(request: ChatRequest) -> Result<ChatReply, String> {
     }
 }
 
+/// Models the local Ollama server has pulled, so the UI can offer real choices
+/// (and never default to a model the user doesn't have). Empty when Ollama is
+/// not running — the UI treats that as "local AI unavailable", not an error.
+#[tauri::command]
+fn list_local_models() -> Vec<String> {
+    grafiki_core::list_ollama_models(None).unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ExtractSessionRequest {
@@ -2282,6 +2290,7 @@ pub fn run() {
             terminal::terminal_detach,
             terminal::terminal_revive,
             extract_session_memory,
+            list_local_models,
             terminal::terminal_write,
             terminal::terminal_resize,
             terminal::terminal_close,

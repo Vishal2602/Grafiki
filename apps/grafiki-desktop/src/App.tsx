@@ -42,6 +42,7 @@ import {
   editCandidate,
   exportMemoryToFile,
   extractSessionMemory,
+  listLocalModels,
   getCaptureConfig,
   getDaemonStatus,
   getMemoryRecord,
@@ -639,6 +640,9 @@ function TerminalPane(props: { projectRoot: string }) {
   );
   const [error, setError] = useState<string | null>(null);
   const [ended, setEnded] = useState(false);
+  // null = connecting; then the backend's honest answer (false = the folder
+  // isn't an initialized Grafiki project, so nothing is being recorded).
+  const [capturing, setCapturing] = useState<boolean | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   // Set when the launcher just created `session`, so the effect spawns instead
   // of attaching. A ref (not state): StrictMode remounts must attach, not respawn.
@@ -702,7 +706,7 @@ function TerminalPane(props: { projectRoot: string }) {
         if (spawnRef.current) {
           spawnRef.current = false;
           // Spawn the login shell (full PATH); the agent is typed in after.
-          await invoke("terminal_open", {
+          const opened = await invoke<{ id: string; capturing: boolean }>("terminal_open", {
             id,
             cwd: props.projectRoot,
             command: "",
@@ -712,24 +716,29 @@ function TerminalPane(props: { projectRoot: string }) {
             onOutput: channel,
           });
           if (!cancelled) {
+            setCapturing(opened.capturing);
             scheduleType(launch);
           }
           return;
         }
-        const reply = await invoke<{ found: boolean; exited: boolean; cwd: string }>(
-          "terminal_attach",
-          { id, onOutput: channel },
-        );
+        const reply = await invoke<{
+          found: boolean;
+          exited: boolean;
+          cwd: string;
+          capturing: boolean;
+        }>("terminal_attach", { id, onOutput: channel });
         if (cancelled) {
           return;
         }
         if (!reply.found) {
           // App relaunched, live PTY is gone: revive from the disk descriptor —
           // same folder, previous output replayed, agent resumed.
-          const revive = await invoke<{ found: boolean; launch: string; cwd: string }>(
-            "terminal_revive",
-            { id, rows: term.rows, cols: term.cols, onOutput: channel },
-          );
+          const revive = await invoke<{
+            found: boolean;
+            launch: string;
+            cwd: string;
+            capturing: boolean;
+          }>("terminal_revive", { id, rows: term.rows, cols: term.cols, onOutput: channel });
           if (cancelled) {
             return;
           }
@@ -740,10 +749,12 @@ function TerminalPane(props: { projectRoot: string }) {
             setSession(null);
             return;
           }
+          setCapturing(revive.capturing);
           // Resume the agent's own session where supported; otherwise relaunch it.
           scheduleType(revive.launch === "claude" ? "claude --continue" : revive.launch);
           return;
         }
+        setCapturing(reply.capturing);
         if (reply.exited) {
           setEnded(true);
           return;
@@ -799,6 +810,7 @@ function TerminalPane(props: { projectRoot: string }) {
     setSession(null);
     setEnded(false);
     setError(null);
+    setCapturing(null);
   };
 
   const startSession = (cmd: string) => {
@@ -808,6 +820,7 @@ function TerminalPane(props: { projectRoot: string }) {
     spawnRef.current = true;
     setEnded(false);
     setError(null);
+    setCapturing(null);
     setSession(next);
   };
 
@@ -846,7 +859,9 @@ function TerminalPane(props: { projectRoot: string }) {
       <div className="toolbar-row" style={{ alignItems: "center", gap: 10 }}>
         <span className="muted" style={{ fontSize: 12 }}>
           {session.launch ? `Running: ${session.launch}` : "Shell"} ·{" "}
-          {props.projectRoot || "this project"} · capturing
+          {props.projectRoot || "this project"}
+          {capturing === true ? " · capturing" : ""}
+          {capturing === false ? " · not capturing — initialize this folder in Settings" : ""}
           {ended ? " · session ended" : ""}
         </span>
         <button style={{ marginLeft: "auto", padding: "4px 10px" }} onClick={endSession}>
@@ -873,10 +888,37 @@ function ChatPane(props: {
   const [scope, setScope] = useState(props.pane.scope ?? props.snapshot?.scope ?? "");
   const [useModel, setUseModel] = useState(false);
   const [model, setModel] = useState("gemma3:1b");
+  // null = still probing Ollama; [] = Ollama down or no models pulled.
+  const [localModels, setLocalModels] = useState<string[] | null>(null);
   const [turns, setTurns] = useState<
     Array<{ question: string; reply: ChatReply | null; error: string | null }>
   >([]);
   const [sending, setSending] = useState(false);
+
+  // Offer the models the user actually HAS: keep the default only if it's
+  // installed, otherwise switch to the first installed model. Never leave the
+  // field pointing at a model that would silently fail.
+  useEffect(() => {
+    let cancelled = false;
+    listLocalModels()
+      .then((models) => {
+        if (cancelled) {
+          return;
+        }
+        setLocalModels(models);
+        if (models.length > 0 && !models.includes("gemma3:1b")) {
+          setModel((current) => (models.includes(current) ? current : models[0]));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setLocalModels([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   async function ask() {
     const q = question.trim();
@@ -1000,13 +1042,26 @@ function ChatPane(props: {
             <span>Use local AI</span>
           </label>
           {useModel ? (
-            <input
-              value={model}
-              onChange={(event) => setModel(event.target.value)}
-              placeholder="gemma3:1b"
-              style={{ width: 150 }}
-              title="Local model served by Ollama (e.g. gemma3:1b). Needs Ollama running."
-            />
+            <>
+              <input
+                value={model}
+                onChange={(event) => setModel(event.target.value)}
+                placeholder="gemma3:1b"
+                list="grafiki-local-models"
+                style={{ width: 170 }}
+                title="Local model served by Ollama. Suggestions are the models you have installed."
+              />
+              <datalist id="grafiki-local-models">
+                {(localModels ?? []).map((name) => (
+                  <option key={name} value={name} />
+                ))}
+              </datalist>
+              {localModels !== null && localModels.length === 0 ? (
+                <span className="muted" style={{ fontSize: 12 }}>
+                  Ollama not reachable — answers stay extractive
+                </span>
+              ) : null}
+            </>
           ) : null}
           <label className="compact-select" style={{ marginLeft: "auto" }}>
             <span>Scope</span>

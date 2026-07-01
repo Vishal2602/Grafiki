@@ -169,6 +169,14 @@ export async function chatWithMemory(input: {
   });
 }
 
+/// Models the local Ollama server has pulled ([] when Ollama isn't running).
+export async function listLocalModels(): Promise<string[]> {
+  if (!hasTauri()) {
+    return [];
+  }
+  return invoke<string[]>("list_local_models");
+}
+
 /// One "Granola" tick: extract durable memory from unprocessed session events
 /// (hosted-terminal output, imported transcripts) into Review candidates.
 /// Returns null when another pass is already running (or in browser preview).
