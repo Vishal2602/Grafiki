@@ -4744,6 +4744,88 @@ pub fn extract_capture_memory(options: ExtractCaptureOptions) -> Result<CaptureE
     })
 }
 
+/// Options for [`run_capture_watch`] — one pass of the passive "Granola for
+/// agents" watcher.
+pub struct RunCaptureWatchOptions {
+    pub project_name: Option<String>,
+    pub start_dir: PathBuf,
+    pub grafiki_home: Option<PathBuf>,
+    /// Agent whose transcript to read (default `claude-code`).
+    pub agent: String,
+    /// Explicit transcript path; `None` auto-discovers **this project's** dir
+    /// (scoped — not every project under `~/.claude/projects`).
+    pub input: Option<PathBuf>,
+    pub scope: String,
+    pub limit: usize,
+    pub model: Option<String>,
+    pub ollama_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureWatchReport {
+    pub events_imported: usize,
+    pub proposed: usize,
+    pub message: String,
+}
+
+/// One pass of the passive "Granola for agents" watcher: import new transcript
+/// activity for THIS project (incremental — per-source dedup skips already-seen
+/// events) and, only if something new arrived, run the local-model extraction to
+/// propose durable memory for review. No model call when nothing is new. This is
+/// the reusable tick shared by the CLI (`grafiki capture extract`) and the
+/// background daemon worker (`spawn_capture_worker`). It NEVER trusts anything —
+/// extracted items land in the candidate review gate.
+pub fn run_capture_watch(options: RunCaptureWatchOptions) -> Result<CaptureWatchReport> {
+    // Scope Claude Code auto-discovery to THIS project's transcript directory, so
+    // the watcher never imports other projects' sessions.
+    let input = match (options.input, options.agent.as_str()) {
+        (Some(path), _) => Some(path),
+        (None, "claude-code") => crate::transcript::claude_code_project_dir(&options.start_dir),
+        (None, _) => None,
+    };
+
+    let import = crate::transcript::import_agent_transcripts(
+        crate::transcript::ImportAgentTranscriptsOptions {
+            project_name: options.project_name.clone(),
+            start_dir: options.start_dir.clone(),
+            grafiki_home: options.grafiki_home.clone(),
+            agent: options.agent,
+            input,
+            scope: options.scope.clone(),
+            limit: options.limit,
+            summarize: false,
+        },
+    )?;
+
+    if import.events_imported == 0 {
+        return Ok(CaptureWatchReport {
+            events_imported: 0,
+            proposed: 0,
+            message: "No new session activity to capture.".to_owned(),
+        });
+    }
+
+    let extract = extract_capture_memory(ExtractCaptureOptions {
+        project_name: options.project_name,
+        start_dir: options.start_dir,
+        grafiki_home: options.grafiki_home,
+        capture_id: Some(import.capture_id.clone()),
+        scope: options.scope,
+        limit: options.limit,
+        model: options.model,
+        ollama_url: options.ollama_url,
+    })?;
+
+    Ok(CaptureWatchReport {
+        events_imported: import.events_imported,
+        proposed: extract.proposed,
+        message: format!(
+            "Captured {} new event(s); proposed {} memory candidate(s) for review.",
+            import.events_imported, extract.proposed
+        ),
+    })
+}
+
 pub fn get_status(options: StatusOptions) -> Result<StatusReport> {
     let scope = Scope::new(options.scope)?;
     let scope_chain = scope.chain().into_vec();
@@ -9741,17 +9823,18 @@ mod tests {
         hybrid_search_results, import_memory, ingest_capture_event, list_candidates, list_context,
         list_decisions, list_events, list_observations, list_relations, list_sessions, list_state,
         log_decision, pending_embedding_count, process_embedding_jobs, propose_candidate,
-        reject_candidate, resolve_and_open, save_entity, search_memory, start_capture_session,
-        update_context, update_decision, update_entity, update_observation, update_relation,
-        update_session, upsert_state, AddContextOptions, ApproveCandidateOptions, AskMemoryOptions,
-        BulkCandidateReviewOptions, CandidateOrder, ChatOptions, ContextListOptions,
-        DecisionListOptions, DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions,
-        DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions,
-        EmbeddingStatusOptions, EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions,
-        ExtractCaptureOptions, ExtractionCandidate, GetContextOptions, GraphOptions,
-        HandoffOptions, ImportOptions, IngestCaptureEventOptions, ListCandidatesOptions,
-        LogDecisionOptions, ObservationListOptions, ProcessEmbeddingsOptions, ProjectReportOptions,
-        ProposeCandidateOptions, RejectCandidateOptions, RelationListOptions, SaveEntityOptions,
+        reject_candidate, resolve_and_open, run_capture_watch, save_entity, search_memory,
+        start_capture_session, update_context, update_decision, update_entity, update_observation,
+        update_relation, update_session, upsert_state, AddContextOptions, ApproveCandidateOptions,
+        AskMemoryOptions, BulkCandidateReviewOptions, CandidateOrder, ChatOptions,
+        ContextListOptions, DecisionListOptions, DeleteContextOptions, DeleteDecisionOptions,
+        DeleteEntityOptions, DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions,
+        EditCandidateOptions, EmbeddingStatusOptions, EndSessionOptions, EventListOptions,
+        EvidenceInput, ExportOptions, ExtractCaptureOptions, ExtractionCandidate,
+        GetContextOptions, GraphOptions, HandoffOptions, ImportOptions, IngestCaptureEventOptions,
+        ListCandidatesOptions, LogDecisionOptions, ObservationListOptions,
+        ProcessEmbeddingsOptions, ProjectReportOptions, ProposeCandidateOptions,
+        RejectCandidateOptions, RelationListOptions, RunCaptureWatchOptions, SaveEntityOptions,
         SearchMemoryOptions, SearchMode, SearchReport, SearchResult, SessionLogOptions,
         StartCaptureOptions, StateListOptions, StatusOptions, UpdateContextOptions,
         UpdateDecisionOptions, UpdateEntityOptions, UpdateObservationOptions,
@@ -11209,6 +11292,95 @@ mod tests {
         assert_eq!(extracted.len(), 2);
         assert!(extracted.iter().any(|c| c.record_type == "decision"));
         assert!(extracted.iter().any(|c| c.record_type == "context"));
+    }
+
+    #[test]
+    fn run_capture_watch_imports_transcript_then_proposes() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let (_temp, home, project_dir) = setup_project();
+        let scope = "example-project/core";
+
+        // A fake Claude Code transcript on disk (what the watcher tails).
+        let transcript = project_dir.join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"timestamp\":\"2026-07-01T00:00:00Z\",\"message\":{\"role\":\
+             \"user\",\"content\":\"Let's use SQLite for V1.\"}}\n{\"type\":\"assistant\",\
+             \"timestamp\":\"2026-07-01T00:00:01Z\",\"message\":{\"role\":\"assistant\",\"content\":\
+             [{\"type\":\"text\",\"text\":\"Agreed — SQLite, embedded, no server.\"}]}}\n",
+        )
+        .unwrap();
+
+        // Stand-in Ollama returning one extracted decision.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 16384];
+            let _ = socket.read(&mut buf).unwrap();
+            let content = "[{\"kind\":\"decision\",\"title\":\"Use SQLite\",\"content\":\"SQLite \
+                 for V1 — embedded, no server.\"}]";
+            let envelope =
+                serde_json::json!({"message":{"role":"assistant","content":content}}).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{envelope}",
+                envelope.len()
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+
+        // One watcher pass with an explicit transcript path (the daemon uses None
+        // to auto-discover this project's ~/.claude/projects dir).
+        let report = run_capture_watch(RunCaptureWatchOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            agent: "claude-code".to_owned(),
+            input: Some(transcript.clone()),
+            scope: scope.to_owned(),
+            limit: 100,
+            model: None,
+            ollama_url: Some(format!("http://127.0.0.1:{port}")),
+        })
+        .unwrap();
+        server.join().unwrap();
+
+        assert!(report.events_imported >= 2, "transcript turns imported");
+        assert_eq!(report.proposed, 1, "the extracted decision is proposed");
+
+        // Landed in the review queue (propose-for-review), from the LLM extractor.
+        let candidates = list_candidates(ListCandidatesOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            status: Some("pending".to_owned()),
+            scope: scope.to_owned(),
+            limit: 100,
+            order: CandidateOrder::Recent,
+        })
+        .unwrap();
+        assert!(candidates
+            .iter()
+            .any(|c| c.source_type == "capture:llm" && c.record_type == "decision"));
+
+        // Second pass with the SAME transcript: dedup ⇒ nothing new ⇒ no model call,
+        // no duplicate proposal (incremental by construction).
+        let again = run_capture_watch(RunCaptureWatchOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            agent: "claude-code".to_owned(),
+            input: Some(transcript),
+            scope: scope.to_owned(),
+            limit: 100,
+            model: None,
+            ollama_url: Some("http://127.0.0.1:1".to_owned()), // unreachable; must not be hit
+        })
+        .unwrap();
+        assert_eq!(again.events_imported, 0, "re-run imports nothing new");
+        assert_eq!(again.proposed, 0);
     }
 
     #[test]

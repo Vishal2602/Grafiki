@@ -21,13 +21,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 use grafiki_core::{
     add_context, approve_candidate, ask_memory, bulk_review_candidates, chat, chat_with_provider,
     delete_context, delete_decision, delete_entity, delete_observation, delete_relation,
-    delete_state, edit_candidate, end_session, export_memory, extract_capture_memory,
-    generate_report, get_capture_status, get_context, get_embedding_status, get_graph,
-    get_memory_record_detail, get_status, handoff_session, import_agent_transcripts, import_memory,
-    index_code, ingest_capture_event, init_project, list_agent_queries, list_candidates,
-    list_capture_events, list_context, list_events, list_sessions, list_state, load_capture_config,
-    log_decision, pending_embedding_count, process_embedding_jobs, propose_candidate,
-    propose_capture_candidates, reject_candidate, run_reflection, save_entity, search_memory,
+    delete_state, edit_candidate, end_session, export_memory, generate_report, get_capture_status,
+    get_context, get_embedding_status, get_graph, get_memory_record_detail, get_status,
+    handoff_session, import_agent_transcripts, import_memory, index_code, ingest_capture_event,
+    init_project, list_agent_queries, list_candidates, list_capture_events, list_context,
+    list_events, list_sessions, list_state, load_capture_config, log_decision,
+    pending_embedding_count, process_embedding_jobs, propose_candidate, propose_capture_candidates,
+    reject_candidate, run_capture_watch, run_reflection, save_entity, search_memory,
     start_capture_session, start_session, stop_capture_session, update_capture_config,
     update_context, update_decision, update_entity, update_observation, update_relation,
     update_session, upsert_state, AddContextOptions, AgentMemoryBriefing,
@@ -38,15 +38,15 @@ use grafiki_core::{
     CaptureStatusReport, ChatOptions, ChatReply, ContextListOptions, DeleteContextOptions,
     DeleteDecisionOptions, DeleteEntityOptions, DeleteObservationOptions, DeleteRelationOptions,
     DeleteStateOptions, EditCandidateOptions, EmbeddingStatusOptions, EmbeddingStatusReport,
-    EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions, ExtractCaptureOptions,
-    GetContextOptions, GetMemoryRecordOptions, GraphOptions, HandoffOptions,
-    ImportAgentTranscriptsOptions, ImportOptions, IndexCodeOptions, IngestCaptureEventOptions,
-    InitOptions, ListAgentQueriesOptions, ListCandidatesOptions, ListCaptureEventsOptions,
-    LogDecisionOptions, OllamaProvider, ProcessEmbeddingsOptions, ProcessEmbeddingsReport,
-    ProjectReportOptions, ProjectResolveOptions, ProposeCandidateOptions,
-    ProposeCaptureCandidatesOptions, RejectCandidateOptions, RunReflectionOptions,
-    SaveEntityOptions, Scope, SearchMemoryOptions, SearchMode as CoreSearchMode, SessionLogOptions,
-    StartCaptureOptions, StartSessionOptions, StateListOptions, StatusOptions, StopCaptureOptions,
+    EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions, GetContextOptions,
+    GetMemoryRecordOptions, GraphOptions, HandoffOptions, ImportAgentTranscriptsOptions,
+    ImportOptions, IndexCodeOptions, IngestCaptureEventOptions, InitOptions,
+    ListAgentQueriesOptions, ListCandidatesOptions, ListCaptureEventsOptions, LogDecisionOptions,
+    OllamaProvider, ProcessEmbeddingsOptions, ProcessEmbeddingsReport, ProjectReportOptions,
+    ProjectResolveOptions, ProposeCandidateOptions, ProposeCaptureCandidatesOptions,
+    RejectCandidateOptions, RunCaptureWatchOptions, RunReflectionOptions, SaveEntityOptions, Scope,
+    SearchMemoryOptions, SearchMode as CoreSearchMode, SessionLogOptions, StartCaptureOptions,
+    StartSessionOptions, StateListOptions, StatusOptions, StopCaptureOptions,
     UpdateCaptureConfigOptions, UpdateContextOptions, UpdateDecisionOptions, UpdateEntityOptions,
     UpdateObservationOptions, UpdateRelationOptions, UpdateSessionOptions, UpsertStateOptions,
 };
@@ -2379,24 +2379,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 format,
             } => {
                 ensure_capture_source_enabled(project.clone(), &path, "transcripts")?;
-                // 1) Ingest this project's agent transcript (auto-discovered);
-                //    per-source dedup makes re-runs incremental (only new events).
-                let import = import_agent_transcripts(ImportAgentTranscriptsOptions {
-                    project_name: project.clone(),
-                    start_dir: path.clone(),
-                    grafiki_home: None,
-                    agent,
-                    input: None,
-                    scope: scope.clone(),
-                    limit,
-                    summarize: false,
-                })?;
-                // 2) Let the local model read it and propose durable memory for review.
-                match extract_capture_memory(ExtractCaptureOptions {
+                // One watcher pass: import THIS project's transcript (scoped,
+                // incremental via dedup) + local-model extraction → propose for
+                // review. This is the same tick the background daemon runs.
+                match run_capture_watch(RunCaptureWatchOptions {
                     project_name: project,
                     start_dir: path,
                     grafiki_home: None,
-                    capture_id: Some(import.capture_id.clone()),
+                    agent,
+                    input: None,
                     scope,
                     limit,
                     model: Some(model),
@@ -2407,10 +2398,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             println!("{}", serde_json::to_string_pretty(&report)?)
                         }
                         _ => {
-                            println!(
-                                "Imported {} new event(s) from {}.",
-                                import.events_imported, import.agent
-                            );
                             println!("{}", report.message);
                             if report.proposed > 0 {
                                 println!(
@@ -2420,10 +2407,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     },
                     Err(error) => {
-                        eprintln!(
-                            "Captured {} event(s), but extraction needs a running local model: {error}",
-                            import.events_imported
-                        );
+                        eprintln!("Capture extraction needs a running local model: {error}");
                     }
                 }
             }
@@ -6360,6 +6344,14 @@ fn serve_http(
 
     let listener = TcpListener::bind(format!("{host}:{port}"))?;
     spawn_embedding_worker(project.clone(), path.clone());
+    // Future A: opt-in passive capture watcher (truly automatic — no command, no
+    // agent instruction). Enabled by GRAFIKI_WATCH_TRANSCRIPTS; model override via
+    // GRAFIKI_WATCH_MODEL (default gemma3:1b). Extraction is proposed for review.
+    if std::env::var_os("GRAFIKI_WATCH_TRANSCRIPTS").is_some() {
+        let model = std::env::var("GRAFIKI_WATCH_MODEL").unwrap_or_else(|_| "gemma3:1b".to_owned());
+        spawn_capture_worker(project.clone(), path.clone(), model);
+        println!("Passive capture watcher ON (GRAFIKI_WATCH_TRANSCRIPTS).");
+    }
     println!("Grafiki HTTP API listening on http://{host}:{port}");
     println!("Health: http://{host}:{port}/health");
 
@@ -6406,6 +6398,60 @@ fn spawn_embedding_worker(project: Option<String>, path: PathBuf) {
                 }
             }
             Err(error) => eprintln!("Embedding worker skipped batch: {error}"),
+        }
+    });
+}
+
+/// Newest top-level file mtime under `dir` (cheap `stat`, no reads). Used to gate
+/// the passive capture watcher so an idle daemon does nothing.
+fn newest_transcript_mtime(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    let mut newest: Option<std::time::SystemTime> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
+            newest = Some(newest.map_or(modified, |current| current.max(modified)));
+        }
+    }
+    newest
+}
+
+/// Future A — the passive "Granola for agents" watcher. A background loop that
+/// tails THIS project's Claude Code transcript and, when it changes, runs one
+/// `run_capture_watch` pass (import new turns → local model extracts durable
+/// memory → PROPOSE for review). No command, no instruction to the agent. Gated
+/// on a cheap directory-mtime check so an idle daemon does zero work; needs a
+/// running local model (default `gemma3:1b`) for the extraction step.
+fn spawn_capture_worker(project: Option<String>, path: PathBuf, model: String) {
+    thread::spawn(move || {
+        let mut last_seen: Option<std::time::SystemTime> = None;
+        loop {
+            thread::sleep(Duration::from_secs(30));
+            // Only act when the project's transcript directory has changed.
+            let Some(dir) = grafiki_core::transcript::claude_code_project_dir(&path) else {
+                continue;
+            };
+            let newest = newest_transcript_mtime(&dir);
+            if newest.is_none() || newest == last_seen {
+                continue;
+            }
+            last_seen = newest;
+
+            match run_capture_watch(RunCaptureWatchOptions {
+                project_name: project.clone(),
+                start_dir: path.clone(),
+                grafiki_home: None,
+                agent: "claude-code".to_owned(),
+                input: None,
+                scope: String::new(),
+                limit: 200,
+                model: Some(model.clone()),
+                ollama_url: None,
+            }) {
+                Ok(report) if report.proposed > 0 => {
+                    eprintln!("Grafiki captured your session: {}", report.message);
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("Grafiki capture watcher skipped a pass: {error}"),
+            }
         }
     });
 }

@@ -236,6 +236,32 @@ fn transcript_input_files(
     Ok(files)
 }
 
+/// The Claude Code transcript directory for a SPECIFIC project path, so passive
+/// capture can be scoped to THIS project instead of scanning every project under
+/// `~/.claude/projects`. Claude Code encodes the cwd into a folder name by
+/// replacing `/`, `.`, and spaces with `-` (verified against real directories,
+/// e.g. `/…/com.conductor.app/bin` → `…-com-conductor-app-bin`). Returns `None`
+/// without `$HOME`. The directory may not exist yet (no sessions captured).
+pub fn claude_code_project_dir(start_dir: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let absolute = start_dir
+        .canonicalize()
+        .unwrap_or_else(|_| start_dir.to_path_buf());
+    let encoded = encode_claude_project_name(&absolute.to_string_lossy());
+    Some(
+        PathBuf::from(home)
+            .join(".claude")
+            .join("projects")
+            .join(encoded),
+    )
+}
+
+/// Encode an absolute path the way Claude Code names its `~/.claude/projects/*`
+/// folders: replace `/`, `.`, and spaces with `-` (verified against real dirs).
+fn encode_claude_project_name(absolute: &str) -> String {
+    absolute.replace(['/', '.', ' '], "-")
+}
+
 fn default_transcript_roots(agent: &str, start_dir: &Path) -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     match (agent, home) {
@@ -647,7 +673,24 @@ mod tests {
     };
     use crate::project::{init_project, InitOptions};
 
-    use super::{import_agent_transcripts, ImportAgentTranscriptsOptions};
+    use super::{
+        encode_claude_project_name, import_agent_transcripts, ImportAgentTranscriptsOptions,
+    };
+
+    #[test]
+    fn encodes_claude_project_dir_name_like_claude_code() {
+        assert_eq!(
+            encode_claude_project_name("/Users/x/Documents/Project/Grafiki"),
+            "-Users-x-Documents-Project-Grafiki"
+        );
+        // `.` and spaces also become `-` (verified: com.conductor.app, Application Support).
+        assert_eq!(
+            encode_claude_project_name(
+                "/Users/x/Library/Application Support/com.conductor.app/bin"
+            ),
+            "-Users-x-Library-Application-Support-com-conductor-app-bin"
+        );
+    }
 
     #[test]
     fn imports_codex_jsonl_transcript_into_capture_events() {

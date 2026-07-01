@@ -12,3 +12,4 @@ grafiki-wiki/
 *.db
 *.db-wal
 *.db-shm
+GRAFIKI_CONTEXT.md
