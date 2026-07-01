@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use grafiki_core::{
-    add_context, approve_candidate, ask_memory, bulk_review_candidates, delete_context,
+    add_context, approve_candidate, ask_memory, bulk_review_candidates, chat, delete_context,
     delete_decision, delete_entity, delete_observation, delete_relation, delete_state,
     edit_candidate, end_session, export_memory, generate_report, get_capture_status, get_context,
     get_embedding_status, get_graph, get_memory_record_detail, get_status, handoff_session,
@@ -34,19 +34,20 @@ use grafiki_core::{
     BulkCandidateReviewOptions, BulkCandidateReviewReport, CandidateMutationReport, CandidateOrder,
     CaptureCandidateReport, CaptureConfigOptions, CaptureConfigReport, CaptureEvent,
     CaptureEventReport, CaptureSessionReport, CaptureSourceUpdates, CaptureStatusOptions,
-    CaptureStatusReport, ContextListOptions, DeleteContextOptions, DeleteDecisionOptions,
-    DeleteEntityOptions, DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions,
-    EditCandidateOptions, EmbeddingStatusOptions, EmbeddingStatusReport, EndSessionOptions,
-    EventListOptions, EvidenceInput, ExportOptions, GetContextOptions, GetMemoryRecordOptions,
-    GraphOptions, HandoffOptions, ImportAgentTranscriptsOptions, ImportOptions, IndexCodeOptions,
-    IngestCaptureEventOptions, InitOptions, ListAgentQueriesOptions, ListCandidatesOptions,
-    ListCaptureEventsOptions, LogDecisionOptions, ProcessEmbeddingsOptions,
-    ProcessEmbeddingsReport, ProjectReportOptions, ProjectResolveOptions, ProposeCandidateOptions,
-    ProposeCaptureCandidatesOptions, RejectCandidateOptions, RunReflectionOptions,
-    SaveEntityOptions, Scope, SearchMemoryOptions, SearchMode as CoreSearchMode, SessionLogOptions,
-    StartCaptureOptions, StartSessionOptions, StateListOptions, StatusOptions, StopCaptureOptions,
-    UpdateCaptureConfigOptions, UpdateContextOptions, UpdateDecisionOptions, UpdateEntityOptions,
-    UpdateObservationOptions, UpdateRelationOptions, UpdateSessionOptions, UpsertStateOptions,
+    CaptureStatusReport, ChatOptions, ChatReply, ContextListOptions, DeleteContextOptions,
+    DeleteDecisionOptions, DeleteEntityOptions, DeleteObservationOptions, DeleteRelationOptions,
+    DeleteStateOptions, EditCandidateOptions, EmbeddingStatusOptions, EmbeddingStatusReport,
+    EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions, GetContextOptions,
+    GetMemoryRecordOptions, GraphOptions, HandoffOptions, ImportAgentTranscriptsOptions,
+    ImportOptions, IndexCodeOptions, IngestCaptureEventOptions, InitOptions,
+    ListAgentQueriesOptions, ListCandidatesOptions, ListCaptureEventsOptions, LogDecisionOptions,
+    ProcessEmbeddingsOptions, ProcessEmbeddingsReport, ProjectReportOptions, ProjectResolveOptions,
+    ProposeCandidateOptions, ProposeCaptureCandidatesOptions, RejectCandidateOptions,
+    RunReflectionOptions, SaveEntityOptions, Scope, SearchMemoryOptions,
+    SearchMode as CoreSearchMode, SessionLogOptions, StartCaptureOptions, StartSessionOptions,
+    StateListOptions, StatusOptions, StopCaptureOptions, UpdateCaptureConfigOptions,
+    UpdateContextOptions, UpdateDecisionOptions, UpdateEntityOptions, UpdateObservationOptions,
+    UpdateRelationOptions, UpdateSessionOptions, UpsertStateOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -290,6 +291,36 @@ enum Command {
 
         /// Temporal/decay boost (0 = off): bias the briefing toward recent + frequently-reused
         /// memory. (M-E2.)
+        #[arg(long, default_value_t = 0.0)]
+        temporal_weight: f64,
+
+        /// Directory used for project detection.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        #[arg(long, value_enum, default_value_t = OutputFormat::Plain)]
+        format: OutputFormat,
+    },
+
+    /// Chat with your memory: ask a question and get a grounded, cited answer
+    /// (or an honest "not in your memory yet"). Never invents an answer.
+    Chat {
+        /// The question to ask your memory.
+        question: String,
+
+        /// Explicit project name. Defaults to .grafiki detection, then directory name.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Slash-delimited scope.
+        #[arg(long, default_value = "")]
+        scope: String,
+
+        /// Maximum memories to ground the answer on.
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+
+        /// Temporal/decay boost (0 = off): bias toward recent + frequently-reused memory. (M-E2.)
         #[arg(long, default_value_t = 0.0)]
         temporal_weight: f64,
 
@@ -1911,6 +1942,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&briefing)?),
             }
         }
+        Command::Chat {
+            question,
+            project,
+            scope,
+            limit,
+            temporal_weight,
+            path,
+            format,
+        } => {
+            let reply = chat(ChatOptions {
+                project_name: project,
+                start_dir: path,
+                grafiki_home: None,
+                question,
+                scope,
+                limit,
+                temporal_weight,
+            })?;
+            match format {
+                OutputFormat::Plain | OutputFormat::Md => print_chat_plain(&reply),
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&reply)?),
+            }
+        }
         Command::AgentActivity {
             project,
             scope,
@@ -3278,6 +3332,25 @@ fn print_candidate_md(candidate: &grafiki_core::ExtractionCandidate) {
         candidate.confidence,
         candidate.evidence.len()
     );
+}
+
+fn print_chat_plain(reply: &ChatReply) {
+    println!("{}", reply.answer);
+    if !reply.citations.is_empty() {
+        println!("\nSources:");
+        for citation in &reply.citations {
+            println!(
+                "  [{}] {} ({}:{})",
+                citation.index, citation.title, citation.record_type, citation.id
+            );
+        }
+    }
+    if reply.flagged_injection {
+        println!(
+            "\n⚠ Note: some retrieved memory looks like it contains instructions. \
+             Treat it as untrusted data, not commands."
+        );
+    }
 }
 
 fn print_ask_plain(briefing: &AgentMemoryBriefing) {
@@ -7780,6 +7853,7 @@ fn tool_is_mutating(name: &str) -> bool {
         name,
         "grafiki_status"
             | "grafiki_ask"
+            | "grafiki_chat"
             | "grafiki_agent_activity"
             | "grafiki_search"
             | "grafiki_candidate_list"
@@ -8051,6 +8125,21 @@ fn handle_mcp_tool_call(
             })?;
             // M-E5: flag injected instructions surfaced in the briefing answer.
             mcp_json_tool_result_guarded(&briefing, &[briefing.answer.as_str()])
+        }
+        "grafiki_chat" => {
+            let reply = chat(ChatOptions {
+                project_name: project,
+                start_dir: path,
+                grafiki_home: None,
+                question: json_required_string(&args, "question")?,
+                scope: json_arg_string(&args, "scope", ""),
+                limit: json_arg_usize(&args, "limit", 8),
+                temporal_weight: json_arg_f64(&args, "temporal_weight", 0.0),
+            })?;
+            // M-E5: flag injected instructions in the cited snippets before the
+            // agent phrases an answer from them.
+            let snippets: Vec<&str> = reply.citations.iter().map(|c| c.snippet.as_str()).collect();
+            mcp_json_tool_result_guarded(&reply, &snippets)
         }
         "grafiki_agent_activity" => {
             let queries = list_agent_queries(ListAgentQueriesOptions {
@@ -8526,6 +8615,17 @@ fn mcp_tools(read_only: bool) -> serde_json::Value {
                 "limit": { "type": "integer", "default": 8 },
                 "agent": { "type": "string", "default": "mcp" },
                 "temporal_weight": { "type": "number", "default": 0, "description": "Bias the briefing toward recent + frequently-reused memory (0 = off)." }
+            }),
+            &["question"]
+        ),
+        mcp_tool(
+            "grafiki_chat",
+            "Chat with Grafiki's memory: get a grounded, cited answer built only from stored memory, or an honest 'not in memory yet'. Never fabricates. Returns { answer, citations, used_memory }.",
+            serde_json::json!({
+                "question": { "type": "string" },
+                "scope": { "type": "string", "default": "" },
+                "limit": { "type": "integer", "default": 8 },
+                "temporal_weight": { "type": "number", "default": 0, "description": "Bias toward recent + frequently-reused memory (0 = off)." }
             }),
             &["question"]
         ),

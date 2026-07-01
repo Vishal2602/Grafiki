@@ -2540,6 +2540,127 @@ pub fn ask_memory(options: AskMemoryOptions) -> Result<AgentMemoryBriefing> {
     })
 }
 
+/// Options for [`chat`] — "chat with your memory" (grounded, cited RAG).
+pub struct ChatOptions {
+    pub project_name: Option<String>,
+    pub start_dir: PathBuf,
+    pub grafiki_home: Option<PathBuf>,
+    pub question: String,
+    pub scope: String,
+    pub limit: usize,
+    pub temporal_weight: f64,
+}
+
+/// Chat with your memory using the deterministic, model-free extractive provider.
+/// See [`chat_with_provider`] to supply a local model (Phase 2, `docs/CHAT_DESIGN.md`).
+pub fn chat(options: ChatOptions) -> Result<crate::chat::ChatReply> {
+    chat_with_provider(options, &crate::chat::ExtractiveProvider)
+}
+
+/// Chat with your memory using a caller-supplied [`crate::chat::ChatProvider`].
+///
+/// Retrieve (hybrid, scope-aware) → ground → generate → cite. Grounded and cited:
+/// the answer is built ONLY from retrieved memory, every source is returned as a
+/// [`crate::chat::Citation`], and when nothing is relevant it ABSTAINS with the
+/// fixed [`crate::chat::NO_MEMORY_ANSWER`] rather than fabricate. Retrieved
+/// snippets are injection-scanned (M-E5) and flagged so a model provider treats
+/// them as untrusted data. Logs the query to the audit trail so chat-driven
+/// retrievals reinforce reuse-salience (M-E1), exactly like `ask_memory`.
+pub fn chat_with_provider(
+    options: ChatOptions,
+    provider: &dyn crate::chat::ChatProvider,
+) -> Result<crate::chat::ChatReply> {
+    use crate::chat::{ChatReply, Citation, GroundedMemory, NO_MEMORY_ANSWER};
+
+    let started = Instant::now();
+    let question = options.question.trim().to_owned();
+    if question.is_empty() {
+        return Err(GrafikiError::InvalidCandidate(
+            "chat question is required".to_owned(),
+        ));
+    }
+    let scope = options.scope.clone();
+    let limit = options.limit.clamp(1, 20);
+
+    let search = search_memory(SearchMemoryOptions {
+        project_name: options.project_name.clone(),
+        start_dir: options.start_dir.clone(),
+        grafiki_home: options.grafiki_home.clone(),
+        query: question.clone(),
+        record_type: "all".to_owned(),
+        mode: SearchMode::Hybrid,
+        scope: scope.clone(),
+        limit,
+        temporal_weight: options.temporal_weight,
+    })?;
+
+    // Log the retrieval for reuse-salience, mirroring ask_memory (best-effort:
+    // an audit failure must not fail the chat).
+    let returned_ids = search
+        .results
+        .iter()
+        .map(|result| format!("{}:{}", result.record_type, result.id))
+        .collect::<Vec<_>>();
+    let _ = record_agent_query(
+        options.project_name.clone(),
+        options.start_dir.clone(),
+        options.grafiki_home.clone(),
+        "chat",
+        &question,
+        &scope,
+        &returned_ids,
+        search.mode,
+        search.fallback.as_deref(),
+        started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+    );
+
+    if search.results.is_empty() {
+        return Ok(ChatReply {
+            question,
+            scope,
+            answer: NO_MEMORY_ANSWER.to_owned(),
+            citations: Vec::new(),
+            used_memory: false,
+            flagged_injection: false,
+        });
+    }
+
+    let memories: Vec<GroundedMemory> = search
+        .results
+        .iter()
+        .enumerate()
+        .map(|(i, result)| GroundedMemory {
+            index: i + 1,
+            record_type: result.record_type.clone(),
+            id: result.id.clone(),
+            title: result.title.clone(),
+            snippet: result.snippet.clone(),
+            suspicious: crate::injection::is_suspicious(&result.snippet),
+        })
+        .collect();
+    let flagged_injection = memories.iter().any(|memory| memory.suspicious);
+    let answer = provider.generate(&question, &memories);
+    let citations = memories
+        .iter()
+        .map(|memory| Citation {
+            index: memory.index,
+            record_type: memory.record_type.clone(),
+            id: memory.id.clone(),
+            title: memory.title.clone(),
+            snippet: memory.snippet.clone(),
+        })
+        .collect();
+
+    Ok(ChatReply {
+        question,
+        scope,
+        answer,
+        citations,
+        used_memory: true,
+        flagged_injection,
+    })
+}
+
 fn format_agent_memory_answer(
     status: &StatusReport,
     search: &SearchReport,
@@ -9492,7 +9613,7 @@ mod tests {
     use crate::session::{start_session, StartSessionOptions};
 
     use super::{
-        add_context, approve_candidate, ask_memory, bulk_review_candidates, delete_context,
+        add_context, approve_candidate, ask_memory, bulk_review_candidates, chat, delete_context,
         delete_decision, delete_entity, delete_observation, delete_relation, delete_state,
         edit_candidate, end_session, export_memory, generate_report, get_context,
         get_embedding_status, get_graph, get_status, handoff_session, hybrid_search_results,
@@ -9502,18 +9623,18 @@ mod tests {
         resolve_and_open, save_entity, search_memory, start_capture_session, update_context,
         update_decision, update_entity, update_observation, update_relation, update_session,
         upsert_state, AddContextOptions, ApproveCandidateOptions, AskMemoryOptions,
-        BulkCandidateReviewOptions, CandidateOrder, ContextListOptions, DecisionListOptions,
-        DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions, DeleteObservationOptions,
-        DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions, EmbeddingStatusOptions,
-        EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions, ExtractionCandidate,
-        GetContextOptions, GraphOptions, HandoffOptions, ImportOptions, IngestCaptureEventOptions,
-        ListCandidatesOptions, LogDecisionOptions, ObservationListOptions,
-        ProcessEmbeddingsOptions, ProjectReportOptions, ProposeCandidateOptions,
-        RejectCandidateOptions, RelationListOptions, SaveEntityOptions, SearchMemoryOptions,
-        SearchMode, SearchReport, SearchResult, SessionLogOptions, StartCaptureOptions,
-        StateListOptions, StatusOptions, UpdateContextOptions, UpdateDecisionOptions,
-        UpdateEntityOptions, UpdateObservationOptions, UpdateRelationOptions, UpdateSessionOptions,
-        UpsertStateOptions,
+        BulkCandidateReviewOptions, CandidateOrder, ChatOptions, ContextListOptions,
+        DecisionListOptions, DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions,
+        DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions,
+        EmbeddingStatusOptions, EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions,
+        ExtractionCandidate, GetContextOptions, GraphOptions, HandoffOptions, ImportOptions,
+        IngestCaptureEventOptions, ListCandidatesOptions, LogDecisionOptions,
+        ObservationListOptions, ProcessEmbeddingsOptions, ProjectReportOptions,
+        ProposeCandidateOptions, RejectCandidateOptions, RelationListOptions, SaveEntityOptions,
+        SearchMemoryOptions, SearchMode, SearchReport, SearchResult, SessionLogOptions,
+        StartCaptureOptions, StateListOptions, StatusOptions, UpdateContextOptions,
+        UpdateDecisionOptions, UpdateEntityOptions, UpdateObservationOptions,
+        UpdateRelationOptions, UpdateSessionOptions, UpsertStateOptions,
     };
 
     fn setup_project() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -10812,6 +10933,65 @@ mod tests {
         .unwrap();
         assert_eq!(shown.title, "Deploy v2");
         assert!(shown.content.contains("verify health"));
+    }
+
+    #[test]
+    fn chat_is_grounded_and_cited_or_abstains() {
+        let (_temp, home, project_dir) = setup_project();
+        let scope = "example-project/core";
+
+        save_entity(SaveEntityOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            name: "Deploy Target".to_owned(),
+            entity_type: "service".to_owned(),
+            observe: Some("We deploy to GCP europe-west1".to_owned()),
+            category: "architecture".to_owned(),
+            scope: scope.to_owned(),
+            relate: None,
+        })
+        .unwrap();
+
+        // A question the memory can answer: grounded answer + a citation.
+        let reply = chat(ChatOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            question: "where do we deploy".to_owned(),
+            scope: scope.to_owned(),
+            limit: 8,
+            temporal_weight: 0.0,
+        })
+        .unwrap();
+        assert!(reply.used_memory, "should answer from memory");
+        assert!(
+            reply.answer.contains("europe-west1"),
+            "answer must be grounded in the retrieved memory: {}",
+            reply.answer
+        );
+        assert!(
+            reply
+                .citations
+                .iter()
+                .any(|c| c.snippet.contains("europe-west1")),
+            "the answer must cite the memory it used"
+        );
+
+        // A question the memory cannot answer: ABSTAIN, never fabricate.
+        let empty = chat(ChatOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            question: "what is the airspeed velocity of an unladen swallow".to_owned(),
+            scope: scope.to_owned(),
+            limit: 8,
+            temporal_weight: 0.0,
+        })
+        .unwrap();
+        assert!(!empty.used_memory);
+        assert!(empty.citations.is_empty());
+        assert_eq!(empty.answer, crate::chat::NO_MEMORY_ANSWER);
     }
 
     #[test]

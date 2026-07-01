@@ -1,6 +1,12 @@
 # DESIGN: Grafiki — "Chat with your memory" (local, grounded RAG)
 
-**Status:** Proposed (implementation-ready)
+**Status:** Phase 1 DONE (model-free chat core + CLI + MCP); Phases 2–4 proposed.
+**Update 2026-06-30:** `grafiki_core::chat` shipped — `ChatProvider` seam +
+`ExtractiveProvider` (deterministic, model-free) + `chat`/`chat_with_provider` in `memory.rs`
+(retrieve → ground → generate → cite; abstains with `NO_MEMORY_ANSWER` when nothing is relevant;
+injection-scans snippets; logs to the reuse-salience audit). Surfaces: CLI `grafiki chat "<q>"` and
+MCP `grafiki_chat` (read-only-safe). The local-model provider is Phase 2 — it drops into the same
+`ChatProvider` seam without touching retrieval or the surfaces.
 **Crates:** `grafiki-core` (retrieval reuse + `chat` module), `grafiki-cli` (CLI + MCP surface),
 `apps/grafiki-desktop` (chat UI + model-download setup)
 **Depends on:** the existing retrieval stack (`ask_memory`, `hybrid_search_results`, Graph/Rerank),

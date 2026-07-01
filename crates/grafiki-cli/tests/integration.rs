@@ -344,6 +344,80 @@ fn daemon_lifecycle_with_token() {
 }
 
 #[test]
+fn mcp_chat_tool_is_grounded_and_cited() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let project = temp.path().join("mcp");
+    std::fs::create_dir_all(&project).unwrap();
+    run_ok(&home, ["init", "mcp", "--path"], &[&project]);
+    run_ok(
+        &home,
+        ["save", "Deploy Target", "--project", "mcp", "--path"],
+        &[
+            &project,
+            Path::new("--type"),
+            Path::new("service"),
+            Path::new("--observe"),
+            Path::new("We deploy to GCP europe-west1"),
+            Path::new("--category"),
+            Path::new("architecture"),
+            Path::new("--scope"),
+            Path::new("mcp/core"),
+            Path::new("--format"),
+            Path::new("json"),
+        ],
+    );
+
+    let mut child = Command::new(GRAFIKI)
+        .env("GRAFIKI_HOME", &home)
+        .args([
+            "mcp",
+            "--project",
+            "mcp",
+            "--path",
+            project.to_str().unwrap(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        // Answerable question → grounded + cited.
+        writeln!(
+            stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"grafiki_chat\",\"arguments\":{{\"question\":\"where do we deploy\",\"scope\":\"mcp/core\"}}}}}}"
+        )
+        .unwrap();
+        // Unanswerable question → honest abstain, never fabricate.
+        writeln!(
+            stdin,
+            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"grafiki_chat\",\"arguments\":{{\"question\":\"what is my favorite color\",\"scope\":\"mcp/core\"}}}}}}"
+        )
+        .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Grounded answer cites the deploy memory.
+    assert!(
+        stdout.contains("europe-west1"),
+        "grounded answer missing: {stdout}"
+    );
+    assert!(stdout.contains("\\\"used_memory\\\":true") || stdout.contains("used_memory"));
+    // Abstains on the unanswerable question.
+    assert!(
+        stdout.contains("don't have anything in your memory"),
+        "expected an abstain for the unanswerable question: {stdout}"
+    );
+}
+
+#[test]
 fn mcp_search_tool_round_trip() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
