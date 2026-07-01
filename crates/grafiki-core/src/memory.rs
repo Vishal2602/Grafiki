@@ -2541,6 +2541,7 @@ pub fn ask_memory(options: AskMemoryOptions) -> Result<AgentMemoryBriefing> {
 }
 
 /// Options for [`chat`] — "chat with your memory" (grounded, cited RAG).
+#[derive(Clone)]
 pub struct ChatOptions {
     pub project_name: Option<String>,
     pub start_dir: PathBuf,
@@ -2639,7 +2640,7 @@ pub fn chat_with_provider(
         })
         .collect();
     let flagged_injection = memories.iter().any(|memory| memory.suspicious);
-    let answer = provider.generate(&question, &memories);
+    let answer = provider.generate(&question, &memories)?;
     let citations = memories
         .iter()
         .map(|memory| Citation {

@@ -26,7 +26,10 @@ pub mod session;
 pub mod transcript;
 pub mod ulid;
 
-pub use chat::{ChatProvider, ChatReply, Citation, ExtractiveProvider, GroundedMemory};
+pub use chat::{
+    build_grounded_messages, ChatMessage, ChatProvider, ChatReply, Citation, ExtractiveProvider,
+    GroundedMemory, OllamaProvider,
+};
 pub use code_index::{index_code, IndexCodeOptions, IndexCodeReport};
 pub use conflict::{
     arbitrate, attribute_cardinality, key_conflict, slot_conflict, temporal_relation,

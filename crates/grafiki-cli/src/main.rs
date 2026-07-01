@@ -19,35 +19,35 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use grafiki_core::{
-    add_context, approve_candidate, ask_memory, bulk_review_candidates, chat, delete_context,
-    delete_decision, delete_entity, delete_observation, delete_relation, delete_state,
-    edit_candidate, end_session, export_memory, generate_report, get_capture_status, get_context,
-    get_embedding_status, get_graph, get_memory_record_detail, get_status, handoff_session,
-    import_agent_transcripts, import_memory, index_code, ingest_capture_event, init_project,
-    list_agent_queries, list_candidates, list_capture_events, list_context, list_events,
-    list_sessions, list_state, load_capture_config, log_decision, pending_embedding_count,
-    process_embedding_jobs, propose_candidate, propose_capture_candidates, reject_candidate,
-    run_reflection, save_entity, search_memory, start_capture_session, start_session,
-    stop_capture_session, update_capture_config, update_context, update_decision, update_entity,
-    update_observation, update_relation, update_session, upsert_state, AddContextOptions,
-    AgentMemoryBriefing, AgentTranscriptImportReport, ApproveCandidateOptions, AskMemoryOptions,
-    BulkCandidateReviewOptions, BulkCandidateReviewReport, CandidateMutationReport, CandidateOrder,
-    CaptureCandidateReport, CaptureConfigOptions, CaptureConfigReport, CaptureEvent,
-    CaptureEventReport, CaptureSessionReport, CaptureSourceUpdates, CaptureStatusOptions,
-    CaptureStatusReport, ChatOptions, ChatReply, ContextListOptions, DeleteContextOptions,
-    DeleteDecisionOptions, DeleteEntityOptions, DeleteObservationOptions, DeleteRelationOptions,
-    DeleteStateOptions, EditCandidateOptions, EmbeddingStatusOptions, EmbeddingStatusReport,
-    EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions, GetContextOptions,
-    GetMemoryRecordOptions, GraphOptions, HandoffOptions, ImportAgentTranscriptsOptions,
-    ImportOptions, IndexCodeOptions, IngestCaptureEventOptions, InitOptions,
-    ListAgentQueriesOptions, ListCandidatesOptions, ListCaptureEventsOptions, LogDecisionOptions,
-    ProcessEmbeddingsOptions, ProcessEmbeddingsReport, ProjectReportOptions, ProjectResolveOptions,
-    ProposeCandidateOptions, ProposeCaptureCandidatesOptions, RejectCandidateOptions,
-    RunReflectionOptions, SaveEntityOptions, Scope, SearchMemoryOptions,
-    SearchMode as CoreSearchMode, SessionLogOptions, StartCaptureOptions, StartSessionOptions,
-    StateListOptions, StatusOptions, StopCaptureOptions, UpdateCaptureConfigOptions,
-    UpdateContextOptions, UpdateDecisionOptions, UpdateEntityOptions, UpdateObservationOptions,
-    UpdateRelationOptions, UpdateSessionOptions, UpsertStateOptions,
+    add_context, approve_candidate, ask_memory, bulk_review_candidates, chat, chat_with_provider,
+    delete_context, delete_decision, delete_entity, delete_observation, delete_relation,
+    delete_state, edit_candidate, end_session, export_memory, generate_report, get_capture_status,
+    get_context, get_embedding_status, get_graph, get_memory_record_detail, get_status,
+    handoff_session, import_agent_transcripts, import_memory, index_code, ingest_capture_event,
+    init_project, list_agent_queries, list_candidates, list_capture_events, list_context,
+    list_events, list_sessions, list_state, load_capture_config, log_decision,
+    pending_embedding_count, process_embedding_jobs, propose_candidate, propose_capture_candidates,
+    reject_candidate, run_reflection, save_entity, search_memory, start_capture_session,
+    start_session, stop_capture_session, update_capture_config, update_context, update_decision,
+    update_entity, update_observation, update_relation, update_session, upsert_state,
+    AddContextOptions, AgentMemoryBriefing, AgentTranscriptImportReport, ApproveCandidateOptions,
+    AskMemoryOptions, BulkCandidateReviewOptions, BulkCandidateReviewReport,
+    CandidateMutationReport, CandidateOrder, CaptureCandidateReport, CaptureConfigOptions,
+    CaptureConfigReport, CaptureEvent, CaptureEventReport, CaptureSessionReport,
+    CaptureSourceUpdates, CaptureStatusOptions, CaptureStatusReport, ChatOptions, ChatReply,
+    ContextListOptions, DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions,
+    DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions,
+    EmbeddingStatusOptions, EmbeddingStatusReport, EndSessionOptions, EventListOptions,
+    EvidenceInput, ExportOptions, GetContextOptions, GetMemoryRecordOptions, GraphOptions,
+    HandoffOptions, ImportAgentTranscriptsOptions, ImportOptions, IndexCodeOptions,
+    IngestCaptureEventOptions, InitOptions, ListAgentQueriesOptions, ListCandidatesOptions,
+    ListCaptureEventsOptions, LogDecisionOptions, OllamaProvider, ProcessEmbeddingsOptions,
+    ProcessEmbeddingsReport, ProjectReportOptions, ProjectResolveOptions, ProposeCandidateOptions,
+    ProposeCaptureCandidatesOptions, RejectCandidateOptions, RunReflectionOptions,
+    SaveEntityOptions, Scope, SearchMemoryOptions, SearchMode as CoreSearchMode, SessionLogOptions,
+    StartCaptureOptions, StartSessionOptions, StateListOptions, StatusOptions, StopCaptureOptions,
+    UpdateCaptureConfigOptions, UpdateContextOptions, UpdateDecisionOptions, UpdateEntityOptions,
+    UpdateObservationOptions, UpdateRelationOptions, UpdateSessionOptions, UpsertStateOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -319,6 +319,15 @@ enum Command {
         /// Maximum memories to ground the answer on.
         #[arg(long, default_value_t = 8)]
         limit: usize,
+
+        /// Local model (via Ollama) to phrase a conversational answer, e.g.
+        /// "gemma3:1b". Omit to return the deterministic extractive answer (no model).
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Ollama endpoint for --model (default http://localhost:11434).
+        #[arg(long)]
+        ollama_url: Option<String>,
 
         /// Temporal/decay boost (0 = off): bias toward recent + frequently-reused memory. (M-E2.)
         #[arg(long, default_value_t = 0.0)]
@@ -1947,11 +1956,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             project,
             scope,
             limit,
+            model,
+            ollama_url,
             temporal_weight,
             path,
             format,
         } => {
-            let reply = chat(ChatOptions {
+            let options = ChatOptions {
                 project_name: project,
                 start_dir: path,
                 grafiki_home: None,
@@ -1959,7 +1970,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 scope,
                 limit,
                 temporal_weight,
-            })?;
+            };
+            // With --model, phrase a conversational answer via a local model
+            // (Ollama). If it's unreachable, fall back to the deterministic
+            // extractive answer rather than failing — memory retrieval succeeded.
+            let reply = match &model {
+                Some(_) => {
+                    let provider = OllamaProvider::new(ollama_url, model);
+                    match chat_with_provider(options.clone(), &provider) {
+                        Ok(reply) => reply,
+                        Err(error) => {
+                            eprintln!("Local model unavailable ({error}); showing raw memory.");
+                            chat(options)?
+                        }
+                    }
+                }
+                None => chat(options)?,
+            };
             match format {
                 OutputFormat::Plain | OutputFormat::Md => print_chat_plain(&reply),
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&reply)?),

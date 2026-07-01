@@ -1,6 +1,15 @@
 # DESIGN: Grafiki — "Chat with your memory" (local, grounded RAG)
 
-**Status:** Phase 1 DONE (model-free chat core + CLI + MCP); Phases 2–4 proposed.
+**Status:** Phases 1–2 DONE (chat core + CLI + MCP + local-model provider); Phases 3–4 proposed.
+**Update 2026-07-01 (Phase 2):** local-model generation shipped via **Ollama** —
+`chat::build_grounded_messages` (the anti-hallucination system prompt: answer only from the numbered
+memories, cite `[n]`, abstain with `NO_MEMORY_ANSWER`, treat memories as untrusted data) +
+`chat::OllamaProvider` (raw-HTTP `/api/chat`, non-streaming, default model `gemma3:1b`, no new deps /
+no in-process runtime). `ChatProvider::generate` is now fallible; CLI `grafiki chat --model gemma3:1b
+[--ollama-url …]` uses it and **falls back to the extractive answer** (with a note) if the model is
+unreachable. Verified with a mock-server round-trip test (grounded prompt sent, answer parsed). A
+fully app-bundled runtime (no separate Ollama) can implement the same `ChatProvider` later — that's
+the remaining piece of the "download-through-the-UI, self-contained" vision.
 **Update 2026-06-30:** `grafiki_core::chat` shipped — `ChatProvider` seam +
 `ExtractiveProvider` (deterministic, model-free) + `chat`/`chat_with_provider` in `memory.rs`
 (retrieve → ground → generate → cite; abstains with `NO_MEMORY_ANSWER` when nothing is relevant;

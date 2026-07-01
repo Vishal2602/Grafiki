@@ -66,6 +66,9 @@ pub enum GrafikiError {
     #[error("Code indexing error: {0}")]
     CodeIndex(String),
 
+    #[error("Chat model error: {0}")]
+    Chat(String),
+
     #[error("Entity not found: {0}")]
     EntityNotFound(String),
 
