@@ -1,7 +1,7 @@
 import type { LayoutState, PaneState } from "./types";
 
 export const defaultPanes: PaneState[] = [
-  { id: "overview", kind: "overview", title: "Overview" },
+  { id: "terminal", kind: "terminal", title: "Terminal" },
 ];
 
 const STORAGE_KEY = "grafiki.desktop.layout";

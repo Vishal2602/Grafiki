@@ -124,19 +124,13 @@ import type {
 
 const PROJECT_ROOT_KEY = "grafiki.desktop.projectRoot";
 
+// Ultra-minimal nav (Wispr/Granola feel): the core loop only. The other panes
+// (overview/search/graph/agent/relations/sessions/state/decisions/context) still
+// exist and render if reached — they're just off the sidebar to keep it clean.
 const navItems: Array<{ kind: PaneKind; label: string; hotkey: string; icon: typeof LayoutDashboard }> = [
-  { kind: "overview", label: "Overview", hotkey: "O", icon: LayoutDashboard },
-  { kind: "search", label: "Search", hotkey: "/", icon: SearchIcon },
-  { kind: "chat", label: "Chat", hotkey: "K", icon: MessageSquare },
   { kind: "terminal", label: "Terminal", hotkey: "J", icon: TerminalSquare },
-  { kind: "graph", label: "Graph", hotkey: "G", icon: Network },
+  { kind: "chat", label: "Chat", hotkey: "K", icon: MessageSquare },
   { kind: "candidates", label: "Review", hotkey: "V", icon: ShieldQuestion },
-  { kind: "agent", label: "Agent Activity", hotkey: "A", icon: RadioTower },
-  { kind: "relations", label: "Relations", hotkey: "R", icon: GitBranch },
-  { kind: "sessions", label: "Sessions", hotkey: "S", icon: History },
-  { kind: "state", label: "State", hotkey: "T", icon: Activity },
-  { kind: "decisions", label: "Decisions", hotkey: "D", icon: GitBranch },
-  { kind: "context", label: "Context", hotkey: "C", icon: Archive },
   { kind: "settings", label: "Settings", hotkey: ",", icon: Settings },
 ];
 
@@ -2626,10 +2620,6 @@ function CandidatesPane(props: {
             placeholder="0"
           />
         </label>
-        <button className="button primary" type="button" onClick={autoCapture} disabled={capturing}>
-          <Sparkles size={15} />
-          {capturing ? "Capturing" : "Auto Capture"}
-        </button>
         <span className="subtle">{visibleCandidates.length}/{candidates.length} candidates</span>
         {candidates.length > 0 && visibleCandidates.length === 0 && minConfidenceValue > 0 ? (
           <span className="subtle">
@@ -2654,31 +2644,6 @@ function CandidatesPane(props: {
         <button className="button danger-button" type="button" onClick={() => bulkReview("reject")} disabled={!selectedIds.length || Boolean(busyId)}>
           <Trash2 size={15} />
           Reject Selected
-        </button>
-      </div>
-      <div className="toolbar-row candidate-toolbar">
-        <span className="subtle">
-          {captureStatus?.active_sessions.length ?? 0} live / {captureStatus?.event_count ?? 0} raw events
-        </span>
-        <button className="button" type="button" onClick={startRawCapture} disabled={capturing}>
-          <CircleDot size={15} />
-          Start
-        </button>
-        <button className="button" type="button" onClick={stopRawCapture} disabled={capturing || !captureStatus?.active_sessions.length}>
-          <X size={15} />
-          Stop
-        </button>
-        <button className="button" type="button" onClick={captureScreen} disabled={capturing}>
-          <PanelRight size={15} />
-          Screen
-        </button>
-        <button className="button" type="button" onClick={importTranscript} disabled={capturing}>
-          <Upload size={15} />
-          Transcript
-        </button>
-        <button className="button" type="button" onClick={summarizeCapture} disabled={capturing || !(captureStatus?.event_count ?? 0)}>
-          <Sparkles size={15} />
-          Summarize
         </button>
       </div>
       {message ? <section className="notice compact good">{message}</section> : null}
