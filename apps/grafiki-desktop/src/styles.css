@@ -60,7 +60,10 @@
 }
 
 :root {
-  color-scheme: light dark;
+  /* Grafiki is a light-mode app by design. Do NOT follow the OS dark setting —
+     the incomplete dark palette (added in M5) made panes look broken on a
+     dark-mode Mac. Forcing `light` keeps native controls light too. */
+  color-scheme: light;
   --paper: #f6f4ee;
   --paper-strong: #ffffff;
   --rail: #fbfaf7;
@@ -84,25 +87,9 @@
     sans-serif;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --paper: #16181c;
-    --paper-strong: #1e2127;
-    --rail: #14161a;
-    --ink: #e8e6e0;
-    --ink-soft: #b3b8bf;
-    --ink-mute: #7b828b;
-    --line: #2c2f36;
-    --line-strong: #3a3e46;
-    --accent: #ff7a33;
-    --accent-soft: #2a1b10;
-    --teal: #2bb3a3;
-    --warn: #e0a13a;
-    --warning-soft: #2a2310;
-    --good: #3fae6b;
-    --shadow: rgba(0, 0, 0, 0.45);
-  }
-}
+/* Dark-mode override intentionally removed — Grafiki is light-mode only (the
+   partial dark palette read as broken). Restore from git history if a complete,
+   opt-in dark theme is ever built. */
 
 @media (prefers-reduced-motion: reduce) {
   *,
