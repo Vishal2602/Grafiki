@@ -169,6 +169,28 @@ export async function chatWithMemory(input: {
   });
 }
 
+/// One "Granola" tick: extract durable memory from unprocessed session events
+/// (hosted-terminal output, imported transcripts) into Review candidates.
+/// Returns null when another pass is already running (or in browser preview).
+export async function extractSessionMemory(input: {
+  startDir?: string;
+  model?: string | null;
+}): Promise<{ events_read: number; proposed: number; message: string } | null> {
+  if (!hasTauri()) {
+    return null;
+  }
+  return invoke<{ events_read: number; proposed: number; message: string } | null>(
+    "extract_session_memory",
+    {
+      request: {
+        startDir: input.startDir ?? "",
+        model: input.model ?? null,
+        ollamaUrl: null,
+      },
+    },
+  );
+}
+
 export async function getMemoryGraph(input: {
   startDir?: string;
   entityId: string;

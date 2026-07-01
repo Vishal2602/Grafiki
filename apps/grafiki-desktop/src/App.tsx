@@ -41,6 +41,7 @@ import {
   deleteMemoryRecord,
   editCandidate,
   exportMemoryToFile,
+  extractSessionMemory,
   getCaptureConfig,
   getDaemonStatus,
   getMemoryRecord,
@@ -766,16 +767,26 @@ function TerminalPane(props: { projectRoot: string }) {
     observer.observe(containerRef.current);
     term.focus();
 
+    // The Granola heartbeat: periodically turn this session's captured output
+    // into Review candidates (backend is single-flight; silent — extraction
+    // must never disturb the terminal).
+    const extractTimer = window.setInterval(() => {
+      extractSessionMemory({ startDir: props.projectRoot }).catch(() => undefined);
+    }, 120_000);
+
     return () => {
       cancelled = true;
       if (launchTimer) {
         window.clearTimeout(launchTimer);
       }
+      window.clearInterval(extractTimer);
       observer.disconnect();
       onData.dispose();
       // Detach ONLY — the session (and the agent) keeps running in the pool.
       void invoke("terminal_detach", { id });
       term.dispose();
+      // One more pass on the way out, so Review is fresh when the user lands there.
+      extractSessionMemory({ startDir: props.projectRoot }).catch(() => undefined);
     };
   }, [session, props.projectRoot]);
 
@@ -1103,6 +1114,23 @@ function CandidatesPane(props: {
   useEffect(() => {
     load();
   }, [props.startDir, props.snapshot, scope, status]);
+
+  // Opening Review runs one extraction pass over anything captured since the
+  // last one (terminal output, transcripts), so fresh candidates are waiting.
+  useEffect(() => {
+    let cancelled = false;
+    extractSessionMemory({ startDir: props.startDir })
+      .then((report) => {
+        if (!cancelled && report && report.proposed > 0) {
+          void load();
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.startDir]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {

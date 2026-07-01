@@ -12,35 +12,36 @@ use tauri::{AppHandle, Manager, RunEvent, State};
 use grafiki_core::{
     add_context, approve_candidate, bulk_review_candidates, chat, chat_with_provider,
     delete_context, delete_decision, delete_entity, delete_observation, delete_relation,
-    delete_state, edit_candidate, export_memory, generate_report, get_capture_status, get_context,
-    get_embedding_status, get_graph, get_status, handoff_session, import_agent_transcripts,
-    import_memory, ingest_capture_event, init_project, list_agent_queries, list_candidates,
-    list_capture_events, list_context, list_decisions, list_events, list_relations, list_sessions,
-    list_state, load_capture_config, log_decision, process_embedding_jobs, propose_candidate,
-    propose_capture_candidates, reject_candidate, resolve_project, save_entity, search_memory,
-    start_capture_session, start_session, stop_capture_session, update_capture_config,
-    update_context, update_decision, update_entity, update_observation, update_relation,
-    update_session, upsert_state, AddContextOptions, AgentQueryLogItem,
-    AgentTranscriptImportReport, ApproveCandidateOptions, BulkCandidateReviewOptions,
-    BulkCandidateReviewReport, CandidateMutationReport, CandidateOrder, CaptureCandidateReport,
-    CaptureConfigOptions, CaptureConfigReport, CaptureEvent, CaptureEventReport,
-    CaptureSessionReport, CaptureSourceUpdates, CaptureStatusOptions, CaptureStatusReport,
-    ChatOptions, ChatReply, ContextListOptions, ContextSummary, DecisionItem, DecisionListOptions,
-    DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions, DeleteObservationOptions,
-    DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions, EmbeddingStatusOptions,
-    EmbeddingStatusReport, EndSessionOptions, EndSessionReport, EventListOptions, EvidenceInput,
-    ExportBundle, ExportOptions, ExtractionCandidate, GetContextOptions, GraphOptions,
-    GraphRelation, GraphReport, HandoffOptions, HandoffReport, ImportAgentTranscriptsOptions,
-    ImportOptions, ImportReport, IngestCaptureEventOptions, InitOptions, InitReport,
-    ListAgentQueriesOptions, ListCandidatesOptions, ListCaptureEventsOptions, LogDecisionOptions,
-    OllamaProvider, ProcessEmbeddingsOptions, ProcessEmbeddingsReport, ProjectReport,
-    ProjectReportOptions, ProjectResolveOptions, ProposeCandidateOptions,
-    ProposeCaptureCandidatesOptions, RejectCandidateOptions, RelationListOptions,
-    SaveEntityOptions, SearchMemoryOptions, SearchMode, SearchReport, SessionLogItem,
-    SessionLogOptions, StartCaptureOptions, StartSessionOptions, StartSessionReport, StateItem,
-    StateListOptions, StatusOptions, StatusReport, StopCaptureOptions, UpdateCaptureConfigOptions,
-    UpdateDecisionOptions, UpdateEntityOptions, UpdateObservationOptions, UpdateRelationOptions,
-    UpdateSessionOptions, UpsertStateOptions,
+    delete_state, edit_candidate, export_memory, extract_capture_memory, generate_report,
+    get_capture_status, get_context, get_embedding_status, get_graph, get_status, handoff_session,
+    import_agent_transcripts, import_memory, ingest_capture_event, init_project,
+    list_agent_queries, list_candidates, list_capture_events, list_context, list_decisions,
+    list_events, list_relations, list_sessions, list_state, load_capture_config, log_decision,
+    process_embedding_jobs, propose_candidate, propose_capture_candidates, reject_candidate,
+    resolve_project, save_entity, search_memory, start_capture_session, start_session,
+    stop_capture_session, update_capture_config, update_context, update_decision, update_entity,
+    update_observation, update_relation, update_session, upsert_state, AddContextOptions,
+    AgentQueryLogItem, AgentTranscriptImportReport, ApproveCandidateOptions,
+    BulkCandidateReviewOptions, BulkCandidateReviewReport, CandidateMutationReport, CandidateOrder,
+    CaptureCandidateReport, CaptureConfigOptions, CaptureConfigReport, CaptureEvent,
+    CaptureEventReport, CaptureExtractReport, CaptureSessionReport, CaptureSourceUpdates,
+    CaptureStatusOptions, CaptureStatusReport, ChatOptions, ChatReply, ContextListOptions,
+    ContextSummary, DecisionItem, DecisionListOptions, DeleteContextOptions, DeleteDecisionOptions,
+    DeleteEntityOptions, DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions,
+    EditCandidateOptions, EmbeddingStatusOptions, EmbeddingStatusReport, EndSessionOptions,
+    EndSessionReport, EventListOptions, EvidenceInput, ExportBundle, ExportOptions,
+    ExtractCaptureOptions, ExtractionCandidate, GetContextOptions, GraphOptions, GraphRelation,
+    GraphReport, HandoffOptions, HandoffReport, ImportAgentTranscriptsOptions, ImportOptions,
+    ImportReport, IngestCaptureEventOptions, InitOptions, InitReport, ListAgentQueriesOptions,
+    ListCandidatesOptions, ListCaptureEventsOptions, LogDecisionOptions, OllamaProvider,
+    ProcessEmbeddingsOptions, ProcessEmbeddingsReport, ProjectReport, ProjectReportOptions,
+    ProjectResolveOptions, ProposeCandidateOptions, ProposeCaptureCandidatesOptions,
+    RejectCandidateOptions, RelationListOptions, SaveEntityOptions, SearchMemoryOptions,
+    SearchMode, SearchReport, SessionLogItem, SessionLogOptions, StartCaptureOptions,
+    StartSessionOptions, StartSessionReport, StateItem, StateListOptions, StatusOptions,
+    StatusReport, StopCaptureOptions, UpdateCaptureConfigOptions, UpdateDecisionOptions,
+    UpdateEntityOptions, UpdateObservationOptions, UpdateRelationOptions, UpdateSessionOptions,
+    UpsertStateOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -699,6 +700,69 @@ fn chat_with_memory(request: ChatRequest) -> Result<ChatReply, String> {
         }
         None => chat(options).map_err(|error| error.to_string()),
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtractSessionRequest {
+    start_dir: Option<String>,
+    model: Option<String>,
+    ollama_url: Option<String>,
+}
+
+/// One tick of the "Granola for agents" loop, desktop edition: extract durable
+/// memory from every not-yet-extracted session event (hosted-terminal output +
+/// imported transcripts) and propose it in Review. Runs at most one at a time —
+/// callers fire it opportunistically (terminal heartbeat, Review refresh).
+#[tauri::command]
+fn extract_session_memory(
+    request: ExtractSessionRequest,
+) -> Result<Option<CaptureExtractReport>, String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    if RUNNING.swap(true, Ordering::SeqCst) {
+        return Ok(None); // an extraction pass is already in flight
+    }
+    let result = (|| {
+        let ollama_url = clean_optional(request.ollama_url);
+        // Use the configured model if given; otherwise prefer the default when
+        // it's actually installed, else the first installed model — never fail
+        // on a hardcoded name the user doesn't have.
+        let model = match clean_optional(request.model) {
+            Some(model) => model,
+            None => {
+                let models = grafiki_core::list_ollama_models(ollama_url.clone())
+                    .map_err(|error| error.to_string())?;
+                if models
+                    .iter()
+                    .any(|name| name == OllamaProvider::DEFAULT_MODEL)
+                {
+                    OllamaProvider::DEFAULT_MODEL.to_owned()
+                } else {
+                    models.first().cloned().ok_or_else(|| {
+                        "No local models installed — run `ollama pull gemma3:1b` (or any model) \
+                         to enable automatic memory extraction."
+                            .to_owned()
+                    })?
+                }
+            }
+        };
+        extract_capture_memory(ExtractCaptureOptions {
+            project_name: None,
+            start_dir: resolve_start_dir(request.start_dir),
+            grafiki_home: None,
+            capture_id: None,
+            scope: String::new(),
+            limit: 200,
+            model: Some(model),
+            ollama_url,
+            unextracted_only: true,
+        })
+        .map(Some)
+        .map_err(|error| error.to_string())
+    })();
+    RUNNING.store(false, Ordering::SeqCst);
+    result
 }
 
 #[tauri::command]
@@ -2217,6 +2281,7 @@ pub fn run() {
             terminal::terminal_attach,
             terminal::terminal_detach,
             terminal::terminal_revive,
+            extract_session_memory,
             terminal::terminal_write,
             terminal::terminal_resize,
             terminal::terminal_close,

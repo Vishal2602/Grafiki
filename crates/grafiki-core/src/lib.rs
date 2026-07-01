@@ -28,8 +28,8 @@ pub mod transcript;
 pub mod ulid;
 
 pub use chat::{
-    build_grounded_messages, ChatMessage, ChatProvider, ChatReply, Citation, ExtractiveProvider,
-    GroundedMemory, OllamaProvider,
+    build_grounded_messages, list_ollama_models, ChatMessage, ChatProvider, ChatReply, Citation,
+    ExtractiveProvider, GroundedMemory, OllamaProvider,
 };
 pub use code_index::{index_code, IndexCodeOptions, IndexCodeReport};
 pub use conflict::{
@@ -79,10 +79,9 @@ pub use memory::{
 };
 pub use project::{
     grafiki_home, init_project, load_capture_config, resolve_project, update_capture_config,
-    CaptureConfig,
-    CaptureConfigOptions, CaptureConfigReport, CaptureSourceConfig, CaptureSourceUpdates,
-    InitImportedFile, InitOptions, InitReport, ProjectContext, ProjectResolveOptions,
-    UpdateCaptureConfigOptions,
+    CaptureConfig, CaptureConfigOptions, CaptureConfigReport, CaptureSourceConfig,
+    CaptureSourceUpdates, InitImportedFile, InitOptions, InitReport, ProjectContext,
+    ProjectResolveOptions, UpdateCaptureConfigOptions,
 };
 pub use reflection::{CommunityDetail, ReflectionReport, RunReflectionOptions};
 pub use scope::{Scope, ScopeChain};

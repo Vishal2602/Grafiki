@@ -171,7 +171,19 @@ impl OllamaProvider {
             "messages": serde_json::to_value(messages)?,
             "stream": false,
         });
-        let response = ollama_post(&self.base_url, "/api/chat", &body)?;
+        let response = ollama_post(&self.base_url, "/api/chat", &body).map_err(|error| {
+            // The by-far most common failure: the configured model isn't pulled.
+            match error {
+                crate::error::GrafikiError::Chat(message) if message.contains("404") => {
+                    crate::error::GrafikiError::Chat(format!(
+                        "{message} — the model '{model}' doesn't seem to be installed. Run \
+                         `ollama pull {model}`, or pick one you have (`ollama list`).",
+                        model = self.model
+                    ))
+                }
+                other => other,
+            }
+        })?;
         let content = response
             .get("message")
             .and_then(|message| message.get("content"))
@@ -199,6 +211,32 @@ fn ollama_post(
     path: &str,
     body: &serde_json::Value,
 ) -> crate::Result<serde_json::Value> {
+    ollama_call(base_url, path, Some(body))
+}
+
+/// The models the local Ollama server has pulled (`GET /api/tags`), by name.
+/// Lets surfaces pick an INSTALLED model instead of failing on the default.
+pub fn list_ollama_models(base_url: Option<String>) -> crate::Result<Vec<String>> {
+    let base_url = base_url.unwrap_or_else(|| OllamaProvider::DEFAULT_URL.to_owned());
+    let response = ollama_call(&base_url, "/api/tags", None)?;
+    Ok(response
+        .get("models")
+        .and_then(|models| models.as_array())
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| model.get("name").and_then(|name| name.as_str()))
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn ollama_call(
+    base_url: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> crate::Result<serde_json::Value> {
     use crate::error::GrafikiError;
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -216,12 +254,17 @@ fn ollama_post(
     };
     let host = host_port.split(':').next().unwrap_or("localhost");
 
-    let payload = serde_json::to_string(body)?;
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
-        payload.len()
-    );
+    let request = match body {
+        Some(body) => {
+            let payload = serde_json::to_string(body)?;
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            )
+        }
+        None => format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"),
+    };
 
     let mut stream = TcpStream::connect(&host_port).map_err(|error| {
         GrafikiError::Chat(format!(
@@ -236,24 +279,75 @@ fn ollama_post(
 
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw)?;
-    let text = String::from_utf8_lossy(&raw);
-    let status_ok = text
-        .lines()
-        .next()
-        .map(|line| line.contains(" 200"))
-        .unwrap_or(false);
-    let body_start = text
-        .find("\r\n\r\n")
+    let body_start = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
         .map(|index| index + 4)
         .ok_or_else(|| GrafikiError::Chat("malformed HTTP response from chat model".to_owned()))?;
-    if !status_ok {
+    let head = String::from_utf8_lossy(&raw[..body_start]);
+    let status_line = head.lines().next().unwrap_or("unknown status").to_owned();
+    // Ollama (Go's net/http) uses chunked transfer-encoding for any response
+    // beyond a couple of KB — i.e. for every real answer. Decode it; otherwise
+    // (Content-Length / close-delimited) the remaining bytes ARE the body.
+    let chunked = head.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with("transfer-encoding:") && lower.contains("chunked")
+    });
+    let body = if chunked {
+        decode_chunked_body(&raw[body_start..])?
+    } else {
+        raw[body_start..].to_vec()
+    };
+    if !status_line.contains(" 200") {
+        // Surface Ollama's own explanation (e.g. `model 'x' not found`), not
+        // just the bare status line.
+        let detail: String = String::from_utf8_lossy(&body)
+            .trim()
+            .chars()
+            .take(200)
+            .collect();
         return Err(GrafikiError::Chat(format!(
-            "chat model returned an error: {}",
-            text.lines().next().unwrap_or("unknown status")
+            "chat model returned an error: {status_line}{}{detail}",
+            if detail.is_empty() { "" } else { " — " }
         )));
     }
-    serde_json::from_str(text[body_start..].trim())
+    serde_json::from_slice(&body)
         .map_err(|error| GrafikiError::Chat(format!("invalid JSON from chat model: {error}")))
+}
+
+/// Decode an HTTP/1.1 chunked body: hex-size line, `size` raw bytes, CRLF,
+/// repeated until the `0` chunk. Operates on bytes — chunk boundaries can split
+/// multi-byte UTF-8 characters, so decoding must precede any string conversion.
+fn decode_chunked_body(mut rest: &[u8]) -> crate::Result<Vec<u8>> {
+    use crate::error::GrafikiError;
+
+    let malformed = || GrafikiError::Chat("malformed chunked response from chat model".to_owned());
+    let mut body = Vec::new();
+    loop {
+        let line_end = rest
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .ok_or_else(malformed)?;
+        let size_text = String::from_utf8_lossy(&rest[..line_end]);
+        // Chunk extensions (";...") are legal; ignore them.
+        let size_field = size_text.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_field, 16).map_err(|_| malformed())?;
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            return Ok(body); // trailers (if any) are irrelevant to us
+        }
+        if rest.len() < size {
+            return Err(malformed());
+        }
+        body.extend_from_slice(&rest[..size]);
+        rest = &rest[size..];
+        // The CRLF after the chunk data.
+        if rest.len() >= 2 && &rest[..2] == b"\r\n" {
+            rest = &rest[2..];
+        } else {
+            return Err(malformed());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -352,5 +446,54 @@ mod tests {
             "memory must be grounded in"
         );
         assert!(request.contains("ONLY"), "grounding rules must be sent");
+    }
+
+    #[test]
+    fn ollama_provider_decodes_chunked_responses() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // Real Ollama (Go net/http) sends Transfer-Encoding: chunked for any
+        // response over a couple of KB — i.e. for every real answer. This mock
+        // chunks the reply, deliberately splitting a multi-byte UTF-8 character
+        // ("é" = 0xC3 0xA9) across two chunks.
+        let json =
+            r#"{"message":{"role":"assistant","content":"café latte is the deploy codename"}}"#;
+        let json_bytes = json.as_bytes();
+        // Split inside "café"'s two-byte é (byte offset of 0xA9).
+        let split = json_bytes.iter().position(|byte| *byte == 0xA9).unwrap();
+        let (first, second) = json_bytes.split_at(split);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let first = first.to_vec();
+        let second = second.to_vec();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = socket.read(&mut buf).unwrap();
+            let mut response = Vec::new();
+            response.extend_from_slice(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                  Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            );
+            for chunk in [&first[..], &second[..]] {
+                response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                response.extend_from_slice(chunk);
+                response.extend_from_slice(b"\r\n");
+            }
+            response.extend_from_slice(b"0\r\n\r\n");
+            socket.write_all(&response).unwrap();
+        });
+
+        let provider = OllamaProvider::new(Some(format!("http://127.0.0.1:{port}")), None);
+        let answer = provider
+            .complete(&[ChatMessage {
+                role: "user".to_owned(),
+                content: "codename?".to_owned(),
+            }])
+            .unwrap();
+        assert_eq!(answer, "café latte is the deploy codename");
+        server.join().unwrap();
     }
 }

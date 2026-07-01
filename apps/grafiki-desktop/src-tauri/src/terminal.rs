@@ -53,7 +53,9 @@ struct SessionDescriptor {
 static DESCRIPTOR_LOCK: Mutex<()> = Mutex::new(());
 
 fn descriptor_path() -> Option<PathBuf> {
-    grafiki_core::grafiki_home().ok().map(|home| home.join(DESCRIPTOR_FILE))
+    grafiki_core::grafiki_home()
+        .ok()
+        .map(|home| home.join(DESCRIPTOR_FILE))
 }
 
 fn unix_now() -> u64 {
@@ -218,7 +220,9 @@ pub fn terminal_open(
     cols: u16,
     on_output: Channel<Vec<u8>>,
 ) -> Result<String, String> {
-    spawn_session(&registry, id, cwd, command, launch, rows, cols, on_output, None)
+    spawn_session(
+        &registry, id, cwd, command, launch, rows, cols, on_output, None,
+    )
 }
 
 /// Revive a session from its on-disk descriptor after an app relaunch: re-open a
@@ -243,7 +247,9 @@ pub fn terminal_revive(
     };
     let mut preamble = Vec::new();
     if !descriptor.tail.trim().is_empty() {
-        preamble.extend_from_slice(b"\x1b[2m\xe2\x94\x80\xe2\x94\x80 previous session \xe2\x94\x80\xe2\x94\x80\x1b[0m\r\n");
+        preamble.extend_from_slice(
+            b"\x1b[2m\xe2\x94\x80\xe2\x94\x80 previous session \xe2\x94\x80\xe2\x94\x80\x1b[0m\r\n",
+        );
         preamble.extend_from_slice(descriptor.tail.replace('\n', "\r\n").as_bytes());
         preamble.extend_from_slice(b"\r\n\x1b[2m\xe2\x94\x80\xe2\x94\x80 end of previous session \xe2\x94\x80\xe2\x94\x80 resuming\x1b[0m\r\n");
     }
@@ -605,9 +611,7 @@ fn strip_ansi(bytes: &[u8]) -> String {
                         // OSC: until BEL (0x07) or ST (ESC \).
                         i += 1;
                         while i < bytes.len() && bytes[i] != 0x07 {
-                            if bytes[i] == 0x1b
-                                && bytes.get(i + 1) == Some(&b'\\')
-                            {
+                            if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
                                 i += 1;
                                 break;
                             }

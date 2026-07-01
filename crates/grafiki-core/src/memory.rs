@@ -4637,6 +4637,11 @@ pub struct ExtractCaptureOptions {
     /// Local model (via Ollama) that reads the transcript. Default `gemma3:1b`.
     pub model: Option<String>,
     pub ollama_url: Option<String>,
+    /// `true` = ignore `capture_id` and read every session event (transcript +
+    /// terminal) newer than the durable extraction cursor, oldest first; the
+    /// cursor advances ONLY after the whole pass succeeds, so a failed model
+    /// call is retried instead of silently consuming the session.
+    pub unextracted_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4655,15 +4660,25 @@ pub struct CaptureExtractReport {
 /// reviewable candidates. Best-effort: needs a running local model, so it is not a
 /// default-build CI gate (the pure prompt/parse logic in [`crate::extract`] is).
 pub fn extract_capture_memory(options: ExtractCaptureOptions) -> Result<CaptureExtractReport> {
-    let events = list_capture_events(ListCaptureEventsOptions {
-        project_name: options.project_name.clone(),
-        start_dir: options.start_dir.clone(),
-        grafiki_home: options.grafiki_home.clone(),
-        capture_id: options.capture_id.clone(),
-        source_type: None,
-        scope: options.scope.clone(),
-        limit: options.limit,
-    })?;
+    let events = if options.unextracted_only {
+        list_unextracted_session_events(
+            options.project_name.clone(),
+            options.start_dir.clone(),
+            options.grafiki_home.clone(),
+            &options.scope,
+            options.limit,
+        )?
+    } else {
+        list_capture_events(ListCaptureEventsOptions {
+            project_name: options.project_name.clone(),
+            start_dir: options.start_dir.clone(),
+            grafiki_home: options.grafiki_home.clone(),
+            capture_id: options.capture_id.clone(),
+            source_type: None,
+            scope: options.scope.clone(),
+            limit: options.limit,
+        })?
+    };
     if events.is_empty() {
         return Ok(CaptureExtractReport {
             events_read: 0,
@@ -4733,6 +4748,20 @@ pub fn extract_capture_memory(options: ExtractCaptureOptions) -> Result<CaptureE
         proposed += 1;
     }
 
+    // Advance the durable cursor only now — model call AND every proposal
+    // succeeded, so nothing can be lost. On any earlier error the cursor stays
+    // put and the next pass re-reads these events (fix for consume-on-failure).
+    if options.unextracted_only {
+        if let Some(last) = events.last() {
+            advance_extraction_cursor(
+                options.project_name,
+                options.start_dir,
+                options.grafiki_home,
+                &last.id,
+            )?;
+        }
+    }
+
     Ok(CaptureExtractReport {
         events_read: events.len(),
         proposed,
@@ -4742,6 +4771,75 @@ pub fn extract_capture_memory(options: ExtractCaptureOptions) -> Result<CaptureE
             proposed
         ),
     })
+}
+
+/// Name of the single durable auto-extraction cursor in `capture_cursors`.
+const EXTRACTION_CURSOR: &str = "auto-extract";
+
+/// Session events (agent transcript turns + hosted-terminal output) newer than
+/// the extraction cursor, OLDEST FIRST so the cursor can advance monotonically.
+fn list_unextracted_session_events(
+    project_name: Option<String>,
+    start_dir: PathBuf,
+    grafiki_home: Option<PathBuf>,
+    scope: &str,
+    limit: usize,
+) -> Result<Vec<CaptureEvent>> {
+    let scope = Scope::new(scope)?;
+    let scope_chain = scope.chain().into_vec();
+    let (_project, connection) = resolve_and_open(project_name, start_dir, grafiki_home)?;
+    let limit = limit.clamp(1, 500) as i64;
+    let cursor: String = connection
+        .query_row(
+            "SELECT last_event_id FROM capture_cursors WHERE name = ?1",
+            params![EXTRACTION_CURSOR],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_default();
+
+    let sql = format!(
+        "
+        SELECT id, capture_session, source_type, source, title, text, payload, metadata,
+               privacy_level, redacted, scope, captured_at, created_at
+        FROM capture_events
+        WHERE scope IN ({}) AND source_type IN ('transcript', 'terminal') AND id > ?
+        ORDER BY id ASC
+        LIMIT ?
+        ",
+        placeholders(scope_chain.len())
+    );
+    let mut params: Vec<&dyn rusqlite::ToSql> = scope_chain
+        .iter()
+        .map(|scope| scope as &dyn rusqlite::ToSql)
+        .collect();
+    params.push(&cursor);
+    params.push(&limit);
+    let mut statement = connection.prepare(&sql)?;
+    let events = collect_rows(statement.query_map(params.as_slice(), capture_event_from_row)?)?;
+    Ok(events)
+}
+
+/// Persist extraction progress (ULID ids are time-ordered, so `MAX` semantics
+/// hold with plain string comparison).
+fn advance_extraction_cursor(
+    project_name: Option<String>,
+    start_dir: PathBuf,
+    grafiki_home: Option<PathBuf>,
+    last_event_id: &str,
+) -> Result<()> {
+    let (_project, connection) = resolve_and_open(project_name, start_dir, grafiki_home)?;
+    connection.execute(
+        "
+        INSERT INTO capture_cursors (name, last_event_id)
+        VALUES (?1, ?2)
+        ON CONFLICT(name) DO UPDATE SET
+            last_event_id = MAX(last_event_id, excluded.last_event_id),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        ",
+        params![EXTRACTION_CURSOR, last_event_id],
+    )?;
+    Ok(())
 }
 
 /// Options for [`run_capture_watch`] — one pass of the passive "Granola for
@@ -4797,31 +4895,36 @@ pub fn run_capture_watch(options: RunCaptureWatchOptions) -> Result<CaptureWatch
         },
     )?;
 
-    if import.events_imported == 0 {
-        return Ok(CaptureWatchReport {
-            events_imported: 0,
-            proposed: 0,
-            message: "No new session activity to capture.".to_owned(),
-        });
-    }
-
+    // Extract everything the cursor hasn't covered yet — NOT just this pass's
+    // import. That includes hosted-terminal output and, crucially, events a
+    // previous pass imported but failed to extract (model down): import-dedup
+    // makes re-imports 0, so gating on events_imported would consume them.
     let extract = extract_capture_memory(ExtractCaptureOptions {
         project_name: options.project_name,
         start_dir: options.start_dir,
         grafiki_home: options.grafiki_home,
-        capture_id: Some(import.capture_id.clone()),
+        capture_id: None,
         scope: options.scope,
         limit: options.limit,
         model: options.model,
         ollama_url: options.ollama_url,
+        unextracted_only: true,
     })?;
+
+    if extract.events_read == 0 {
+        return Ok(CaptureWatchReport {
+            events_imported: import.events_imported,
+            proposed: 0,
+            message: "No new session activity to capture.".to_owned(),
+        });
+    }
 
     Ok(CaptureWatchReport {
         events_imported: import.events_imported,
         proposed: extract.proposed,
         message: format!(
             "Captured {} new event(s); proposed {} memory candidate(s) for review.",
-            import.events_imported, extract.proposed
+            extract.events_read, extract.proposed
         ),
     })
 }
@@ -11264,6 +11367,7 @@ mod tests {
             limit: 100,
             model: None,
             ollama_url: Some(format!("http://127.0.0.1:{port}")),
+            unextracted_only: false,
         })
         .unwrap();
         server.join().unwrap();
@@ -11381,6 +11485,90 @@ mod tests {
         .unwrap();
         assert_eq!(again.events_imported, 0, "re-run imports nothing new");
         assert_eq!(again.proposed, 0);
+    }
+
+    #[test]
+    fn failed_extraction_does_not_consume_the_session() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let (_temp, home, project_dir) = setup_project();
+        let scope = "example-project/core";
+        let transcript = project_dir.join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"user\",\"timestamp\":\"2026-07-01T00:00:00Z\",\"message\":{\"role\":\
+             \"user\",\"content\":\"Pin the CI timezone to UTC.\"}}\n",
+        )
+        .unwrap();
+
+        // Pass 1: the transcript imports, but the model is unreachable — the
+        // extraction fails AFTER the events were ingested (the exact real-world
+        // failure that used to permanently consume the session).
+        let failed = run_capture_watch(RunCaptureWatchOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            agent: "claude-code".to_owned(),
+            input: Some(transcript.clone()),
+            scope: scope.to_owned(),
+            limit: 100,
+            model: None,
+            ollama_url: Some("http://127.0.0.1:1".to_owned()), // nothing listens here
+        });
+        assert!(failed.is_err(), "unreachable model must surface an error");
+
+        // Pass 2: the model is back. Import dedups to 0 new events, but the
+        // cursor never advanced — the SAME events must now be extracted.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 16384];
+            let _ = socket.read(&mut buf).unwrap();
+            let content =
+                "[{\"kind\":\"decision\",\"title\":\"Pin CI to UTC\",\"content\":\"CI timezone \
+                 pinned to UTC.\"}]";
+            let envelope =
+                serde_json::json!({"message":{"role":"assistant","content":content}}).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{envelope}",
+                envelope.len()
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+        let recovered = run_capture_watch(RunCaptureWatchOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            agent: "claude-code".to_owned(),
+            input: Some(transcript),
+            scope: scope.to_owned(),
+            limit: 100,
+            model: None,
+            ollama_url: Some(format!("http://127.0.0.1:{port}")),
+        })
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(recovered.events_imported, 0, "dedup: nothing re-imported");
+        assert_eq!(
+            recovered.proposed, 1,
+            "the previously-failed session must still be extracted"
+        );
+        let candidates = list_candidates(ListCandidatesOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            status: Some("pending".to_owned()),
+            scope: scope.to_owned(),
+            limit: 100,
+            order: CandidateOrder::Recent,
+        })
+        .unwrap();
+        assert!(candidates
+            .iter()
+            .any(|c| c.source_type == "capture:llm" && c.record_type == "decision"));
     }
 
     #[test]

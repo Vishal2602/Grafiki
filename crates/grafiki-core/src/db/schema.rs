@@ -6,7 +6,7 @@ use crate::Result;
 pub const INITIAL_SCHEMA_VERSION: i64 = 1;
 /// The newest schema version this build knows how to produce. Bump this and add
 /// a `Migration` entry whenever the schema changes.
-pub const LATEST_SCHEMA_VERSION: i64 = 4;
+pub const LATEST_SCHEMA_VERSION: i64 = 5;
 
 struct Migration {
     version: i64,
@@ -36,7 +36,24 @@ const MIGRATIONS: &[Migration] = &[
         description: "observations.source_type for conflict-arbitration source-priority (H2)",
         sql: MIGRATION_V4_OBSERVATION_SOURCE_TYPE,
     },
+    Migration {
+        version: 5,
+        description: "capture_cursors: durable auto-extraction progress (retry-safe)",
+        sql: MIGRATION_V5_CAPTURE_CURSORS,
+    },
 ];
+
+// Auto-extraction used to gate on "events imported this pass", so a failed model
+// call permanently consumed the session (import-dedup made the retry a no-op).
+// The cursor records the last capture_event actually EXTRACTED — advanced only
+// after the model call succeeds — so failures are retried, never swallowed.
+const MIGRATION_V5_CAPTURE_CURSORS: &str = r#"
+CREATE TABLE IF NOT EXISTS capture_cursors (
+    name          TEXT PRIMARY KEY,
+    last_event_id TEXT NOT NULL,
+    updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+) STRICT;
+"#;
 
 // Conflict arbitration (H2) ranks facts by source-trust tier. Observations stored
 // `source` as a `session:{id}` provenance link, not a comparable source-type, so
