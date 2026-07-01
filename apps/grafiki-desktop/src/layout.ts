@@ -13,6 +13,7 @@ const PANE_KINDS: ReadonlySet<string> = new Set([
   "overview",
   "search",
   "chat",
+  "terminal",
   "graph",
   "candidates",
   "relations",

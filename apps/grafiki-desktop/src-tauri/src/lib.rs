@@ -44,6 +44,8 @@ use grafiki_core::{
 };
 use serde::{Deserialize, Serialize};
 
+mod terminal;
+
 #[derive(Debug, Clone, Serialize)]
 struct ProjectMeta {
     project: String,
@@ -2205,11 +2207,16 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(DaemonTokens::default())
+        .manage(terminal::TerminalRegistry::default())
         .invoke_handler(tauri::generate_handler![
             get_project_snapshot,
             initialize_project,
             search_project_memory,
             chat_with_memory,
+            terminal::terminal_open,
+            terminal::terminal_write,
+            terminal::terminal_resize,
+            terminal::terminal_close,
             start_grafiki_session,
             end_grafiki_session,
             handoff_grafiki_session,

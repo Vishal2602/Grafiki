@@ -2,6 +2,7 @@ export type PaneKind =
   | "overview"
   | "search"
   | "chat"
+  | "terminal"
   | "graph"
   | "candidates"
   | "relations"

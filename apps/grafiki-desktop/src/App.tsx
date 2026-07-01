@@ -24,6 +24,7 @@ import {
   MessageSquare,
   Network,
   PanelRight,
+  TerminalSquare,
   Pencil,
   Plus,
   RefreshCcw,
@@ -37,7 +38,11 @@ import {
   X,
   RadioTower,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { invoke, Channel } from "@tauri-apps/api/core";
+import { Terminal as XTerm } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import "@xterm/xterm/css/xterm.css";
 import {
   approveCandidate,
   autoCaptureMemory,
@@ -123,6 +128,7 @@ const navItems: Array<{ kind: PaneKind; label: string; hotkey: string; icon: typ
   { kind: "overview", label: "Overview", hotkey: "O", icon: LayoutDashboard },
   { kind: "search", label: "Search", hotkey: "/", icon: SearchIcon },
   { kind: "chat", label: "Chat", hotkey: "K", icon: MessageSquare },
+  { kind: "terminal", label: "Terminal", hotkey: "J", icon: TerminalSquare },
   { kind: "graph", label: "Graph", hotkey: "G", icon: Network },
   { kind: "candidates", label: "Review", hotkey: "V", icon: ShieldQuestion },
   { kind: "agent", label: "Agent Activity", hotkey: "A", icon: RadioTower },
@@ -837,6 +843,7 @@ function MemoryPane(props: {
             onOpenResult={props.onOpenResult}
           />
         ) : null}
+        {pane.kind === "terminal" ? <TerminalPane projectRoot={props.projectRoot} /> : null}
         {pane.kind === "graph" ? (
           <GraphPane pane={pane} snapshot={props.snapshot} startDir={props.projectRoot} onUpdate={props.onUpdate} />
         ) : null}
@@ -994,6 +1001,124 @@ function OverviewPane({ snapshot }: { snapshot: ProjectSnapshot | null }) {
           ),
         )}
       </motion.section>
+    </div>
+  );
+}
+
+function TerminalPane(props: { projectRoot: string }) {
+  // null = show the launcher; "" = plain shell; "claude"/"codex"/... = run that agent.
+  const [launch, setLaunch] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (launch === null || !containerRef.current) {
+      return;
+    }
+    const id = `term-${Math.random().toString(36).slice(2, 10)}`;
+    const term = new XTerm({
+      fontFamily: '"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace',
+      fontSize: 13,
+      cursorBlink: true,
+      theme: { background: "#16181c", foreground: "#e8e6e0", cursor: "#ff7a33" },
+    });
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    term.open(containerRef.current);
+    fit.fit();
+
+    const channel = new Channel<number[]>();
+    channel.onmessage = (bytes) => term.write(new Uint8Array(bytes));
+
+    // Always spawn the login shell (full PATH); if an agent was chosen, type it in.
+    invoke("terminal_open", {
+      id,
+      cwd: props.projectRoot,
+      command: "",
+      rows: term.rows,
+      cols: term.cols,
+      onOutput: channel,
+    }).catch((openError) => setError(String(openError)));
+
+    let launchTimer: number | undefined;
+    if (launch) {
+      launchTimer = window.setTimeout(() => {
+        void invoke("terminal_write", { id, data: `${launch}\r` });
+      }, 700);
+    }
+
+    const onData = term.onData((data) => {
+      void invoke("terminal_write", { id, data });
+    });
+    const resize = () => {
+      try {
+        fit.fit();
+      } catch {
+        /* pane not laid out yet */
+      }
+      void invoke("terminal_resize", { id, rows: term.rows, cols: term.cols });
+    };
+    const observer = new ResizeObserver(resize);
+    observer.observe(containerRef.current);
+    term.focus();
+
+    return () => {
+      if (launchTimer) {
+        window.clearTimeout(launchTimer);
+      }
+      observer.disconnect();
+      onData.dispose();
+      void invoke("terminal_close", { id });
+      term.dispose();
+    };
+  }, [launch, props.projectRoot]);
+
+  if (launch === null) {
+    const options = [
+      { label: "Claude Code", cmd: "claude" },
+      { label: "Codex", cmd: "codex" },
+      { label: "Gemini", cmd: "gemini" },
+      { label: "Shell", cmd: "" },
+    ];
+    return (
+      <div
+        className="view-stack"
+        style={{ padding: 28, display: "flex", flexDirection: "column", gap: 16, alignItems: "flex-start" }}
+      >
+        <div>
+          <h2 style={{ margin: 0 }}>Start a session</h2>
+          <p className="muted" style={{ marginTop: 6, maxWidth: 460 }}>
+            It runs inside Grafiki, in <code>{props.projectRoot || "this project"}</code>. Work
+            normally — everything in this session is captured automatically, no setup.
+          </p>
+        </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          {options.map((option) => (
+            <button key={option.label} onClick={() => setLaunch(option.cmd)} style={{ padding: "9px 18px" }}>
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="view-stack" style={{ display: "flex", flexDirection: "column", height: "100%", gap: 8 }}>
+      <div className="toolbar-row" style={{ alignItems: "center", gap: 10 }}>
+        <span className="muted" style={{ fontSize: 12 }}>
+          {launch ? `Running: ${launch}` : "Shell"} · {props.projectRoot || "this project"} ·
+          capturing
+        </span>
+        <button style={{ marginLeft: "auto", padding: "4px 10px" }} onClick={() => setLaunch(null)}>
+          New session
+        </button>
+      </div>
+      {error ? <p style={{ color: "var(--danger, #ff6b6b)" }}>{error}</p> : null}
+      <div
+        ref={containerRef}
+        style={{ flex: 1, minHeight: 0, background: "#16181c", borderRadius: 6, overflow: "hidden", padding: 6 }}
+      />
     </div>
   );
 }
