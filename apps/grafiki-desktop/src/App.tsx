@@ -7,12 +7,9 @@ import {
 import {
   Activity,
   AlertTriangle,
-  Archive,
   BrainCircuit,
   CheckCircle2,
   CircleDot,
-  Columns3,
-  Command as CommandIcon,
   Database,
   Download,
   FileClock,
@@ -45,23 +42,18 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import {
   approveCandidate,
-  autoCaptureMemory,
   bulkReviewCandidates,
   chatWithMemory,
-  captureScreenSnapshot,
-  captureMemory,
   deleteMemoryRecord,
   editCandidate,
   endSession,
   exportMemoryToFile,
-  getAutomaticCaptureStatus,
   getCaptureConfig,
   getDaemonStatus,
   getMemoryGraph,
   getMemoryRecord,
   getProjectSnapshot,
   handoffSession,
-  importAgentTranscripts,
   importMemoryFromFile,
   initializeProject,
   listAgentActivity,
@@ -78,11 +70,8 @@ import {
   startSession,
   stopDaemon,
   rejectCandidate,
-  startAutomaticCapture,
   updateMemoryRecord,
   updateCaptureConfig,
-  stopAutomaticCapture,
-  summarizeAutomaticCapture,
   isPreviewMode,
   confirmDialog,
 } from "./api";
@@ -96,11 +85,8 @@ import {
 } from "./layout";
 import type {
   AgentQueryLogItem,
-  AgentTranscriptImportInput,
   CaptureConfigReport,
   CaptureSourceConfig,
-  CaptureMemoryResult,
-  CaptureType,
   ChatReply,
   ContextSummary,
   DaemonStatus,
@@ -114,7 +100,6 @@ import type {
   PaneKind,
   PaneState,
   ProjectSnapshot,
-  RawCaptureStatus,
   SearchMode,
   SearchResult,
   SessionLogItem,
@@ -127,21 +112,12 @@ const PROJECT_ROOT_KEY = "grafiki.desktop.projectRoot";
 // Ultra-minimal nav (Wispr/Granola feel): the core loop only. The other panes
 // (overview/search/graph/agent/relations/sessions/state/decisions/context) still
 // exist and render if reached — they're just off the sidebar to keep it clean.
-const navItems: Array<{ kind: PaneKind; label: string; hotkey: string; icon: typeof LayoutDashboard }> = [
-  { kind: "terminal", label: "Terminal", hotkey: "J", icon: TerminalSquare },
-  { kind: "chat", label: "Chat", hotkey: "K", icon: MessageSquare },
-  { kind: "candidates", label: "Review", hotkey: "V", icon: ShieldQuestion },
-  { kind: "settings", label: "Settings", hotkey: ",", icon: Settings },
+const navItems: Array<{ kind: PaneKind; label: string; icon: typeof LayoutDashboard }> = [
+  { kind: "terminal", label: "Terminal", icon: TerminalSquare },
+  { kind: "chat", label: "Chat", icon: MessageSquare },
+  { kind: "candidates", label: "Review", icon: ShieldQuestion },
+  { kind: "settings", label: "Settings", icon: Settings },
 ];
-
-const captureItems = [
-  { captureType: "decision", label: "Decision", icon: GitBranch },
-  { captureType: "observation", label: "Observation", icon: BrainCircuit },
-  { captureType: "state", label: "State Item", icon: Activity },
-  { captureType: "context", label: "Context", icon: FileText },
-  { captureType: "handoff", label: "Handoff", icon: FileClock },
-  { captureType: "relation", label: "Relation", icon: Network },
-] as const;
 
 const entityTypeOptions = ["concept", "module", "service", "file", "api", "tool", "library", "config", "person", "endpoint"];
 const observationCategories = [
@@ -197,45 +173,6 @@ const sessionStatuses = ["active", "completed", "handed-off", "abandoned"];
 const endStatuses = ["completed", "handed-off", "abandoned"];
 const searchRecordTypes = ["all", "entity", "observation", "decision", "context", "state", "session"];
 
-const captureCopy: Record<CaptureType, { title: string; titlePlaceholder: string; body: string; bodyPlaceholder: string }> = {
-  decision: {
-    title: "Decision",
-    titlePlaceholder: "Decision title",
-    body: "Reasoning",
-    bodyPlaceholder: "Why this decision matters, tradeoffs, alternatives.",
-  },
-  observation: {
-    title: "Entity",
-    titlePlaceholder: "Thing this memory belongs to",
-    body: "Observation",
-    bodyPlaceholder: "A durable fact, behavior, constraint, or lesson.",
-  },
-  state: {
-    title: "Work item",
-    titlePlaceholder: "What needs to remain active",
-    body: "Details",
-    bodyPlaceholder: "Current state, blockers, or next useful action.",
-  },
-  context: {
-    title: "Context title",
-    titlePlaceholder: "Name for this trusted context",
-    body: "Context",
-    bodyPlaceholder: "Reference material that future AI sessions should trust.",
-  },
-  handoff: {
-    title: "Handoff",
-    titlePlaceholder: "Handoff label",
-    body: "Note",
-    bodyPlaceholder: "Optional note for your own orientation. Existing memory generates the handoff.",
-  },
-  relation: {
-    title: "Source entity",
-    titlePlaceholder: "Entity to link from",
-    body: "Optional observation",
-    bodyPlaceholder: "Why this relationship exists.",
-  },
-};
-
 const transition = {
   quick: { duration: 0.14, ease: [0.2, 0, 0.2, 1] },
   pane: { type: "spring", stiffness: 420, damping: 38, mass: 0.8 },
@@ -260,8 +197,6 @@ export default function App() {
   const [recordDetail, setRecordDetail] = useState<MemoryRecordDetail | null>(null);
   const [recordDetailError, setRecordDetailError] = useState<string | null>(null);
   const [recordDetailLoading, setRecordDetailLoading] = useState(false);
-  const [commandOpen, setCommandOpen] = useState(false);
-  const [launcherOpen, setLauncherOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const reduceMotion = useReducedMotion() ?? false;
 
@@ -287,26 +222,6 @@ export default function App() {
     };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
-  }, []);
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      const key = event.key.toLowerCase();
-      if ((event.metaKey || event.ctrlKey) && key === "k") {
-        event.preventDefault();
-        setCommandOpen(true);
-      }
-      if ((event.metaKey || event.ctrlKey) && key === "n") {
-        event.preventDefault();
-        setLauncherOpen(true);
-      }
-      if ((event.metaKey || event.ctrlKey) && event.shiftKey && key === "d") {
-        event.preventDefault();
-        openCapture("decision");
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
   const activePane = useMemo(
@@ -401,31 +316,10 @@ export default function App() {
     });
   }
 
-  function openCapture(captureType: CaptureType) {
-    openPane("capture", {
-      captureType,
-      title: `New ${captureType}`,
-    });
-    setLauncherOpen(false);
-  }
-
   async function refreshSnapshot() {
     const next = await getProjectSnapshot({ startDir: projectRoot });
     setSnapshot(next);
     return next;
-  }
-
-  function handleCaptured(result: CaptureMemoryResult) {
-    setSelectedResult({
-      record_type: result.record_type,
-      id: result.id,
-      title: result.title,
-      snippet: result.message,
-      scope: result.scope,
-      score: null,
-    });
-    setInspectorOpen(true);
-    refreshSnapshot();
   }
 
   async function initializeCurrentProject(path?: string) {
@@ -466,26 +360,6 @@ export default function App() {
         current.activePaneId === id ? panes[Math.max(0, index - 1)].id : current.activePaneId;
       return { activePaneId, panes };
     });
-  }
-
-  function duplicatePane(id: string) {
-    setLayout((current) => {
-      const source = current.panes.find((pane) => pane.id === id);
-      if (!source) return current;
-      const copy = {
-        ...source,
-        id: newPaneId(source.kind),
-        title: `${source.title} Copy`,
-      };
-      return {
-        activePaneId: copy.id,
-        panes: [...current.panes, copy],
-      };
-    });
-  }
-
-  function duplicateActivePane() {
-    duplicatePane(layout.activePaneId);
   }
 
   function openResultInPane(result: SearchResult) {
@@ -533,20 +407,16 @@ export default function App() {
         </div>
       ) : null}
       <Rail
-        activeKind={activePane?.kind ?? "overview"}
+        activeKind={activePane?.kind ?? "terminal"}
         onOpen={(kind) => switchPrimaryPane(kind)}
-        onLauncher={() => setLauncherOpen(true)}
-        onCommand={() => setCommandOpen(true)}
         reduceMotion={reduceMotion}
       />
 
       <main className="workspace">
         <TopStatus
           snapshot={snapshot}
-          paneCount={layout.panes.length}
           inspectorOpen={inspectorOpen}
           onToggleInspector={() => setInspectorOpen((current) => !current)}
-          onCapture={() => setLauncherOpen(true)}
         />
 
         <section className="pane-strip" aria-label="Workspace panes">
@@ -565,14 +435,12 @@ export default function App() {
                 reduceMotion={reduceMotion}
                 onActivate={() => activatePane(pane.id)}
                 onClose={() => closePane(pane.id)}
-                onSplit={() => duplicatePane(pane.id)}
                 onUpdate={(patch) => updatePane(pane.id, patch)}
                 onSelectResult={(result) => {
                   setSelectedResult(result);
                   setInspectorOpen(true);
                 }}
                 onOpenResult={openResultInPane}
-                onCaptured={handleCaptured}
                 onSessionChanged={handleSessionChanged}
                 onProjectRootChange={setProjectRoot}
                 onInitializeProject={initializeCurrentProject}
@@ -599,36 +467,6 @@ export default function App() {
           />
         ) : null}
       </AnimatePresence>
-
-      <AnimatePresence>
-        {commandOpen ? (
-          <CommandPalette
-            snapshot={snapshot}
-            reduceMotion={reduceMotion}
-            onClose={() => setCommandOpen(false)}
-            onOpenPane={(kind) => switchPrimaryPane(kind)}
-            onNewSearch={(query) =>
-              switchPrimaryPane("search", {
-                query,
-                mode: "hybrid",
-                title: titleForPane({ kind: "search", query }),
-              })
-            }
-            onCapture={openCapture}
-            onSplit={duplicateActivePane}
-          />
-        ) : null}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {launcherOpen ? (
-          <Launcher
-            reduceMotion={reduceMotion}
-            onClose={() => setLauncherOpen(false)}
-            onCapture={openCapture}
-          />
-        ) : null}
-      </AnimatePresence>
       </motion.div>
     </LayoutGroup>
   );
@@ -637,16 +475,14 @@ export default function App() {
 function Rail(props: {
   activeKind: PaneKind;
   onOpen: (kind: PaneKind) => void;
-  onLauncher: () => void;
-  onCommand: () => void;
   reduceMotion: boolean;
 }) {
   return (
     <aside className="rail">
       <motion.button
         className="brand"
-        aria-label="Grafiki overview"
-        onClick={() => props.onOpen("overview")}
+        aria-label="Grafiki home"
+        onClick={() => props.onOpen("terminal")}
         {...pressMotion(props.reduceMotion)}
       >
         <span className="brand-mark">G</span>
@@ -662,47 +498,23 @@ function Rail(props: {
               layout
               className={`rail-item ${props.activeKind === item.kind ? "active" : ""}`}
               onClick={() => props.onOpen(item.kind)}
-              title={`${item.label} (${item.hotkey})`}
+              title={item.label}
               {...pressMotion(props.reduceMotion)}
             >
               <Icon size={18} />
               <span>{item.label}</span>
-              <kbd>{item.hotkey}</kbd>
             </motion.button>
           );
         })}
       </nav>
-
-      <div className="rail-actions">
-        <motion.button
-          className="rail-action"
-          onClick={props.onCommand}
-          {...pressMotion(props.reduceMotion)}
-        >
-          <CommandIcon size={17} />
-          <span>Command</span>
-          <kbd>⌘K</kbd>
-        </motion.button>
-        <motion.button
-          className="rail-action primary"
-          onClick={props.onLauncher}
-          {...pressMotion(props.reduceMotion)}
-        >
-          <Plus size={18} />
-          <span>Capture</span>
-          <kbd>⌘N</kbd>
-        </motion.button>
-      </div>
     </aside>
   );
 }
 
 function TopStatus(props: {
   snapshot: ProjectSnapshot | null;
-  paneCount: number;
   inspectorOpen: boolean;
   onToggleInspector: () => void;
-  onCapture: () => void;
 }) {
   const snapshot = props.snapshot;
   const project = snapshot?.project?.project ?? "No project";
@@ -725,15 +537,8 @@ function TopStatus(props: {
       </div>
 
       <div className="status-cluster">
-        <button className="button primary top-action" type="button" onClick={props.onCapture}>
-          <Plus size={15} />
-          Capture
-        </button>
         <StatusPill tone={memoryAvailable ? "good" : "warn"} icon={memoryAvailable ? CheckCircle2 : AlertTriangle}>
           {memoryAvailable ? "Memory online" : "Initialize needed"}
-        </StatusPill>
-        <StatusPill tone="neutral" icon={Columns3}>
-          {props.paneCount} {props.paneCount === 1 ? "pane" : "panes"}
         </StatusPill>
         <StatusPill tone="accent" icon={Sparkles}>
           {embedding ? `${embedding.fresh_records}/${embedding.embeddable_records} fresh` : "Embeddings"}
@@ -777,11 +582,9 @@ function MemoryPane(props: {
   reduceMotion: boolean;
   onActivate: () => void;
   onClose: () => void;
-  onSplit: () => void;
   onUpdate: (patch: Partial<PaneState>) => void;
   onSelectResult: (result: SearchResult) => void;
   onOpenResult: (result: SearchResult) => void;
-  onCaptured: (result: CaptureMemoryResult) => void;
   onSessionChanged: (result: { record_type: string; id: string; title: string; scope: string; message: string }) => void;
   onProjectRootChange: (path: string) => void;
   onInitializeProject: (path?: string) => Promise<void>;
@@ -805,9 +608,6 @@ function MemoryPane(props: {
           <h2>{pane.title}</h2>
         </div>
         <div className="pane-actions">
-          <button onClick={props.onSplit} title="Duplicate pane">
-            <SplitSquareHorizontal size={15} />
-          </button>
           <button onClick={props.onClose} title="Close pane">
             <X size={15} />
           </button>
@@ -927,14 +727,6 @@ function MemoryPane(props: {
             error={props.recordDetailError}
             startDir={props.projectRoot}
             onMemoryChanged={props.onMemoryChanged}
-          />
-        ) : null}
-        {pane.kind === "capture" ? (
-          <CapturePane
-            pane={pane}
-            startDir={props.projectRoot}
-            reduceMotion={props.reduceMotion}
-            onCaptured={props.onCaptured}
           />
         ) : null}
       </div>
@@ -2088,11 +1880,9 @@ function CandidatesPane(props: {
   onMemoryChanged: () => Promise<ProjectSnapshot>;
 }) {
   const [candidates, setCandidates] = useState<ExtractionCandidate[]>([]);
-  const [captureStatus, setCaptureStatus] = useState<RawCaptureStatus | null>(null);
   const [status, setStatus] = useState("pending");
   const [scope, setScope] = useState(props.snapshot?.scope ?? "");
   const [loading, setLoading] = useState(false);
-  const [capturing, setCapturing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [focusedCandidateId, setFocusedCandidateId] = useState<string | null>(null);
@@ -2126,18 +1916,12 @@ function CandidatesPane(props: {
     setLoading(true);
     setError(null);
     try {
-      const [nextCandidates, nextCaptureStatus] = await Promise.all([
-        listCandidates({
-          startDir: props.startDir,
-          scope,
-          status,
-          limit: 100,
-        }),
-        getAutomaticCaptureStatus({
-          startDir: props.startDir,
-          scope,
-        }),
-      ]);
+      const nextCandidates = await listCandidates({
+        startDir: props.startDir,
+        scope,
+        status,
+        limit: 100,
+      });
       setCandidates(nextCandidates);
       setSelectedIds((ids) =>
         ids.filter((id) => nextCandidates.some((candidate) => candidate.id === id && candidate.status === "pending")),
@@ -2146,7 +1930,6 @@ function CandidatesPane(props: {
         if (id && nextCandidates.some((candidate) => candidate.id === id)) return id;
         return nextCandidates.find((candidate) => candidate.status === "pending")?.id ?? nextCandidates[0]?.id ?? null;
       });
-      setCaptureStatus(nextCaptureStatus);
     } catch (listError) {
       setError(String(listError));
     } finally {
@@ -2407,172 +2190,6 @@ function CandidatesPane(props: {
     return group.candidates
       .filter((candidate) => candidate.status === "pending" && candidateIsNoisy(candidate))
       .map((candidate) => candidate.id);
-  }
-
-  async function autoCapture() {
-    setCapturing(true);
-    setMessage(null);
-    setError(null);
-    try {
-      const result = await autoCaptureMemory({
-        startDir: props.startDir,
-        scope,
-        source: "desktop-review",
-        limit: 40,
-      });
-      setMessage(`${result.message} ${result.changed_files.length} changed files found.`);
-      await load();
-      await props.onMemoryChanged();
-    } catch (captureError) {
-      setError(String(captureError));
-    } finally {
-      setCapturing(false);
-    }
-  }
-
-  async function startRawCapture() {
-    setCapturing(true);
-    setMessage(null);
-    setError(null);
-    try {
-      const result = await startAutomaticCapture({
-        startDir: props.startDir,
-        scope,
-        sourceApp: "grafiki-desktop",
-      });
-      setMessage(result.message);
-      await load();
-    } catch (captureError) {
-      setError(String(captureError));
-    } finally {
-      setCapturing(false);
-    }
-  }
-
-  async function stopRawCapture() {
-    const activeId = captureStatus?.active_sessions[0]?.id;
-    if (!activeId) {
-      setMessage("No active capture session to stop.");
-      return;
-    }
-    setCapturing(true);
-    setMessage(null);
-    setError(null);
-    try {
-      const result = await stopAutomaticCapture({
-        startDir: props.startDir,
-        captureId: activeId,
-      });
-      setMessage(result.message);
-      await load();
-    } catch (captureError) {
-      setError(String(captureError));
-    } finally {
-      setCapturing(false);
-    }
-  }
-
-  async function captureScreen() {
-    setCapturing(true);
-    setMessage(null);
-    setError(null);
-    try {
-      const result = await captureScreenSnapshot({
-        startDir: props.startDir,
-        scope,
-        captureId: captureStatus?.active_sessions[0]?.id,
-      });
-      setMessage(result.message);
-      await load();
-    } catch (captureError) {
-      setError(String(captureError));
-    } finally {
-      setCapturing(false);
-    }
-  }
-
-  function importTranscript() {
-    setPromptModal({
-      title: "Import transcript",
-      submitLabel: "Import",
-      fields: [
-        {
-          name: "agent",
-          label: "Agent",
-          type: "select",
-          defaultValue: "codex",
-          options: [
-            { value: "codex", label: "Codex" },
-            { value: "claude-code", label: "Claude Code" },
-            { value: "cursor", label: "Cursor" },
-            { value: "generic", label: "Generic" },
-          ],
-        },
-        {
-          name: "path",
-          label: "Transcript file or folder (blank = default location)",
-          type: "text",
-          placeholder: "/path/to/transcript or leave blank",
-        },
-      ],
-      onSubmit: (values) => {
-        setPromptModal(null);
-        const agent = (values.agent ?? "").trim().toLowerCase();
-        if (!["codex", "claude-code", "cursor", "generic"].includes(agent)) {
-          setError("Agent must be codex, claude-code, cursor, or generic.");
-          return;
-        }
-        void performImport(agent as AgentTranscriptImportInput["agent"], (values.path ?? "").trim());
-      },
-    });
-  }
-
-  async function performImport(
-    agent: AgentTranscriptImportInput["agent"],
-    inputPath: string,
-  ) {
-    setCapturing(true);
-    setMessage(null);
-    setError(null);
-    try {
-      const result = await importAgentTranscripts({
-        startDir: props.startDir,
-        scope,
-        agent,
-        input: inputPath,
-        limit: 200,
-        summarize: true,
-      });
-      const proposed = result.candidates?.candidates.length ?? 0;
-      setMessage(`${result.message} ${proposed} candidates proposed.`);
-      await load();
-      await props.onMemoryChanged();
-    } catch (captureError) {
-      setError(String(captureError));
-    } finally {
-      setCapturing(false);
-    }
-  }
-
-  async function summarizeCapture() {
-    setCapturing(true);
-    setMessage(null);
-    setError(null);
-    try {
-      const result = await summarizeAutomaticCapture({
-        startDir: props.startDir,
-        scope,
-        captureId: captureStatus?.active_sessions[0]?.id,
-        limit: 80,
-      });
-      setMessage(`${result.message} ${result.events_summarized} events summarized.`);
-      await load();
-      await props.onMemoryChanged();
-    } catch (captureError) {
-      setError(String(captureError));
-    } finally {
-      setCapturing(false);
-    }
   }
 
   return (
@@ -4252,242 +3869,6 @@ function DetailPane(props: {
   );
 }
 
-function CapturePane(props: {
-  pane: PaneState;
-  startDir: string;
-  reduceMotion: boolean;
-  onCaptured: (result: CaptureMemoryResult) => void;
-}) {
-  const type = props.pane.captureType ?? "observation";
-  const copy = captureCopy[type];
-  const [title, setTitle] = useState("");
-  const [scope, setScope] = useState("");
-  const [content, setContent] = useState("");
-  const [key, setKey] = useState("");
-  const [entityType, setEntityType] = useState("concept");
-  const [category, setCategory] = useState(type === "context" ? "reference" : "general");
-  const [status, setStatus] = useState("in-progress");
-  const [priority, setPriority] = useState("medium");
-  const [relationTarget, setRelationTarget] = useState("");
-  const [relationType, setRelationType] = useState("works_with");
-  const [tags, setTags] = useState("");
-  const [alternatives, setAlternatives] = useState("");
-  const [supersedes, setSupersedes] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState<CaptureMemoryResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const requiresContent = type === "observation" || type === "context";
-  const canSubmit =
-    title.trim().length > 0 &&
-    (!requiresContent || content.trim().length > 0) &&
-    (type !== "relation" || relationTarget.trim().length > 0);
-
-  async function submit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!canSubmit || saving) return;
-
-    setSaving(true);
-    setError(null);
-    setSaved(null);
-    try {
-      const result = await captureMemory({
-        startDir: props.startDir,
-        captureType: type,
-        title,
-        scope,
-        content,
-        key,
-        entityType,
-        category,
-        status,
-        priority,
-        relationTarget,
-        relationType,
-        tags,
-        alternatives,
-        supersedes,
-      });
-      setSaved(result);
-      props.onCaptured(result);
-    } catch (captureError) {
-      setError(String(captureError));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  function clearForm() {
-    setTitle("");
-    setScope("");
-    setContent("");
-    setKey("");
-    setRelationTarget("");
-    setTags("");
-    setAlternatives("");
-    setSupersedes("");
-    setSaved(null);
-    setError(null);
-  }
-
-  return (
-    <motion.form
-      className="capture-form"
-      onSubmit={submit}
-      initial={props.reduceMotion ? false : { opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={transition.quick}
-    >
-      <label>
-        <span>{copy.title}</span>
-        <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder={copy.titlePlaceholder} />
-      </label>
-
-      {type !== "handoff" ? (
-        <label>
-          <span>Scope</span>
-          <input value={scope} onChange={(event) => setScope(event.target.value)} placeholder="project/module" />
-        </label>
-      ) : null}
-
-      {type === "state" || type === "context" ? (
-        <label>
-          <span>Key</span>
-          <input value={key} onChange={(event) => setKey(event.target.value)} placeholder="auto from title" />
-        </label>
-      ) : null}
-
-      {type === "relation" ? (
-        <label>
-          <span>Target Entity ID</span>
-          <input
-            value={relationTarget}
-            onChange={(event) => setRelationTarget(event.target.value)}
-            placeholder="existing-entity-id"
-          />
-        </label>
-      ) : null}
-
-      {type !== "handoff" ? (
-        <label>
-          <span>{copy.body}</span>
-          <textarea value={content} onChange={(event) => setContent(event.target.value)} placeholder={copy.bodyPlaceholder} />
-        </label>
-      ) : null}
-
-      {type === "decision" ? (
-        <div className="metadata-grid">
-          <label>
-            <span>Tags</span>
-            <input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="desktop, retrieval" />
-          </label>
-          <label>
-            <span>Alternatives</span>
-            <input
-              value={alternatives}
-              onChange={(event) => setAlternatives(event.target.value)}
-              placeholder="comma separated"
-            />
-          </label>
-          <label>
-            <span>Supersedes</span>
-            <input value={supersedes} onChange={(event) => setSupersedes(event.target.value)} placeholder="decision id" />
-          </label>
-        </div>
-      ) : null}
-
-      {type === "observation" || type === "relation" ? (
-        <div className="metadata-grid">
-          <label>
-            <span>Entity Type</span>
-            <select value={entityType} onChange={(event) => setEntityType(event.target.value)}>
-              {entityTypeOptions.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            <span>Category</span>
-            <select value={category} onChange={(event) => setCategory(event.target.value)}>
-              {observationCategories.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
-          </label>
-          {type === "relation" ? (
-            <label>
-              <span>Relation</span>
-              <select value={relationType} onChange={(event) => setRelationType(event.target.value)}>
-                {relationTypes.map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-            </label>
-          ) : null}
-        </div>
-      ) : null}
-
-      {type === "state" ? (
-        <div className="metadata-grid">
-          <label>
-            <span>Status</span>
-            <select value={status} onChange={(event) => setStatus(event.target.value)}>
-              {stateStatuses.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            <span>Priority</span>
-            <select value={priority} onChange={(event) => setPriority(event.target.value)}>
-              {statePriorities.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-      ) : null}
-
-      {type === "context" ? (
-        <div className="metadata-grid">
-          <label>
-            <span>Category</span>
-            <select value={category} onChange={(event) => setCategory(event.target.value)}>
-              {contextCategories.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-      ) : null}
-
-      {saved ? <section className="notice compact good">{saved.message}</section> : null}
-      {error ? <section className="notice compact">{error}</section> : null}
-
-      <div className="form-actions">
-        <motion.button type="button" className="button secondary" onClick={clearForm} {...pressMotion(props.reduceMotion)}>
-          Clear
-        </motion.button>
-        <motion.button className="button primary" disabled={!canSubmit || saving} {...pressMotion(props.reduceMotion)}>
-          {saving ? "Capturing" : "Capture"}
-        </motion.button>
-      </div>
-    </motion.form>
-  );
-}
-
 function Inspector(props: {
   snapshot: ProjectSnapshot | null;
   activePane?: PaneState;
@@ -4567,170 +3948,6 @@ function Inspector(props: {
         </section>
       ) : null}
     </motion.aside>
-  );
-}
-
-function CommandPalette(props: {
-  snapshot: ProjectSnapshot | null;
-  reduceMotion: boolean;
-  onClose: () => void;
-  onOpenPane: (kind: PaneKind) => void;
-  onNewSearch: (query: string) => void;
-  onCapture: (captureType: CaptureType) => void;
-  onSplit: () => void;
-}) {
-  const dialogRef = useModalDialog<HTMLElement>(props.onClose);
-  const [query, setQuery] = useState("");
-  const commands = [
-    ...navItems.map((item) => ({
-      id: `open-${item.kind}`,
-      title: `Open ${item.label}`,
-      meta: "navigation",
-      icon: item.icon,
-      run: () => props.onOpenPane(item.kind),
-    })),
-    {
-      id: "split-pane",
-      title: "Duplicate Active Pane",
-      meta: "layout",
-      icon: SplitSquareHorizontal,
-      run: props.onSplit,
-    },
-    ...captureItems.map((item) => ({
-      id: `capture-${item.captureType}`,
-      title: `Capture ${item.label}`,
-      meta: "memory write",
-      icon: item.icon,
-      run: () => props.onCapture(item.captureType),
-    })),
-  ];
-  const filtered = commands.filter((command) =>
-    `${command.title} ${command.meta}`.toLowerCase().includes(query.toLowerCase()),
-  );
-
-  function submitSearch() {
-    const clean = query.trim();
-    if (clean) {
-      props.onNewSearch(clean);
-      props.onClose();
-    }
-  }
-
-  return (
-    <motion.div
-      className="overlay"
-      role="presentation"
-      onMouseDown={props.onClose}
-      initial={props.reduceMotion ? false : { opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={props.reduceMotion ? undefined : { opacity: 0 }}
-      transition={transition.quick}
-    >
-      <motion.section
-        ref={dialogRef}
-        className="command-palette"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Command palette"
-        tabIndex={-1}
-        onMouseDown={(event) => event.stopPropagation()}
-        initial={props.reduceMotion ? false : { opacity: 0, y: 12, scale: 0.985 }}
-        animate={{ opacity: 1, y: 0, scale: 1 }}
-        exit={props.reduceMotion ? undefined : { opacity: 0, y: 8, scale: 0.985 }}
-        transition={transition.modal}
-      >
-        <div className="command-input">
-          <CommandIcon size={18} />
-          <input
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") submitSearch();
-            }}
-            placeholder={`Search commands or ${props.snapshot?.project?.project ?? "memory"}`}
-            autoFocus
-          />
-        </div>
-        <div className="command-results">
-          {filtered.slice(0, 9).map((command) => {
-            const Icon = command.icon;
-            return (
-              <motion.button
-                key={command.id}
-                onClick={() => {
-                  command.run();
-                  props.onClose();
-                }}
-                initial={props.reduceMotion ? false : { opacity: 0, y: 6 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={transition.quick}
-                whileHover={props.reduceMotion ? undefined : { x: 3 }}
-                whileTap={props.reduceMotion ? undefined : { scale: 0.99 }}
-              >
-                <Icon size={17} />
-                <span>{command.title}</span>
-                <code>{command.meta}</code>
-              </motion.button>
-            );
-          })}
-        </div>
-      </motion.section>
-    </motion.div>
-  );
-}
-
-function Launcher(props: {
-  reduceMotion: boolean;
-  onClose: () => void;
-  onCapture: (captureType: CaptureType) => void;
-}) {
-  const dialogRef = useModalDialog<HTMLElement>(props.onClose);
-  return (
-    <motion.div
-      className="overlay"
-      role="presentation"
-      onMouseDown={props.onClose}
-      initial={props.reduceMotion ? false : { opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={props.reduceMotion ? undefined : { opacity: 0 }}
-      transition={transition.quick}
-    >
-      <motion.section
-        ref={dialogRef}
-        className="launcher"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Capture memory"
-        tabIndex={-1}
-        onMouseDown={(event) => event.stopPropagation()}
-        initial={props.reduceMotion ? false : { opacity: 0, y: 12, scale: 0.985 }}
-        animate={{ opacity: 1, y: 0, scale: 1 }}
-        exit={props.reduceMotion ? undefined : { opacity: 0, y: 8, scale: 0.985 }}
-        transition={transition.modal}
-      >
-        <header>
-          <strong>Capture Memory</strong>
-          <motion.button onClick={props.onClose} {...pressMotion(props.reduceMotion)}>
-            <X size={16} />
-          </motion.button>
-        </header>
-        <div className="launcher-grid">
-          {captureItems.map((item) => {
-            const Icon = item.icon;
-            return (
-              <motion.button
-                key={item.captureType}
-                onClick={() => props.onCapture(item.captureType)}
-                {...pressMotion(props.reduceMotion)}
-              >
-                <Icon size={22} />
-                <span>{item.label}</span>
-              </motion.button>
-            );
-          })}
-        </div>
-      </motion.section>
-    </motion.div>
   );
 }
 
