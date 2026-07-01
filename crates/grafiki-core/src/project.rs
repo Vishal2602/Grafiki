@@ -569,7 +569,9 @@ fn is_valid_project_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')
 }
 
-pub(crate) fn grafiki_home() -> Result<PathBuf> {
+/// The Grafiki home directory: `$GRAFIKI_HOME` if set, else `~/.grafiki`.
+/// Public so surfaces (desktop, CLI) can store app-level state next to the DBs.
+pub fn grafiki_home() -> Result<PathBuf> {
     if let Some(home) = env::var_os("GRAFIKI_HOME") {
         return Ok(PathBuf::from(home));
     }

@@ -27,6 +27,98 @@ use tauri::State;
 const SCROLLBACK_MAX: usize = 512 * 1024;
 /// Capture is flushed to `capture_events` whenever this much output accumulates.
 const CAPTURE_FLUSH_THRESHOLD: usize = 64 * 1024;
+/// How much (ANSI-stripped) tail is persisted to disk for cross-relaunch resume.
+const RESUME_TAIL_MAX: usize = 32 * 1024;
+/// App-level file (under the Grafiki home dir) holding resumable session
+/// descriptors — the terminal's equivalent of an editor's session store.
+const DESCRIPTOR_FILE: &str = "terminal_sessions.json";
+
+/// What survives an app relaunch: enough to re-open a shell in the same folder,
+/// show the previous output, and resume the agent (`claude --continue`).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SessionDescriptor {
+    id: String,
+    cwd: String,
+    /// The agent command originally launched ("" = plain shell).
+    launch: String,
+    /// ANSI-stripped tail of the session output, replayed on revive.
+    #[serde(default)]
+    tail: String,
+    #[serde(default)]
+    updated_at: u64,
+}
+
+/// Serializes read-modify-write cycles on the descriptor file across the
+/// commands and every session's reader thread.
+static DESCRIPTOR_LOCK: Mutex<()> = Mutex::new(());
+
+fn descriptor_path() -> Option<PathBuf> {
+    grafiki_core::grafiki_home().ok().map(|home| home.join(DESCRIPTOR_FILE))
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+fn load_descriptors(path: &PathBuf) -> HashMap<String, SessionDescriptor> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Upsert (or with `descriptor: None`, remove) one session's descriptor.
+/// Best-effort: persistence must never disrupt the live terminal.
+fn store_descriptor(id: &str, descriptor: Option<SessionDescriptor>) {
+    let Some(path) = descriptor_path() else {
+        return;
+    };
+    let _guard = DESCRIPTOR_LOCK.lock().unwrap();
+    let mut all = load_descriptors(&path);
+    match descriptor {
+        Some(descriptor) => {
+            all.insert(id.to_owned(), descriptor);
+        }
+        None => {
+            all.remove(id);
+        }
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&all) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+fn load_descriptor(id: &str) -> Option<SessionDescriptor> {
+    let path = descriptor_path()?;
+    let _guard = DESCRIPTOR_LOCK.lock().unwrap();
+    load_descriptors(&path).remove(id)
+}
+
+/// Refresh a session's persisted tail from its current scrollback.
+fn persist_tail(id: &str, cwd: &str, launch: &str, shared: &Arc<Mutex<TermShared>>) {
+    let tail = {
+        let state = shared.lock().unwrap();
+        let scrollback = &state.scrollback;
+        let start = scrollback.len().saturating_sub(RESUME_TAIL_MAX);
+        strip_ansi(&scrollback[start..])
+    };
+    store_descriptor(
+        id,
+        Some(SessionDescriptor {
+            id: id.to_owned(),
+            cwd: cwd.to_owned(),
+            launch: launch.to_owned(),
+            tail,
+            updated_at: unix_now(),
+        }),
+    );
+}
 
 /// State shared between the reader thread and the Tauri commands. One mutex
 /// guards scrollback + the attached channel so replay-then-attach is atomic
@@ -63,6 +155,8 @@ struct TerminalSession {
     /// Grafiki capture session id (`None` when the folder isn't a Grafiki project).
     capture_id: Option<String>,
     project_root: String,
+    /// The agent command this session was started for ("" = plain shell).
+    launch: String,
     shared: Arc<Mutex<TermShared>>,
 }
 
@@ -75,6 +169,14 @@ pub struct TerminalRegistry(Mutex<HashMap<String, TerminalSession>>);
 pub struct AttachReply {
     pub found: bool,
     pub exited: bool,
+    pub cwd: String,
+}
+
+/// What `terminal_revive` tells the UI about a disk-restored session.
+#[derive(serde::Serialize)]
+pub struct ReviveReply {
+    pub found: bool,
+    pub launch: String,
     pub cwd: String,
 }
 
@@ -101,17 +203,80 @@ fn attach_channel(shared: &Arc<Mutex<TermShared>>, channel: Channel<Vec<u8>>) ->
 
 /// Open a hosted terminal: spawn `command` in `cwd` inside a PTY, stream its bytes
 /// to `on_output`, and capture the session into `cwd`'s Grafiki project (if any).
+/// `launch` is the agent the UI will type into the shell (recorded for resume).
 /// If a LIVE session with this id already exists, reattach to it instead (open is
 /// idempotent — a double mount must never spawn or kill anything).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn terminal_open(
     registry: State<TerminalRegistry>,
     id: String,
     cwd: String,
     command: String,
+    launch: String,
     rows: u16,
     cols: u16,
     on_output: Channel<Vec<u8>>,
+) -> Result<String, String> {
+    spawn_session(&registry, id, cwd, command, launch, rows, cols, on_output, None)
+}
+
+/// Revive a session from its on-disk descriptor after an app relaunch: re-open a
+/// shell in the same folder and replay the previous output as a dimmed preamble.
+/// The frontend then types the agent's own resume command (`claude --continue`).
+/// `found: false` means there is nothing to revive (never opened / explicitly
+/// ended) — the caller shows the launcher.
+#[tauri::command]
+pub fn terminal_revive(
+    registry: State<TerminalRegistry>,
+    id: String,
+    rows: u16,
+    cols: u16,
+    on_output: Channel<Vec<u8>>,
+) -> Result<ReviveReply, String> {
+    let Some(descriptor) = load_descriptor(&id) else {
+        return Ok(ReviveReply {
+            found: false,
+            launch: String::new(),
+            cwd: String::new(),
+        });
+    };
+    let mut preamble = Vec::new();
+    if !descriptor.tail.trim().is_empty() {
+        preamble.extend_from_slice(b"\x1b[2m\xe2\x94\x80\xe2\x94\x80 previous session \xe2\x94\x80\xe2\x94\x80\x1b[0m\r\n");
+        preamble.extend_from_slice(descriptor.tail.replace('\n', "\r\n").as_bytes());
+        preamble.extend_from_slice(b"\r\n\x1b[2m\xe2\x94\x80\xe2\x94\x80 end of previous session \xe2\x94\x80\xe2\x94\x80 resuming\x1b[0m\r\n");
+    }
+    spawn_session(
+        &registry,
+        id,
+        descriptor.cwd.clone(),
+        String::new(),
+        descriptor.launch.clone(),
+        rows,
+        cols,
+        on_output,
+        Some(preamble),
+    )?;
+    Ok(ReviveReply {
+        found: true,
+        launch: descriptor.launch,
+        cwd: descriptor.cwd,
+    })
+}
+
+/// Shared spawn path for `terminal_open` and `terminal_revive`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_session(
+    registry: &State<TerminalRegistry>,
+    id: String,
+    cwd: String,
+    command: String,
+    launch: String,
+    rows: u16,
+    cols: u16,
+    on_output: Channel<Vec<u8>>,
+    preamble: Option<Vec<u8>>,
 ) -> Result<String, String> {
     {
         let mut sessions = registry.0.lock().unwrap();
@@ -172,12 +337,21 @@ pub fn terminal_open(
     .ok()
     .map(|report| report.capture.id);
 
+    let preamble = preamble.unwrap_or_default();
     let shared = Arc::new(Mutex::new(TermShared {
-        scrollback: Vec::new(),
+        scrollback: preamble.clone(),
         channel: Some(on_output),
         capture: Vec::new(),
         exited: false,
     }));
+    // Show the revive preamble before any live output (the reader thread only
+    // starts sending after this, so ordering holds).
+    if !preamble.is_empty() {
+        let state = shared.lock().unwrap();
+        if let Some(channel) = &state.channel {
+            let _ = channel.send(preamble);
+        }
+    }
 
     // Reader thread: drain the PTY for the session's whole life — buffering
     // scrollback + teeing capture even while no UI is attached. A send failure
@@ -186,6 +360,8 @@ pub fn terminal_open(
         let shared = shared.clone();
         let capture_id = capture_id.clone();
         let project_root = cwd.clone();
+        let id = id.clone();
+        let launch = launch.clone();
         std::thread::spawn(move || {
             let mut chunk = [0u8; 8192];
             loop {
@@ -214,6 +390,9 @@ pub fn terminal_open(
                         };
                         if let Some(raw) = flush {
                             flush_capture(&project_root, &capture_id, raw);
+                            // Piggyback resume-tail persistence on the capture
+                            // cadence so a hard app quit loses little context.
+                            persist_tail(&id, &project_root, &launch, &shared);
                         }
                     }
                 }
@@ -230,6 +409,7 @@ pub fn terminal_open(
                 }
                 std::mem::take(&mut state.capture)
             };
+            persist_tail(&id, &project_root, &launch, &shared);
             if let Some(capture) = capture_id {
                 flush_capture(&project_root, &Some(capture.clone()), remainder);
                 let _ = stop_capture_session(StopCaptureOptions {
@@ -242,6 +422,10 @@ pub fn terminal_open(
         });
     }
 
+    // Persist the descriptor immediately so even a session that quits without
+    // producing output can be revived into its folder.
+    persist_tail(&id, &cwd, &launch, &shared);
+
     registry.0.lock().unwrap().insert(
         id.clone(),
         TerminalSession {
@@ -250,6 +434,7 @@ pub fn terminal_open(
             child,
             capture_id,
             project_root: cwd,
+            launch,
             shared,
         },
     );
@@ -285,11 +470,23 @@ pub fn terminal_attach(
 
 /// Detach the UI from a session WITHOUT stopping it: the PTY keeps running and
 /// being captured in the background. Called when the pane unmounts (tab switch).
+/// Also refreshes the on-disk resume tail — a tab-away is the last reliable
+/// moment before a possible app quit.
 #[tauri::command]
 pub fn terminal_detach(registry: State<TerminalRegistry>, id: String) -> Result<(), String> {
-    let sessions = registry.0.lock().unwrap();
-    if let Some(session) = sessions.get(&id) {
-        session.shared.lock().unwrap().channel = None;
+    let persist = {
+        let sessions = registry.0.lock().unwrap();
+        sessions.get(&id).map(|session| {
+            session.shared.lock().unwrap().channel = None;
+            (
+                session.project_root.clone(),
+                session.launch.clone(),
+                session.shared.clone(),
+            )
+        })
+    };
+    if let Some((cwd, launch, shared)) = persist {
+        persist_tail(&id, &cwd, &launch, &shared);
     }
     Ok(())
 }
@@ -339,6 +536,8 @@ pub fn terminal_close(registry: State<TerminalRegistry>, id: String) -> Result<(
     if let Some(session) = session {
         finish_session(session);
     }
+    // Explicitly ended sessions are not resumable.
+    store_descriptor(&id, None);
     Ok(())
 }
 

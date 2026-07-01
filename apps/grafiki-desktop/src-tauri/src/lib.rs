@@ -2216,6 +2216,7 @@ pub fn run() {
             terminal::terminal_open,
             terminal::terminal_attach,
             terminal::terminal_detach,
+            terminal::terminal_revive,
             terminal::terminal_write,
             terminal::terminal_resize,
             terminal::terminal_close,

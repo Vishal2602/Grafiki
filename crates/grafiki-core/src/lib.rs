@@ -78,7 +78,8 @@ pub use memory::{
     UpsertStateOptions,
 };
 pub use project::{
-    init_project, load_capture_config, resolve_project, update_capture_config, CaptureConfig,
+    grafiki_home, init_project, load_capture_config, resolve_project, update_capture_config,
+    CaptureConfig,
     CaptureConfigOptions, CaptureConfigReport, CaptureSourceConfig, CaptureSourceUpdates,
     InitImportedFile, InitOptions, InitReport, ProjectContext, ProjectResolveOptions,
     UpdateCaptureConfigOptions,

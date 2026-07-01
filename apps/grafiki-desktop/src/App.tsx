@@ -680,17 +680,17 @@ function TerminalPane(props: { projectRoot: string }) {
     };
 
     let launchTimer: number | undefined;
-    // Type the chosen agent into the fresh shell exactly once per session
+    // Type a command into the fresh shell exactly once per session
     // (sessionStorage guard survives StrictMode's dev double-mount).
     const launchGuard = `grafiki-terminal-launched:${id}`;
-    const scheduleLaunch = () => {
-      if (!launch || sessionStorage.getItem(launchGuard)) {
+    const scheduleType = (cmd: string) => {
+      if (!cmd || sessionStorage.getItem(launchGuard)) {
         return;
       }
       launchTimer = window.setTimeout(() => {
         if (!sessionStorage.getItem(launchGuard)) {
           sessionStorage.setItem(launchGuard, "1");
-          void invoke("terminal_write", { id, data: `${launch}\r` });
+          void invoke("terminal_write", { id, data: `${cmd}\r` });
         }
       }, 700);
     };
@@ -705,12 +705,13 @@ function TerminalPane(props: { projectRoot: string }) {
             id,
             cwd: props.projectRoot,
             command: "",
+            launch,
             rows: term.rows,
             cols: term.cols,
             onOutput: channel,
           });
           if (!cancelled) {
-            scheduleLaunch();
+            scheduleType(launch);
           }
           return;
         }
@@ -722,10 +723,24 @@ function TerminalPane(props: { projectRoot: string }) {
           return;
         }
         if (!reply.found) {
-          // The app was relaunched and the PTY is gone: back to the launcher.
-          localStorage.removeItem(terminalStorageKey(props.projectRoot));
-          sessionStorage.removeItem(launchGuard);
-          setSession(null);
+          // App relaunched, live PTY is gone: revive from the disk descriptor —
+          // same folder, previous output replayed, agent resumed.
+          const revive = await invoke<{ found: boolean; launch: string; cwd: string }>(
+            "terminal_revive",
+            { id, rows: term.rows, cols: term.cols, onOutput: channel },
+          );
+          if (cancelled) {
+            return;
+          }
+          if (!revive.found) {
+            // Nothing to revive (explicitly ended): back to the launcher.
+            localStorage.removeItem(terminalStorageKey(props.projectRoot));
+            sessionStorage.removeItem(launchGuard);
+            setSession(null);
+            return;
+          }
+          // Resume the agent's own session where supported; otherwise relaunch it.
+          scheduleType(revive.launch === "claude" ? "claude --continue" : revive.launch);
           return;
         }
         if (reply.exited) {
@@ -735,7 +750,7 @@ function TerminalPane(props: { projectRoot: string }) {
         // Reattached to a live session: sync the PTY to the new pane size and
         // finish the launch typing if a dev remount interrupted it.
         resize();
-        scheduleLaunch();
+        scheduleType(launch);
       } catch (connectError) {
         if (!cancelled) {
           setError(String(connectError));
