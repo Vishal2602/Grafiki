@@ -162,12 +162,13 @@ impl OllamaProvider {
     }
 }
 
-impl ChatProvider for OllamaProvider {
-    fn generate(&self, question: &str, memories: &[GroundedMemory]) -> crate::Result<String> {
-        let messages = serde_json::to_value(build_grounded_messages(question, memories))?;
+impl OllamaProvider {
+    /// Raw chat completion: send `messages` to the model and return the assistant
+    /// text. Shared by the grounded chat and by capture auto-extraction.
+    pub fn complete(&self, messages: &[ChatMessage]) -> crate::Result<String> {
         let body = serde_json::json!({
             "model": self.model,
-            "messages": messages,
+            "messages": serde_json::to_value(messages)?,
             "stream": false,
         });
         let response = ollama_post(&self.base_url, "/api/chat", &body)?;
@@ -181,6 +182,12 @@ impl ChatProvider for OllamaProvider {
                 )
             })?;
         Ok(content.trim().to_owned())
+    }
+}
+
+impl ChatProvider for OllamaProvider {
+    fn generate(&self, question: &str, memories: &[GroundedMemory]) -> crate::Result<String> {
+        self.complete(&build_grounded_messages(question, memories))
     }
 }
 

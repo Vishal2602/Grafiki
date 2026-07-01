@@ -21,28 +21,29 @@ use clap::{Parser, Subcommand, ValueEnum};
 use grafiki_core::{
     add_context, approve_candidate, ask_memory, bulk_review_candidates, chat, chat_with_provider,
     delete_context, delete_decision, delete_entity, delete_observation, delete_relation,
-    delete_state, edit_candidate, end_session, export_memory, generate_report, get_capture_status,
-    get_context, get_embedding_status, get_graph, get_memory_record_detail, get_status,
-    handoff_session, import_agent_transcripts, import_memory, index_code, ingest_capture_event,
-    init_project, list_agent_queries, list_candidates, list_capture_events, list_context,
-    list_events, list_sessions, list_state, load_capture_config, log_decision,
-    pending_embedding_count, process_embedding_jobs, propose_candidate, propose_capture_candidates,
-    reject_candidate, run_reflection, save_entity, search_memory, start_capture_session,
-    start_session, stop_capture_session, update_capture_config, update_context, update_decision,
-    update_entity, update_observation, update_relation, update_session, upsert_state,
-    AddContextOptions, AgentMemoryBriefing, AgentTranscriptImportReport, ApproveCandidateOptions,
-    AskMemoryOptions, BulkCandidateReviewOptions, BulkCandidateReviewReport,
-    CandidateMutationReport, CandidateOrder, CaptureCandidateReport, CaptureConfigOptions,
-    CaptureConfigReport, CaptureEvent, CaptureEventReport, CaptureSessionReport,
-    CaptureSourceUpdates, CaptureStatusOptions, CaptureStatusReport, ChatOptions, ChatReply,
-    ContextListOptions, DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions,
-    DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions,
-    EmbeddingStatusOptions, EmbeddingStatusReport, EndSessionOptions, EventListOptions,
-    EvidenceInput, ExportOptions, GetContextOptions, GetMemoryRecordOptions, GraphOptions,
-    HandoffOptions, ImportAgentTranscriptsOptions, ImportOptions, IndexCodeOptions,
-    IngestCaptureEventOptions, InitOptions, ListAgentQueriesOptions, ListCandidatesOptions,
-    ListCaptureEventsOptions, LogDecisionOptions, OllamaProvider, ProcessEmbeddingsOptions,
-    ProcessEmbeddingsReport, ProjectReportOptions, ProjectResolveOptions, ProposeCandidateOptions,
+    delete_state, edit_candidate, end_session, export_memory, extract_capture_memory,
+    generate_report, get_capture_status, get_context, get_embedding_status, get_graph,
+    get_memory_record_detail, get_status, handoff_session, import_agent_transcripts, import_memory,
+    index_code, ingest_capture_event, init_project, list_agent_queries, list_candidates,
+    list_capture_events, list_context, list_events, list_sessions, list_state, load_capture_config,
+    log_decision, pending_embedding_count, process_embedding_jobs, propose_candidate,
+    propose_capture_candidates, reject_candidate, run_reflection, save_entity, search_memory,
+    start_capture_session, start_session, stop_capture_session, update_capture_config,
+    update_context, update_decision, update_entity, update_observation, update_relation,
+    update_session, upsert_state, AddContextOptions, AgentMemoryBriefing,
+    AgentTranscriptImportReport, ApproveCandidateOptions, AskMemoryOptions,
+    BulkCandidateReviewOptions, BulkCandidateReviewReport, CandidateMutationReport, CandidateOrder,
+    CaptureCandidateReport, CaptureConfigOptions, CaptureConfigReport, CaptureEvent,
+    CaptureEventReport, CaptureSessionReport, CaptureSourceUpdates, CaptureStatusOptions,
+    CaptureStatusReport, ChatOptions, ChatReply, ContextListOptions, DeleteContextOptions,
+    DeleteDecisionOptions, DeleteEntityOptions, DeleteObservationOptions, DeleteRelationOptions,
+    DeleteStateOptions, EditCandidateOptions, EmbeddingStatusOptions, EmbeddingStatusReport,
+    EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions, ExtractCaptureOptions,
+    GetContextOptions, GetMemoryRecordOptions, GraphOptions, HandoffOptions,
+    ImportAgentTranscriptsOptions, ImportOptions, IndexCodeOptions, IngestCaptureEventOptions,
+    InitOptions, ListAgentQueriesOptions, ListCandidatesOptions, ListCaptureEventsOptions,
+    LogDecisionOptions, OllamaProvider, ProcessEmbeddingsOptions, ProcessEmbeddingsReport,
+    ProjectReportOptions, ProjectResolveOptions, ProposeCandidateOptions,
     ProposeCaptureCandidatesOptions, RejectCandidateOptions, RunReflectionOptions,
     SaveEntityOptions, Scope, SearchMemoryOptions, SearchMode as CoreSearchMode, SessionLogOptions,
     StartCaptureOptions, StartSessionOptions, StateListOptions, StatusOptions, StopCaptureOptions,
@@ -1107,6 +1108,38 @@ enum CaptureCommand {
 
         #[arg(long, default_value_t = 80)]
         limit: usize,
+
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+
+        #[arg(long, value_enum, default_value_t = OutputFormat::Plain)]
+        format: OutputFormat,
+    },
+
+    /// Auto-extract durable memory (decisions, conventions, gotchas) from your
+    /// recent coding session using a local model — proposed for your review, never
+    /// auto-trusted. Imports this project's agent transcript first, then extracts.
+    Extract {
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Agent whose transcript to read (claude-code, codex, cursor).
+        #[arg(long, default_value = "claude-code")]
+        agent: String,
+
+        #[arg(long, default_value = "")]
+        scope: String,
+
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+
+        /// Local model (via Ollama) that reads the transcript.
+        #[arg(long, default_value = "gemma3:1b")]
+        model: String,
+
+        /// Ollama endpoint (default http://localhost:11434).
+        #[arg(long)]
+        ollama_url: Option<String>,
 
         #[arg(long, default_value = ".")]
         path: PathBuf,
@@ -2334,6 +2367,65 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     limit,
                 })?;
                 print_capture_candidate_report(&report, format)?;
+            }
+            CaptureCommand::Extract {
+                project,
+                agent,
+                scope,
+                limit,
+                model,
+                ollama_url,
+                path,
+                format,
+            } => {
+                ensure_capture_source_enabled(project.clone(), &path, "transcripts")?;
+                // 1) Ingest this project's agent transcript (auto-discovered);
+                //    per-source dedup makes re-runs incremental (only new events).
+                let import = import_agent_transcripts(ImportAgentTranscriptsOptions {
+                    project_name: project.clone(),
+                    start_dir: path.clone(),
+                    grafiki_home: None,
+                    agent,
+                    input: None,
+                    scope: scope.clone(),
+                    limit,
+                    summarize: false,
+                })?;
+                // 2) Let the local model read it and propose durable memory for review.
+                match extract_capture_memory(ExtractCaptureOptions {
+                    project_name: project,
+                    start_dir: path,
+                    grafiki_home: None,
+                    capture_id: Some(import.capture_id.clone()),
+                    scope,
+                    limit,
+                    model: Some(model),
+                    ollama_url,
+                }) {
+                    Ok(report) => match format {
+                        OutputFormat::Json => {
+                            println!("{}", serde_json::to_string_pretty(&report)?)
+                        }
+                        _ => {
+                            println!(
+                                "Imported {} new event(s) from {}.",
+                                import.events_imported, import.agent
+                            );
+                            println!("{}", report.message);
+                            if report.proposed > 0 {
+                                println!(
+                                    "Review them with `grafiki candidates list` or the desktop Review pane."
+                                );
+                            }
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!(
+                            "Captured {} event(s), but extraction needs a running local model: {error}",
+                            import.events_imported
+                        );
+                    }
+                }
             }
         },
         Command::Graph {

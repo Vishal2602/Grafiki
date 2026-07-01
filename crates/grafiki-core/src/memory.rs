@@ -4624,6 +4624,126 @@ pub fn propose_capture_candidates(
     })
 }
 
+/// Options for [`extract_capture_memory`] — LLM auto-extraction of durable memory
+/// from a captured coding session ("Granola for agents").
+pub struct ExtractCaptureOptions {
+    pub project_name: Option<String>,
+    pub start_dir: PathBuf,
+    pub grafiki_home: Option<PathBuf>,
+    /// Capture session to read; `None` = the latest active session.
+    pub capture_id: Option<String>,
+    pub scope: String,
+    pub limit: usize,
+    /// Local model (via Ollama) that reads the transcript. Default `gemma3:1b`.
+    pub model: Option<String>,
+    pub ollama_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureExtractReport {
+    pub events_read: usize,
+    pub proposed: usize,
+    pub message: String,
+}
+
+/// Auto-EXTRACT durable memory from a captured coding session using a local model,
+/// then PROPOSE each item for the user's review (never blind-store — the guardrail
+/// against a wrong extraction becoming a trusted fact). This is the intelligent
+/// half of "Granola for agents": unlike [`propose_capture_candidates`] (which
+/// bundles raw events into one heuristic summary), the model reads the transcript
+/// and pulls out the actual decisions / conventions / gotchas as separate,
+/// reviewable candidates. Best-effort: needs a running local model, so it is not a
+/// default-build CI gate (the pure prompt/parse logic in [`crate::extract`] is).
+pub fn extract_capture_memory(options: ExtractCaptureOptions) -> Result<CaptureExtractReport> {
+    let events = list_capture_events(ListCaptureEventsOptions {
+        project_name: options.project_name.clone(),
+        start_dir: options.start_dir.clone(),
+        grafiki_home: options.grafiki_home.clone(),
+        capture_id: options.capture_id.clone(),
+        source_type: None,
+        scope: options.scope.clone(),
+        limit: options.limit,
+    })?;
+    if events.is_empty() {
+        return Ok(CaptureExtractReport {
+            events_read: 0,
+            proposed: 0,
+            message: "No captured events found to extract from.".to_owned(),
+        });
+    }
+
+    // Assemble the transcript the model reads (already redacted at capture time).
+    let transcript = events
+        .iter()
+        .map(|event| {
+            let title = event.title.as_deref().unwrap_or("");
+            let text = event.text.as_deref().unwrap_or("");
+            format!("[{}] {}\n{}", event.source_type, title, text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let provider = crate::chat::OllamaProvider::new(options.ollama_url, options.model);
+    let response = provider.complete(&crate::extract::build_extraction_messages(&transcript))?;
+    let items = crate::extract::parse_extracted_memories(&response);
+
+    let evidence = events
+        .iter()
+        .take(30)
+        .map(evidence_from_capture_event)
+        .collect::<Vec<_>>();
+    let source = options
+        .capture_id
+        .clone()
+        .unwrap_or_else(|| "recent-capture".to_owned());
+
+    let mut proposed = 0;
+    for item in &items {
+        let payload = if item.kind == "decision" {
+            serde_json::json!({ "title": item.title, "reasoning": item.content })
+        } else {
+            serde_json::json!({
+                "key": format!("capture-{}", slugify(&item.title)),
+                "title": item.title,
+                "category": "reference",
+                "content": item.content,
+            })
+        };
+        let record_type = if item.kind == "decision" {
+            "decision"
+        } else {
+            "context"
+        };
+        propose_candidate(ProposeCandidateOptions {
+            project_name: options.project_name.clone(),
+            start_dir: options.start_dir.clone(),
+            grafiki_home: options.grafiki_home.clone(),
+            source_type: "capture:llm".to_owned(),
+            source: Some(source.clone()),
+            record_type: record_type.to_owned(),
+            payload,
+            scope: options.scope.clone(),
+            confidence: 0.6,
+            rationale: Some(
+                "Auto-extracted from your coding session by the local model; review before trusting."
+                    .to_owned(),
+            ),
+            evidence: evidence.clone(),
+        })?;
+        proposed += 1;
+    }
+
+    Ok(CaptureExtractReport {
+        events_read: events.len(),
+        proposed,
+        message: format!(
+            "Read {} event(s); proposed {} memory candidate(s) for review.",
+            events.len(),
+            proposed
+        ),
+    })
+}
+
 pub fn get_status(options: StatusOptions) -> Result<StatusReport> {
     let scope = Scope::new(options.scope)?;
     let scope_chain = scope.chain().into_vec();
@@ -9616,21 +9736,21 @@ mod tests {
     use super::{
         add_context, approve_candidate, ask_memory, bulk_review_candidates, chat, delete_context,
         delete_decision, delete_entity, delete_observation, delete_relation, delete_state,
-        edit_candidate, end_session, export_memory, generate_report, get_context,
-        get_embedding_status, get_graph, get_status, handoff_session, hybrid_search_results,
-        import_memory, ingest_capture_event, list_candidates, list_context, list_decisions,
-        list_events, list_observations, list_relations, list_sessions, list_state, log_decision,
-        pending_embedding_count, process_embedding_jobs, propose_candidate, reject_candidate,
-        resolve_and_open, save_entity, search_memory, start_capture_session, update_context,
-        update_decision, update_entity, update_observation, update_relation, update_session,
-        upsert_state, AddContextOptions, ApproveCandidateOptions, AskMemoryOptions,
+        edit_candidate, end_session, export_memory, extract_capture_memory, generate_report,
+        get_context, get_embedding_status, get_graph, get_status, handoff_session,
+        hybrid_search_results, import_memory, ingest_capture_event, list_candidates, list_context,
+        list_decisions, list_events, list_observations, list_relations, list_sessions, list_state,
+        log_decision, pending_embedding_count, process_embedding_jobs, propose_candidate,
+        reject_candidate, resolve_and_open, save_entity, search_memory, start_capture_session,
+        update_context, update_decision, update_entity, update_observation, update_relation,
+        update_session, upsert_state, AddContextOptions, ApproveCandidateOptions, AskMemoryOptions,
         BulkCandidateReviewOptions, CandidateOrder, ChatOptions, ContextListOptions,
         DecisionListOptions, DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions,
         DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions,
         EmbeddingStatusOptions, EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions,
-        ExtractionCandidate, GetContextOptions, GraphOptions, HandoffOptions, ImportOptions,
-        IngestCaptureEventOptions, ListCandidatesOptions, LogDecisionOptions,
-        ObservationListOptions, ProcessEmbeddingsOptions, ProjectReportOptions,
+        ExtractCaptureOptions, ExtractionCandidate, GetContextOptions, GraphOptions,
+        HandoffOptions, ImportOptions, IngestCaptureEventOptions, ListCandidatesOptions,
+        LogDecisionOptions, ObservationListOptions, ProcessEmbeddingsOptions, ProjectReportOptions,
         ProposeCandidateOptions, RejectCandidateOptions, RelationListOptions, SaveEntityOptions,
         SearchMemoryOptions, SearchMode, SearchReport, SearchResult, SessionLogOptions,
         StartCaptureOptions, StateListOptions, StatusOptions, UpdateContextOptions,
@@ -10993,6 +11113,102 @@ mod tests {
         assert!(!empty.used_memory);
         assert!(empty.citations.is_empty());
         assert_eq!(empty.answer, crate::chat::NO_MEMORY_ANSWER);
+    }
+
+    #[test]
+    fn extract_capture_memory_proposes_reviewable_candidates() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let (_temp, home, project_dir) = setup_project();
+        let scope = "example-project/core";
+
+        // Capture a tiny "coding session".
+        let capture = start_capture_session(StartCaptureOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            scope: scope.to_owned(),
+            source_app: Some("test".to_owned()),
+            consent_profile: None,
+            redaction_profile: None,
+        })
+        .unwrap();
+        ingest_capture_event(IngestCaptureEventOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            capture_id: Some(capture.capture.id.clone()),
+            source_type: "terminal".to_owned(),
+            source: None,
+            title: Some("session".to_owned()),
+            text: Some("We chose SQLite over Postgres for V1 because it's embedded.".to_owned()),
+            payload: None,
+            metadata: None,
+            scope: scope.to_owned(),
+            privacy_level: None,
+            captured_at: None,
+            redacted: false,
+        })
+        .unwrap();
+
+        // Stand-in Ollama: return two extracted items as the model's content.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 16384];
+            let _ = socket.read(&mut buf).unwrap();
+            let content = "[{\"kind\":\"decision\",\"title\":\"Use SQLite\",\"content\":\"Chosen \
+                 over Postgres for V1 because it is embedded.\"},{\"kind\":\"context\",\"title\":\
+                 \"DB constraint\",\"content\":\"V1 excludes a server database.\"}]";
+            let envelope =
+                serde_json::json!({"message":{"role":"assistant","content":content}}).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{envelope}",
+                envelope.len()
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+
+        let report = extract_capture_memory(ExtractCaptureOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            capture_id: Some(capture.capture.id.clone()),
+            scope: scope.to_owned(),
+            limit: 100,
+            model: None,
+            ollama_url: Some(format!("http://127.0.0.1:{port}")),
+        })
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(
+            report.proposed, 2,
+            "both extracted items should be proposed"
+        );
+
+        // They land in the REVIEW queue (propose-for-review), not trusted memory —
+        // the guardrail against a wrong extraction becoming a trusted fact.
+        let candidates = list_candidates(ListCandidatesOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            status: Some("pending".to_owned()),
+            scope: scope.to_owned(),
+            limit: 100,
+            order: CandidateOrder::Recent,
+        })
+        .unwrap();
+        let extracted: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| candidate.source_type == "capture:llm")
+            .collect();
+        assert_eq!(extracted.len(), 2);
+        assert!(extracted.iter().any(|c| c.record_type == "decision"));
+        assert!(extracted.iter().any(|c| c.record_type == "context"));
     }
 
     #[test]

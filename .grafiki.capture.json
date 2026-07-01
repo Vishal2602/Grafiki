@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "sources": {
+    "git": true,
+    "transcripts": true,
+    "terminal": true,
+    "files": true,
+    "ide": true,
+    "screen": false,
+    "browser": false,
+    "audio": false,
+    "system": true
+  },
+  "blocked_paths": [
+    ".git",
+    ".grafiki",
+    ".grafiki.capture.json",
+    ".env",
+    "node_modules",
+    "target",
+    "dist",
+    "build"
+  ],
+  "blocked_apps": [],
+  "redaction_profile": "default",
+  "terminal_output": "off",
+  "screen_policy": "manual",
+  "browser_policy": "off"
+}

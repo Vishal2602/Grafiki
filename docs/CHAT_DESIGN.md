@@ -1,6 +1,17 @@
 # DESIGN: Grafiki — "Chat with your memory" (local, grounded RAG)
 
-**Status:** Phases 1–2 DONE + Phase 3 desktop chat pane DONE; the app-bundled runtime and Phase 4 proposed.
+**Status:** Chat Phases 1–3 DONE; **"Granola for agents" auto-EXTRACTION DONE** (local model); app-bundled runtime, continuous auto-watch, and Phase 4 proposed.
+**Update 2026-07-01 (auto-extraction):** the intelligent half of passive capture shipped —
+`grafiki_core::extract` (`build_extraction_messages` + tolerant `parse_extracted_memories`, pure and
+CI-tested) + `memory::extract_capture_memory` (reads captured session events → local Gemma pulls out
+durable decisions/conventions/gotchas → **proposes each as a review candidate**, `source_type
+"capture:llm"`, never blind-stored — the Postgres-incident guardrail). CLI `grafiki capture extract`
+(imports this project's auto-discovered agent transcript, then extracts; per-source dedup makes it
+incremental). Reuses the `OllamaProvider::complete` seam. Verified: pure prompt/parse unit tests +
+an integration test running the full pipeline against a mock model server. REMAINING for TRULY
+passive (user's hard constraint — no telling the AI anything): a background daemon that
+auto-discovers + tails the transcript and runs extraction continuously (this manual `capture extract`
+command is the stepping stone).
 **Update 2026-07-01 (Phase 3 UI):** the **desktop chat pane** shipped — a `chat_with_memory` Tauri
 command (`apps/grafiki-desktop/src-tauri/src/lib.rs`, same Ollama+extractive-fallback logic as the
 CLI), an `chatWithMemory` API binding, and a `ChatPane` React view (new `"chat"` nav item) that shows
