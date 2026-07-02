@@ -1167,6 +1167,66 @@ textarea {
   justify-content: center;
 }
 
+/* --------------------------------------------------------------- palette */
+.palette-overlay {
+  align-items: flex-start;
+  padding-top: 14vh;
+}
+.palette {
+  width: min(540px, 90vw);
+  background: var(--sheet);
+  border-radius: var(--r-card);
+  border: 1px solid var(--hairline-2);
+  box-shadow: 0 20px 60px rgba(3, 33, 19, 0.35);
+  overflow: hidden;
+}
+.palette input {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--hairline);
+  border-radius: 0;
+  padding: 13px 16px;
+  font-size: 14px;
+  background: transparent;
+}
+.palette input:focus {
+  box-shadow: none;
+  border-color: var(--hairline);
+}
+.palette-list {
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 6px;
+}
+.palette-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--r-btn);
+  font-size: 13px;
+  cursor: pointer;
+}
+.palette-row.active {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+.palette-row em {
+  font-style: italic;
+}
+.palette-hint {
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.palette-empty {
+  padding: 16px;
+  text-align: center;
+  color: var(--ink-3);
+  font-family: var(--serif);
+  font-size: 14px;
+}
+
 /* --------------------------------------------------------- session detail */
 .session-head {
   display: flex;

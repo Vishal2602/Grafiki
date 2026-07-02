@@ -170,6 +170,7 @@ export default function App() {
   const [recordDetailError, setRecordDetailError] = useState<string | null>(null);
   const [recordDetailLoading, setRecordDetailLoading] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const [onboarding, setOnboarding] = useState(
     () => !localStorage.getItem("grafiki.onboarded") && !localStorage.getItem(PROJECT_ROOT_KEY),
   );
@@ -218,6 +219,17 @@ export default function App() {
     setSelectedResult(null);
     setRecordDetail(null);
   }, [projectRoot]);
+
+  useEffect(() => {
+    const onPaletteKey = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setPaletteOpen((current) => !current);
+      }
+    };
+    window.addEventListener("keydown", onPaletteKey);
+    return () => window.removeEventListener("keydown", onPaletteKey);
+  }, []);
 
   useEffect(() => {
     const onHashChange = () => {
@@ -448,6 +460,64 @@ export default function App() {
       </main>
 
       <AnimatePresence initial={false}>
+        {paletteOpen ? (
+          <CommandPalette
+            onClose={() => setPaletteOpen(false)}
+            onAsk={(question) =>
+              switchPrimaryPane("chat", { query: question, title: `Memory: ${question}` })
+            }
+            actions={[
+              { id: "home", label: "Go to Home", hint: "ledger", run: () => switchPrimaryPane("home") },
+              { id: "sessions", label: "Go to Sessions", run: () => switchPrimaryPane("terminal") },
+              { id: "memory", label: "Go to Memory", hint: "chat", run: () => switchPrimaryPane("chat") },
+              {
+                id: "review",
+                label: `Go to Review${(homeLedger?.ledger.pending_candidates ?? 0) > 0 ? ` (${homeLedger?.ledger.pending_candidates} pending)` : ""}`,
+                run: () => switchPrimaryPane("candidates"),
+              },
+              { id: "settings", label: "Go to Settings", run: () => switchPrimaryPane("settings") },
+              {
+                id: "start-claude",
+                label: "Start Claude Code session",
+                run: () => switchPrimaryPane("terminal", { query: "claude" }),
+              },
+              {
+                id: "start-shell",
+                label: "Start shell session",
+                run: () => switchPrimaryPane("terminal", { query: "" }),
+              },
+              ...(homeLedger?.resumable
+                ? [
+                    {
+                      id: "resume",
+                      label: "Resume last session",
+                      hint: homeLedger.resumable.launch || "shell",
+                      run: () => {
+                        localStorage.setItem(
+                          terminalStorageKey(projectRoot),
+                          JSON.stringify({
+                            id: homeLedger.resumable!.id,
+                            launch: homeLedger.resumable!.launch,
+                          }),
+                        );
+                        switchPrimaryPane("terminal");
+                      },
+                    },
+                  ]
+                : []),
+              {
+                id: "extract",
+                label: "Extract memories now",
+                hint: "runs the local model",
+                run: () => {
+                  void extractSessionMemory({ startDir: projectRoot })
+                    .then(() => refreshLedger())
+                    .catch(() => undefined);
+                },
+              },
+            ]}
+          />
+        ) : null}
         {inspectorOpen ? (
           <Inspector
             snapshot={snapshot}
@@ -669,6 +739,110 @@ function MemoryPane(props: {
         ) : null}
       </div>
     </motion.article>
+  );
+}
+
+type PaletteAction = {
+  id: string;
+  label: string;
+  hint?: string;
+  run: () => void;
+};
+
+function CommandPalette(props: {
+  actions: PaletteAction[];
+  onAsk: (question: string) => void;
+  onClose: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [index, setIndex] = useState(0);
+
+  const q = query.trim().toLowerCase();
+  const matches = props.actions.filter((action) => action.label.toLowerCase().includes(q));
+  // Anything that matches no action becomes a memory question — the palette IS
+  // the ask bar when you type a sentence.
+  const askRow = query.trim().length > 0;
+  const total = matches.length + (askRow ? 1 : 0);
+  const clamped = Math.min(index, Math.max(0, total - 1));
+
+  const execute = (position: number) => {
+    if (position < matches.length) {
+      matches[position].run();
+    } else if (askRow) {
+      props.onAsk(query.trim());
+    }
+    props.onClose();
+  };
+
+  return (
+    <motion.div
+      className="overlay palette-overlay"
+      role="presentation"
+      onMouseDown={props.onClose}
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      transition={transition.quick}
+    >
+      <motion.div
+        className="palette"
+        role="dialog"
+        aria-label="Command palette"
+        onMouseDown={(event) => event.stopPropagation()}
+        initial={{ opacity: 0, y: -8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={transition.quick}
+      >
+        <input
+          autoFocus
+          value={query}
+          placeholder="Type a command, or ask your memory…"
+          onChange={(event) => {
+            setQuery(event.target.value);
+            setIndex(0);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowDown") {
+              event.preventDefault();
+              setIndex(Math.min(total - 1, clamped + 1));
+            } else if (event.key === "ArrowUp") {
+              event.preventDefault();
+              setIndex(Math.max(0, clamped - 1));
+            } else if (event.key === "Enter") {
+              event.preventDefault();
+              if (total > 0) execute(clamped);
+            } else if (event.key === "Escape") {
+              props.onClose();
+            }
+          }}
+        />
+        <div className="palette-list">
+          {matches.map((action, position) => (
+            <div
+              key={action.id}
+              className={`palette-row ${position === clamped ? "active" : ""}`}
+              onMouseEnter={() => setIndex(position)}
+              onClick={() => execute(position)}
+            >
+              <span>{action.label}</span>
+              {action.hint ? <span className="palette-hint">{action.hint}</span> : null}
+            </div>
+          ))}
+          {askRow ? (
+            <div
+              className={`palette-row ${clamped === matches.length ? "active" : ""}`}
+              onMouseEnter={() => setIndex(matches.length)}
+              onClick={() => execute(matches.length)}
+            >
+              <span>
+                Ask memory: <em>“{query.trim()}”</em>
+              </span>
+              <span className="palette-hint">↵</span>
+            </div>
+          ) : null}
+          {total === 0 ? <div className="palette-empty">Nothing matches.</div> : null}
+        </div>
+      </motion.div>
+    </motion.div>
   );
 }
 
