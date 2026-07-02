@@ -16,6 +16,7 @@ export interface PaneState {
   kind: PaneKind;
   title: string;
   query?: string;
+  handoffPrompt?: string;
   mode?: SearchMode;
   scope?: string;
   entityId?: string;

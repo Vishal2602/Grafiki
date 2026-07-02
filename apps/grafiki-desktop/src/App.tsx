@@ -679,7 +679,7 @@ function MemoryPane(props: {
         </header>
       ) : null}
 
-      <div className="pane-body">
+      <div className={`pane-body ${pane.kind === "terminal" || pane.kind === "chat" ? "fill" : ""}`}>
         {pane.kind === "home" ? (
           <HomePane
             snapshot={props.snapshot}
@@ -700,6 +700,7 @@ function MemoryPane(props: {
             projectRoot={props.projectRoot}
             fallbackCwd={props.snapshot?.start_dir ?? ""}
             initialLaunch={pane.query}
+            handoffPrompt={pane.handoffPrompt}
           />
         ) : null}
         {pane.kind === "chat" ? (
@@ -709,6 +710,7 @@ function MemoryPane(props: {
             projectRoot={props.projectRoot}
             onUpdate={props.onUpdate}
             onOpenResult={props.onOpenResult}
+            onNavigate={props.onNavigate}
           />
         ) : null}
         {pane.kind === "candidates" ? (
@@ -1204,6 +1206,7 @@ function TerminalPane(props: {
   projectRoot: string;
   fallbackCwd: string;
   initialLaunch?: string;
+  handoffPrompt?: string;
 }) {
   // The session id is STABLE and persisted per project: switching tabs detaches
   // the UI but the PTY (and the agent inside it) keeps running; coming back
@@ -1271,7 +1274,7 @@ function TerminalPane(props: {
   const [lens, setLens] = useState<"terminal" | "chat">("terminal");
   const [turns, setTurns] = useState<LiveTranscriptTurn[]>([]);
   const [composer, setComposer] = useState("");
-  const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const chatCapable = session?.launch === "claude";
   useEffect(() => {
     if (!session || lens !== "chat") {
@@ -1293,7 +1296,12 @@ function TerminalPane(props: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lens, session?.id]);
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ block: "end" });
+    // Scroll ONLY the bubble list — scrollIntoView would drag every scrollable
+    // ancestor (including the window root) and shove the chrome off-screen.
+    const scroller = chatScrollRef.current;
+    if (scroller) {
+      scroller.scrollTop = scroller.scrollHeight;
+    }
   }, [turns.length]);
   const sendComposer = () => {
     const text = composer.trim();
@@ -1349,9 +1357,27 @@ function TerminalPane(props: {
     };
 
     let launchTimer: number | undefined;
+    let handoffTimer: number | undefined;
     // Type a command into the fresh shell exactly once per session
     // (sessionStorage guard survives StrictMode's dev double-mount).
     const launchGuard = `grafiki-terminal-launched:${id}`;
+    const handoffGuard = `grafiki-terminal-handoff:${id}`;
+    // Recall→act: once the agent has booted, hand it the cited memory context
+    // as its opening prompt (single line — newlines would submit early).
+    const scheduleHandoff = () => {
+      const prompt = props.handoffPrompt?.replace(/\s+/g, " ").trim();
+      if (!prompt || sessionStorage.getItem(handoffGuard)) {
+        return;
+      }
+      handoffTimer = window.setTimeout(() => {
+        if (!sessionStorage.getItem(handoffGuard)) {
+          sessionStorage.setItem(handoffGuard, "1");
+          void invoke("terminal_write", { id, data: prompt }).then(() =>
+            window.setTimeout(() => void invoke("terminal_write", { id, data: "\r" }), 400),
+          );
+        }
+      }, 7000);
+    };
     const scheduleType = (cmd: string) => {
       if (!cmd || sessionStorage.getItem(launchGuard)) {
         return;
@@ -1382,6 +1408,7 @@ function TerminalPane(props: {
           if (!cancelled) {
             setCapturing(opened.capturing);
             scheduleType(launch);
+            scheduleHandoff();
           }
           return;
         }
@@ -1453,6 +1480,9 @@ function TerminalPane(props: {
       cancelled = true;
       if (launchTimer) {
         window.clearTimeout(launchTimer);
+      }
+      if (handoffTimer) {
+        window.clearTimeout(handoffTimer);
       }
       window.clearInterval(extractTimer);
       observer.disconnect();
@@ -1571,7 +1601,7 @@ function TerminalPane(props: {
         />
         {lens === "chat" ? (
           <div className="chat-lens">
-            <div className="chat-lens-scroll">
+            <div className="chat-lens-scroll" ref={chatScrollRef}>
               {turns.length === 0 ? (
                 <p className="muted" style={{ margin: "auto", textAlign: "center" }}>
                   Waiting for the conversation… (the transcript appears after Claude's first
@@ -1587,7 +1617,6 @@ function TerminalPane(props: {
                   </div>
                 ))
               )}
-              <div ref={chatEndRef} />
             </div>
             <div className="search-box">
               <input
@@ -1658,6 +1687,7 @@ function ChatPane(props: {
   projectRoot: string;
   onUpdate: (patch: Partial<PaneState>) => void;
   onOpenResult: (result: SearchResult) => void;
+  onNavigate: (kind: PaneKind, patch?: Partial<PaneState>) => void;
 }) {
   const [question, setQuestion] = useState("");
   const [scope, setScope] = useState(props.pane.scope ?? props.snapshot?.scope ?? "");
@@ -1897,6 +1927,20 @@ function ChatPane(props: {
                         </button>
                       ))}
                     </div>
+                  ) : null}
+                  {turn.reply.used_memory ? (
+                    <button
+                      className="link-button"
+                      style={{ marginTop: 8, fontSize: 12 }}
+                      onClick={() =>
+                        props.onNavigate("terminal", {
+                          query: "claude",
+                          handoffPrompt: `Context from my project memory (Grafiki): Q: ${turn.question} — A: ${turn.reply?.answer ?? ""} — Continue working from these decisions.`,
+                        })
+                      }
+                    >
+                      Continue this with Claude →
+                    </button>
                   ) : null}
                   {turn.reply.flagged_injection ? (
                     <p className="muted" style={{ marginTop: 6, fontSize: 12 }}>

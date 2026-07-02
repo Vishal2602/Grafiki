@@ -2347,10 +2347,98 @@ fn install_panic_logger() {
     }));
 }
 
+/// The ambient menubar presence: a tray item whose title shows the live
+/// capture dot, with the review count and window shortcuts one click away.
+/// Best-effort — the app works identically without it.
+fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{MenuBuilder, MenuItem};
+    use tauri::tray::TrayIconBuilder;
+
+    let status_item = MenuItem::with_id(app, "status", "Not capturing", false, None::<&str>)?;
+    let review_item = MenuItem::with_id(app, "review", "Review: up to date", true, None::<&str>)?;
+    let open_item = MenuItem::with_id(app, "open", "Open Grafiki", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit Grafiki", true, None::<&str>)?;
+    let menu = MenuBuilder::new(app)
+        .item(&status_item)
+        .separator()
+        .item(&review_item)
+        .item(&open_item)
+        .separator()
+        .item(&quit_item)
+        .build()?;
+
+    let tray = TrayIconBuilder::with_id("grafiki-tray")
+        .icon(
+            app.default_window_icon()
+                .cloned()
+                .expect("bundled window icon"),
+        )
+        .icon_as_template(true)
+        .menu(&menu)
+        .show_menu_on_left_click(true)
+        .on_menu_event(|app, event| {
+            let show = |target: Option<&str>| {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+                if let Some(target) = target {
+                    let _ = tauri::Emitter::emit(app, "grafiki://navigate", target);
+                }
+            };
+            match event.id().as_ref() {
+                "open" => show(None),
+                "review" => show(Some("candidates")),
+                "quit" => app.exit(0),
+                _ => {}
+            }
+        })
+        .build(app)?;
+
+    // Ambient status tick: the dot next to the menubar icon while capturing,
+    // and the live pending count in the menu.
+    let handle = app.clone();
+    std::thread::spawn(move || loop {
+        let capturing = {
+            let registry = handle.state::<terminal::TerminalRegistry>();
+            terminal::live_sessions(&registry)
+                .iter()
+                .any(|session| session.capturing)
+        };
+        let _ = tray.set_title(Some(if capturing { "●" } else { "" }));
+        let _ = status_item.set_text(if capturing {
+            "● Capturing this session"
+        } else {
+            "Not capturing"
+        });
+        if let Ok(ledger) = grafiki_core::capture_ledger(grafiki_core::CaptureLedgerOptions {
+            project_name: None,
+            start_dir: resolve_start_dir(None),
+            grafiki_home: None,
+            limit: 1,
+        }) {
+            let _ = review_item.set_text(if ledger.pending_candidates > 0 {
+                format!("Review: {} pending", ledger.pending_candidates)
+            } else {
+                "Review: up to date".to_owned()
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_secs(20));
+    });
+
+    Ok(())
+}
+
 pub fn run() {
     install_panic_logger();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            if let Err(error) = setup_tray(app.handle()) {
+                eprintln!("grafiki: tray unavailable: {error}");
+            }
+            Ok(())
+        })
         .manage(DaemonTokens::default())
         .manage(terminal::TerminalRegistry::default())
         .invoke_handler(tauri::generate_handler![
