@@ -251,6 +251,12 @@ optional.
   capture_sessions, candidates, descriptors), nav = Home/Sessions/Memory/
   Review/Settings, Review keyboard triage, Chat under Memory. This alone
   transforms the product.
+- **P0.5 — Motion pass (user-added):** strip ALL legacy transitions/animations
+  (press-lift on every button, spring-scale pane entrances, layout animations
+  on nav) and replace with the calm set from DESIGN.md §7: 140–180ms ease-out
+  fades with small translate for surface changes, CSS-only press states,
+  slide-down banner entrances, capture pulse, count-up stats. Motion should be
+  felt only at moments of *arrival* (new memory, new session), never on hover.
 - **P1 — Onboarding wizard** (project init + Ollama probe/pull + first-session
   handoff) and the live-session side peek.
 - **P2 — Session detail + agent chat lens** (past sessions: memories/summary/

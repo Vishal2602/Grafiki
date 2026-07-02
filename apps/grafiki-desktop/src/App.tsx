@@ -151,21 +151,13 @@ const sessionTypes = [
 ];
 const sessionStatuses = ["active", "completed", "handed-off", "abandoned"];
 
+// Motion happens at moments of ARRIVAL (a pane appears, a banner lands, a
+// memory is learned) — never on hover, never as springs. DESIGN.md §7.
 const transition = {
-  quick: { duration: 0.14, ease: [0.2, 0, 0.2, 1] },
-  pane: { type: "spring", stiffness: 420, damping: 38, mass: 0.8 },
-  modal: { type: "spring", stiffness: 520, damping: 42, mass: 0.9 },
+  quick: { duration: 0.14, ease: [0.2, 0, 0, 1] },
+  pane: { duration: 0.16, ease: [0.2, 0, 0, 1] },
+  modal: { duration: 0.18, ease: [0.2, 0, 0, 1] },
 } as const;
-
-function pressMotion(reduceMotion: boolean) {
-  return reduceMotion
-    ? {}
-    : {
-        whileHover: { y: -1 },
-        whileTap: { scale: 0.985 },
-        transition: transition.quick,
-      };
-}
 
 export default function App() {
   const [layout, setLayout] = useState<LayoutState>(() => loadInitialLayout());
@@ -461,34 +453,27 @@ function Rail(props: {
 }) {
   return (
     <aside className="rail">
-      <motion.button
-        className="brand"
-        aria-label="Grafiki home"
-        onClick={() => props.onOpen("home")}
-        {...pressMotion(props.reduceMotion)}
-      >
+      <button className="brand" aria-label="Grafiki home" onClick={() => props.onOpen("home")}>
         <span className="brand-mark">G</span>
         <span className="brand-text">Grafiki</span>
-      </motion.button>
+      </button>
 
       <nav className="rail-nav" aria-label="Primary">
         {navItems.map((item) => {
           const Icon = item.icon;
           return (
-            <motion.button
+            <button
               key={item.kind}
-              layout
               className={`rail-item ${props.activeKind === item.kind ? "active" : ""}`}
               onClick={() => props.onOpen(item.kind)}
               title={item.label}
-              {...pressMotion(props.reduceMotion)}
             >
               <Icon size={16} />
               <span>{item.label}</span>
               {item.kind === "candidates" && props.pendingCount > 0 ? (
                 <span className="rail-badge">{props.pendingCount}</span>
               ) : null}
-            </motion.button>
+            </button>
           );
         })}
       </nav>
@@ -507,12 +492,7 @@ function TopStatus(props: {
   const memoryAvailable = snapshot?.memory_available ?? false;
 
   return (
-    <motion.header
-      className="top-status"
-      initial={{ opacity: 0, y: -6 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={transition.quick}
-    >
+    <header className="top-status">
       <div className="project-lockup">
         <Database size={16} />
         <div>
@@ -537,7 +517,7 @@ function TopStatus(props: {
           <PanelRight size={16} />
         </button>
       </div>
-    </motion.header>
+    </header>
   );
 }
 
@@ -548,10 +528,10 @@ function StatusPill(props: {
 }) {
   const Icon = props.icon;
   return (
-    <motion.span className={`status-pill ${props.tone}`} layout transition={transition.quick}>
+    <span className={`status-pill ${props.tone}`}>
       <Icon size={14} />
       {props.children}
-    </motion.span>
+    </span>
   );
 }
 
@@ -581,12 +561,11 @@ function MemoryPane(props: {
 
   return (
     <motion.article
-      layout
       className={`memory-pane ${props.active ? "active" : ""}`}
       onPointerDown={props.onActivate}
-      initial={props.reduceMotion ? false : { opacity: 0, y: 10, scale: 0.992 }}
-      animate={{ opacity: 1, y: 0, scale: 1 }}
-      exit={props.reduceMotion ? undefined : { opacity: 0, y: 8, scale: 0.992 }}
+      initial={props.reduceMotion ? false : { opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={props.reduceMotion ? undefined : { opacity: 0 }}
       transition={transition.pane}
     >
       {pane.kind !== "home" ? (
@@ -763,7 +742,12 @@ function HomePane(props: {
         </div>
 
         {live ? (
-          <div className="live-card">
+          <motion.div
+            className="live-card"
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={transition.quick}
+          >
             <div className="term-preview">{live.tail || "…"}</div>
             <div className="live-bar">
               <span className="pulse-dot" />
@@ -776,9 +760,14 @@ function HomePane(props: {
                 Open →
               </button>
             </div>
-          </div>
+          </motion.div>
         ) : resumable ? (
-          <div className="suggest-banner">
+          <motion.div
+            className="suggest-banner"
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={transition.quick}
+          >
             <span className="spark">↻</span>
             Pick up where you left off — {resumable.launch || "shell"} in {resumable.cwd}
             <span className="banner-action">
@@ -786,11 +775,16 @@ function HomePane(props: {
                 Resume session
               </button>
             </span>
-          </div>
+          </motion.div>
         ) : null}
 
         {(ledger?.pending_candidates ?? 0) > 0 ? (
-          <div className="suggest-banner">
+          <motion.div
+            className="suggest-banner"
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ ...transition.quick, delay: 0.05 }}
+          >
             <span className="spark">✦</span>
             {ledger?.pending_candidates} new{" "}
             {ledger?.pending_candidates === 1 ? "memory" : "memories"} from your sessions
@@ -800,7 +794,7 @@ function HomePane(props: {
                 Review
               </button>
             </span>
-          </div>
+          </motion.div>
         ) : null}
 
         {sessions.length === 0 ? (
@@ -2978,16 +2972,16 @@ function PromptModal(props: { config: PromptConfig; reduceMotion: boolean; onClo
         aria-label={config.title}
         tabIndex={-1}
         onMouseDown={(event) => event.stopPropagation()}
-        initial={props.reduceMotion ? false : { opacity: 0, y: 12, scale: 0.985 }}
-        animate={{ opacity: 1, y: 0, scale: 1 }}
-        exit={props.reduceMotion ? undefined : { opacity: 0, y: 8, scale: 0.985 }}
+        initial={props.reduceMotion ? false : { opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        exit={props.reduceMotion ? undefined : { opacity: 0 }}
         transition={transition.modal}
       >
         <header>
           <strong>{config.title}</strong>
-          <motion.button onClick={props.onClose} {...pressMotion(props.reduceMotion)}>
+          <button className="icon-button" onClick={props.onClose}>
             <X size={16} />
-          </motion.button>
+          </button>
         </header>
         <div className="prompt-fields">
           {config.fields.map((field, index) => (

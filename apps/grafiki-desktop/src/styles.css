@@ -1167,6 +1167,29 @@ textarea {
   justify-content: center;
 }
 
+/* ------------------------------------------------------- press & motion */
+/* Press feedback is CSS, not JS: cheap, instant, everywhere. */
+button:active:not(:disabled) {
+  transform: scale(0.985);
+}
+.rail-item,
+.button,
+.icon-button,
+.evidence-chip,
+.search-box button {
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease,
+    transform 80ms ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pulse-dot {
+    animation: none;
+  }
+  * {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+
 /* ---------------------------------------------------------- scrollbars */
 ::-webkit-scrollbar {
   width: 10px;
