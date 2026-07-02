@@ -13,3 +13,6 @@ grafiki-wiki/
 *.db-wal
 *.db-shm
 GRAFIKI_CONTEXT.md
+
+# Design reference screenshots — contain personal/work data, never commit
+Inspiration/

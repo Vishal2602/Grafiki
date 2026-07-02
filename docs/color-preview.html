@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Grafiki — Color Directions</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --frame:#ECEBE8; --sheet:#FBFAF8; --sidebar:#F4F3F0; --card:#FFFFFF;
+    --well:#16181C; --ink:#1B1A17; --ink2:#6E6C66; --ink3:#A3A199;
+    --hair:rgba(27,26,23,.08); --hair2:rgba(27,26,23,.16);
+    --ok:#3D9A63; --warn:#C7912B; --danger:#C4483C;
+  }
+  *{box-sizing:border-box; margin:0}
+  body{background:#E3E2DF; font-family:Inter,system-ui,sans-serif; color:var(--ink); padding:48px; -webkit-font-smoothing:antialiased}
+  h1{font-family:Newsreader,Georgia,serif; font-weight:400; font-size:40px; margin-bottom:6px}
+  h1 em{font-style:italic}
+  .sub{color:var(--ink2); font-size:14px; margin-bottom:40px}
+  h2{font-family:Newsreader,Georgia,serif; font-weight:500; font-size:24px; margin:56px 0 6px}
+  .note{color:var(--ink2); font-size:13px; margin-bottom:20px; max-width:720px; line-height:1.5}
+  .row{display:flex; gap:24px; flex-wrap:wrap}
+
+  /* ---------- mini app mockup ---------- */
+  .mock{width:460px; background:var(--frame); border-radius:16px; padding:10px; border:1px solid var(--hair);
+        box-shadow:0 8px 30px rgba(27,26,23,.08)}
+  .mock-inner{display:flex; gap:8px}
+  .rail{width:110px; padding:10px 6px; display:flex; flex-direction:column; gap:2px}
+  .rail .brand{font-weight:600; font-size:11px; padding:6px 8px; display:flex; align-items:center; gap:6px}
+  .rail .brand .dot{width:14px;height:14px;border-radius:4px;background:var(--A);display:inline-block}
+  .rail a{font-size:10.5px; color:var(--ink2); padding:5px 8px; border-radius:6px; text-decoration:none; display:flex; gap:5px; align-items:center}
+  .rail a.active{background:rgba(27,26,23,.06); color:var(--ink); font-weight:500}
+  .rail a .badge{margin-left:auto; background:var(--A); color:#fff; border-radius:99px; font-size:8.5px; padding:1px 5px; font-weight:600}
+  .sheet{flex:1; background:var(--sheet); border-radius:12px; border:1px solid var(--hair); padding:14px 16px; min-height:330px}
+  .sheet .title{font-family:Newsreader,Georgia,serif; font-size:19px; font-weight:500; margin-bottom:2px}
+  .sheet .meta{font-size:9.5px; color:var(--ink3); margin-bottom:10px}
+  .stat-strip{display:flex; gap:6px; margin-bottom:10px}
+  .stat{flex:1; background:var(--card); border:1px solid var(--hair); border-radius:8px; padding:7px 8px}
+  .stat b{font-family:Newsreader,Georgia,serif; font-weight:500; font-size:16px; display:block}
+  .stat span{font-size:7.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--ink3)}
+  .banner{background:var(--Asoft); border:1px solid var(--hair); border-radius:8px; padding:6px 9px; font-size:9.5px;
+          display:flex; align-items:center; gap:6px; margin-bottom:10px}
+  .banner .spark{color:var(--Aink)}
+  .banner button{margin-left:auto; background:var(--ink); color:#fff; border:0; font-size:8.5px; padding:3px 8px;
+                 border-radius:99px; font-weight:500; font-family:inherit}
+  .group{font-size:8px; letter-spacing:.1em; text-transform:uppercase; color:var(--ink3); margin:8px 0 4px}
+  .lrow{display:flex; align-items:center; gap:8px; padding:6px 2px; border-bottom:1px solid var(--hair); font-size:10.5px}
+  .lrow:last-child{border-bottom:0}
+  .lrow .ic{width:18px;height:18px;border-radius:5px;background:var(--well);color:#fff;display:flex;align-items:center;justify-content:center;font-size:8px;font-family:'JetBrains Mono',monospace}
+  .lrow .t b{display:block; font-weight:500; font-size:10.5px}
+  .lrow .t span{font-size:8.5px; color:var(--ink3)}
+  .lrow .time{margin-left:auto; font-size:8.5px; color:var(--ink3)}
+  .lrow .mem{color:var(--Aink); font-size:8.5px; font-weight:500}
+  .live{border:1px solid var(--hair); border-radius:8px; overflow:hidden; margin-bottom:10px}
+  .live .term{background:var(--well); color:#9BE29B; font-family:'JetBrains Mono',monospace; font-size:8.5px; padding:7px 9px}
+  .live .term .p{color:#7F8B99}
+  .live .bar{display:flex; align-items:center; gap:5px; font-size:8.5px; padding:5px 9px; background:var(--card)}
+  .pulse{width:6px;height:6px;border-radius:99px;background:var(--A); animation:pu 1.6s ease infinite}
+  @keyframes pu{0%,100%{opacity:1}50%{opacity:.35}}
+  .live .bar .open{margin-left:auto; color:var(--Aink); font-weight:500}
+  .askbar{margin-top:12px; background:var(--card); border:1px solid var(--hair2); border-radius:99px; padding:6px 10px;
+          display:flex; align-items:center; gap:6px; font-size:9.5px; color:var(--ink3); box-shadow:0 2px 8px rgba(27,26,23,.06)}
+  .askbar .mic{margin-left:auto; width:16px;height:16px;border-radius:99px;background:var(--A)}
+  .cap{font-size:12px; font-weight:600; margin:14px 0 4px}
+  .cap small{display:block; font-weight:400; color:var(--ink2); font-size:11px; margin-top:2px}
+
+  /* dark mockup */
+  .dark{--frame:#131311; --sheet:#1E1D1A; --sidebar:#191816; --card:#262522;
+        --ink:#E9E7E1; --ink2:#A5A29A; --ink3:#7A7871;
+        --hair:rgba(255,255,255,.08); --hair2:rgba(255,255,255,.16)}
+  .dark .lrow .ic{background:#0E0F12}
+  .dark .live .term{background:#0E0F12}
+
+  /* swatches */
+  .sw{display:flex; gap:10px; flex-wrap:wrap; margin:10px 0 4px}
+  .chip{width:130px; border-radius:10px; overflow:hidden; border:1px solid var(--hair); background:#fff}
+  .chip .c{height:56px}
+  .chip .l{padding:6px 8px; font-size:10px}
+  .chip .l b{display:block; font-size:10.5px}
+  .chip .l span{color:var(--ink2); font-family:'JetBrains Mono',monospace; font-size:9px}
+  kbd{font-family:'JetBrains Mono',monospace; font-size:10px; border:1px solid var(--hair2); border-bottom-width:2px;
+      border-radius:5px; padding:1px 5px; background:#fff}
+</style>
+</head>
+<body>
+
+<h1>Grafiki — <em>color</em> directions</h1>
+<p class="sub">Same mini-Home mockup, three accents. The neutrals (warm paper + charcoal well) are constant — the argument is only about the accent.</p>
+
+<div class="row">
+
+  <!-- A. EMBER -->
+  <div>
+    <div class="mock" style="--A:#E8652B; --Asoft:#FBEDE4; --Aink:#B44A0D">
+      <div class="mock-inner">
+        <div class="rail">
+          <div class="brand"><span class="dot"></span>Grafiki</div>
+          <a class="active">⌂ Home</a><a>▣ Sessions</a><a>✳ Memory</a>
+          <a>☑ Review <span class="badge">3</span></a><a>⚙ Settings</a>
+        </div>
+        <div class="sheet">
+          <div class="title">Today</div>
+          <div class="meta">~/Project/Grafiki · memory online</div>
+          <div class="stat-strip">
+            <div class="stat"><b>4</b><span>sessions</span></div>
+            <div class="stat"><b>11</b><span>memories</span></div>
+            <div class="stat"><b>3</b><span>pending</span></div>
+          </div>
+          <div class="live">
+            <div class="term"><span class="p">~/Grafiki %</span> claude<br>✳ Refactoring terminal.rs…</div>
+            <div class="bar"><span class="pulse"></span> claude · capturing · 24 min <span class="open">Open →</span></div>
+          </div>
+          <div class="banner"><span class="spark">✦</span> 3 new memories from your last session <button>Review</button></div>
+          <div class="group">Yesterday</div>
+          <div class="lrow"><div class="ic">C</div><div class="t"><b>claude · terminal resume</b><span>58 min</span></div><span class="mem">4 memories</span><span class="time">7:12 PM</span></div>
+          <div class="lrow"><div class="ic">%</div><div class="t"><b>shell · release build</b><span>12 min</span></div><span class="mem">1 memory</span><span class="time">2:40 PM</span></div>
+          <div class="askbar">✳ Ask your memory… <span class="mic"></span></div>
+        </div>
+      </div>
+    </div>
+    <p class="cap">A · Ember <small>Refined version of Grafiki's current orange. Warm, energetic, "recording".</small></p>
+  </div>
+
+  <!-- B. MOSS -->
+  <div>
+    <div class="mock" style="--A:#8A9A3B; --Asoft:#F1F2E2; --Aink:#5F6E1E">
+      <div class="mock-inner">
+        <div class="rail">
+          <div class="brand"><span class="dot"></span>Grafiki</div>
+          <a class="active">⌂ Home</a><a>▣ Sessions</a><a>✳ Memory</a>
+          <a>☑ Review <span class="badge">3</span></a><a>⚙ Settings</a>
+        </div>
+        <div class="sheet">
+          <div class="title">Today</div>
+          <div class="meta">~/Project/Grafiki · memory online</div>
+          <div class="stat-strip">
+            <div class="stat"><b>4</b><span>sessions</span></div>
+            <div class="stat"><b>11</b><span>memories</span></div>
+            <div class="stat"><b>3</b><span>pending</span></div>
+          </div>
+          <div class="live">
+            <div class="term"><span class="p">~/Grafiki %</span> claude<br>✳ Refactoring terminal.rs…</div>
+            <div class="bar"><span class="pulse"></span> claude · capturing · 24 min <span class="open">Open →</span></div>
+          </div>
+          <div class="banner"><span class="spark">✦</span> 3 new memories from your last session <button>Review</button></div>
+          <div class="group">Yesterday</div>
+          <div class="lrow"><div class="ic">C</div><div class="t"><b>claude · terminal resume</b><span>58 min</span></div><span class="mem">4 memories</span><span class="time">7:12 PM</span></div>
+          <div class="lrow"><div class="ic">%</div><div class="t"><b>shell · release build</b><span>12 min</span></div><span class="mem">1 memory</span><span class="time">2:40 PM</span></div>
+          <div class="askbar">✳ Ask your memory… <span class="mic"></span></div>
+        </div>
+      </div>
+    </div>
+    <p class="cap">B · Moss <small>Granola's olive-chartreuse family. Calm, organic, "notes that grew on their own".</small></p>
+  </div>
+
+  <!-- C. INKWELL -->
+  <div>
+    <div class="mock" style="--A:#1B1A17; --Asoft:#EFEEEA; --Aink:#1B1A17">
+      <div class="mock-inner">
+        <div class="rail">
+          <div class="brand"><span class="dot" style="background:#E8652B"></span>Grafiki</div>
+          <a class="active">⌂ Home</a><a>▣ Sessions</a><a>✳ Memory</a>
+          <a>☑ Review <span class="badge">3</span></a><a>⚙ Settings</a>
+        </div>
+        <div class="sheet">
+          <div class="title">Today</div>
+          <div class="meta">~/Project/Grafiki · memory online</div>
+          <div class="stat-strip">
+            <div class="stat"><b>4</b><span>sessions</span></div>
+            <div class="stat"><b>11</b><span>memories</span></div>
+            <div class="stat"><b>3</b><span>pending</span></div>
+          </div>
+          <div class="live">
+            <div class="term"><span class="p">~/Grafiki %</span> claude<br>✳ Refactoring terminal.rs…</div>
+            <div class="bar"><span class="pulse" style="background:#E8652B"></span> claude · capturing · 24 min <span class="open">Open →</span></div>
+          </div>
+          <div class="banner"><span class="spark">✦</span> 3 new memories from your last session <button>Review</button></div>
+          <div class="group">Yesterday</div>
+          <div class="lrow"><div class="ic">C</div><div class="t"><b>claude · terminal resume</b><span>58 min</span></div><span class="mem">4 memories</span><span class="time">7:12 PM</span></div>
+          <div class="lrow"><div class="ic">%</div><div class="t"><b>shell · release build</b><span>12 min</span></div><span class="mem">1 memory</span><span class="time">2:40 PM</span></div>
+          <div class="askbar">✳ Ask your memory… <span class="mic" style="background:#E8652B"></span></div>
+        </div>
+      </div>
+    </div>
+    <p class="cap">C · Inkwell <small>Nearly monochrome (Linear-est). Ink does everything; ember survives ONLY as the live-capture pulse.</small></p>
+  </div>
+
+  <!-- D. BLACK CHERRY (user's palette) -->
+  <div>
+    <div class="mock" style="--A:#5A0002; --Asoft:#F5E8E6; --Aink:#5A0002">
+      <div class="mock-inner">
+        <div class="rail">
+          <div class="brand"><span class="dot"></span>Grafiki</div>
+          <a class="active">⌂ Home</a><a>▣ Sessions</a><a>✳ Memory</a>
+          <a>☑ Review <span class="badge" style="background:#A8231D">3</span></a><a>⚙ Settings</a>
+        </div>
+        <div class="sheet">
+          <div class="title">Today</div>
+          <div class="meta">~/Project/Grafiki · memory online</div>
+          <div class="stat-strip">
+            <div class="stat"><b>4</b><span>sessions</span></div>
+            <div class="stat"><b>11</b><span>memories</span></div>
+            <div class="stat"><b>3</b><span>pending</span></div>
+          </div>
+          <div class="live">
+            <div class="term"><span class="p">~/Grafiki %</span> claude<br>✳ Refactoring terminal.rs…</div>
+            <div class="bar"><span class="pulse" style="background:#A8231D"></span> claude · capturing · 24 min <span class="open">Open →</span></div>
+          </div>
+          <div class="banner"><span class="spark">✦</span> 3 new memories from your last session <button style="background:#5A0002">Review</button></div>
+          <div class="group">Yesterday</div>
+          <div class="lrow"><div class="ic">C</div><div class="t"><b>claude · terminal resume</b><span>58 min</span></div><span class="mem">4 memories</span><span class="time">7:12 PM</span></div>
+          <div class="lrow"><div class="ic">%</div><div class="t"><b>shell · release build</b><span>12 min</span></div><span class="mem">1 memory</span><span class="time">2:40 PM</span></div>
+          <div class="askbar">✳ Ask your memory… <span class="mic" style="background:#A8231D"></span></div>
+        </div>
+      </div>
+    </div>
+    <p class="cap">D · Black Cherry <small>Your palette: parchment neutrals + #5A0002 as the structural accent (buttons, nav, links) + a brighter in-family cherry #A8231D doing the LIVE work (pulse, badge). Terminal well stays neutral charcoal for ANSI legibility.</small></p>
+  </div>
+
+  <!-- E. CHERRY DUOTONE (user's idea: mahogany rail stays dark in LIGHT mode) -->
+  <div>
+    <div class="mock" style="--A:#5A0002; --Asoft:#F5E8E6; --Aink:#5A0002; --frame:#230007; --sidebar:#230007">
+      <div class="mock-inner">
+        <div class="rail" style="--ink:#F2E9E4; --ink2:#C9AFA6">
+          <div class="brand" style="color:#F2E9E4"><span class="dot" style="background:#C24A3F"></span>Grafiki</div>
+          <a class="active" style="background:rgba(255,255,255,.10); color:#F2E9E4">⌂ Home</a>
+          <a style="color:#C9AFA6">▣ Sessions</a><a style="color:#C9AFA6">✳ Memory</a>
+          <a style="color:#C9AFA6">☑ Review <span class="badge" style="background:#C24A3F">3</span></a>
+          <a style="color:#C9AFA6">⚙ Settings</a>
+        </div>
+        <div class="sheet">
+          <div class="title">Today</div>
+          <div class="meta">~/Project/Grafiki · memory online</div>
+          <div class="stat-strip">
+            <div class="stat"><b>4</b><span>sessions</span></div>
+            <div class="stat"><b>11</b><span>memories</span></div>
+            <div class="stat"><b>3</b><span>pending</span></div>
+          </div>
+          <div class="live">
+            <div class="term"><span class="p">~/Grafiki %</span> claude<br>✳ Refactoring terminal.rs…</div>
+            <div class="bar"><span class="pulse" style="background:#A8231D"></span> claude · capturing · 24 min <span class="open">Open →</span></div>
+          </div>
+          <div class="banner"><span class="spark">✦</span> 3 new memories from your last session <button style="background:#5A0002">Review</button></div>
+          <div class="group">Yesterday</div>
+          <div class="lrow"><div class="ic">C</div><div class="t"><b>claude · terminal resume</b><span>58 min</span></div><span class="mem">4 memories</span><span class="time">7:12 PM</span></div>
+          <div class="lrow"><div class="ic">%</div><div class="t"><b>shell · release build</b><span>12 min</span></div><span class="mem">1 memory</span><span class="time">2:40 PM</span></div>
+          <div class="askbar">✳ Ask your memory… <span class="mic" style="background:#A8231D"></span></div>
+        </div>
+      </div>
+    </div>
+    <p class="cap">E · Cherry Duotone <small>Your idea: mahogany rail/frame stays dark even in light mode — parchment lives only inside the sheet. The rail is the brand anchor in BOTH themes (Slack-aubergine pattern); rail text goes warm parchment, active item = soft white wash.</small></p>
+  </div>
+
+  <!-- F. SNOWY RAINFOREST (user's palette #2) -->
+  <div>
+    <div class="mock" style="--A:#0B4A32; --Asoft:#E7F0EA; --Aink:#0B4A32; --frame:#032113; --sidebar:#032113; --sheet:#FAFAFA; --card:#FFFFFF">
+      <div class="mock-inner">
+        <div class="rail" style="--ink:#EAF2EC; --ink2:#AFC4B5">
+          <div class="brand" style="color:#EAF2EC"><span class="dot" style="background:#2E9E6B"></span>Grafiki</div>
+          <a class="active" style="background:rgba(255,255,255,.10); color:#EAF2EC">⌂ Home</a>
+          <a style="color:#AFC4B5">▣ Sessions</a><a style="color:#AFC4B5">✳ Memory</a>
+          <a style="color:#AFC4B5">☑ Review <span class="badge" style="background:#2E9E6B">3</span></a>
+          <a style="color:#AFC4B5">⚙ Settings</a>
+        </div>
+        <div class="sheet">
+          <div class="title">Today</div>
+          <div class="meta">~/Project/Grafiki · memory online</div>
+          <div class="stat-strip">
+            <div class="stat"><b>4</b><span>sessions</span></div>
+            <div class="stat"><b>11</b><span>memories</span></div>
+            <div class="stat"><b>3</b><span>pending</span></div>
+          </div>
+          <div class="live">
+            <div class="term"><span class="p">~/Grafiki %</span> claude<br>✳ Refactoring terminal.rs…</div>
+            <div class="bar"><span class="pulse" style="background:#2E9E6B"></span> claude · capturing · 24 min <span class="open">Open →</span></div>
+          </div>
+          <div class="banner" style="background:#E7F0EA"><span class="spark">✦</span> 3 new memories from your last session <button style="background:#0B4A32">Review</button></div>
+          <div class="group">Yesterday</div>
+          <div class="lrow"><div class="ic">C</div><div class="t"><b>claude · terminal resume</b><span>58 min</span></div><span class="mem">4 memories</span><span class="time">7:12 PM</span></div>
+          <div class="lrow"><div class="ic">%</div><div class="t"><b>shell · release build</b><span>12 min</span></div><span class="mem">1 memory</span><span class="time">2:40 PM</span></div>
+          <div class="askbar">✳ Ask your memory… <span class="mic" style="background:#2E9E6B"></span></div>
+        </div>
+      </div>
+    </div>
+    <p class="cap">F · Snowy Rainforest <small>Your palette #2: Evergreen #032113 rail (both themes) + Bright Snow #FAFAFA sheet. Structure accent = deep pine #0B4A32 (buttons, links); live accent = fresh green #2E9E6B (pulse, badge). Kills the danger-red collision entirely.</small></p>
+  </div>
+</div>
+
+<h2>D in dark — Rich Mahogany as the frame</h2>
+<p class="note">#230007 works best as the dark theme's FRAME (the library wall), with warm charcoal sheets on it — not as the terminal background.</p>
+<div class="row">
+  <div class="mock dark" style="--A:#C24A3F; --Asoft:#3A1512; --Aink:#E08A7E; --frame:#230007; --sheet:#221E1B; --sidebar:#2A0B08; --card:#2B2622">
+    <div class="mock-inner">
+      <div class="rail">
+        <div class="brand"><span class="dot" style="background:#C24A3F"></span>Grafiki</div>
+        <a class="active">⌂ Home</a><a>▣ Sessions</a><a>✳ Memory</a>
+        <a>☑ Review <span class="badge" style="background:#C24A3F">3</span></a><a>⚙ Settings</a>
+      </div>
+      <div class="sheet">
+        <div class="title">Today</div>
+        <div class="meta">~/Project/Grafiki · memory online</div>
+        <div class="stat-strip">
+          <div class="stat"><b>4</b><span>sessions</span></div>
+          <div class="stat"><b>11</b><span>memories</span></div>
+          <div class="stat"><b>3</b><span>pending</span></div>
+        </div>
+        <div class="live">
+          <div class="term"><span class="p">~/Grafiki %</span> claude<br>✳ Refactoring terminal.rs…</div>
+          <div class="bar"><span class="pulse" style="background:#C24A3F"></span> claude · capturing · 24 min <span class="open">Open →</span></div>
+        </div>
+        <div class="banner"><span class="spark">✦</span> 3 new memories from your last session <button style="background:#E9E7E1;color:#1B1A17">Review</button></div>
+        <div class="group">Yesterday</div>
+        <div class="lrow"><div class="ic">C</div><div class="t"><b>claude · terminal resume</b><span>58 min</span></div><span class="mem">4 memories</span><span class="time">7:12 PM</span></div>
+        <div class="lrow"><div class="ic">%</div><div class="t"><b>shell · release build</b><span>12 min</span></div><span class="mem">1 memory</span><span class="time">2:40 PM</span></div>
+        <div class="askbar">✳ Ask your memory… <span class="mic" style="background:#C24A3F"></span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h2>Dark theme (later) — same bones, Granola charcoal</h2>
+<p class="note">Whichever accent wins carries over. Shown with Ember.</p>
+<div class="row">
+  <div class="mock dark" style="--A:#F0763C; --Asoft:#33261E; --Aink:#F0975F">
+    <div class="mock-inner">
+      <div class="rail">
+        <div class="brand"><span class="dot"></span>Grafiki</div>
+        <a class="active">⌂ Home</a><a>▣ Sessions</a><a>✳ Memory</a>
+        <a>☑ Review <span class="badge">3</span></a><a>⚙ Settings</a>
+      </div>
+      <div class="sheet">
+        <div class="title">Today</div>
+        <div class="meta">~/Project/Grafiki · memory online</div>
+        <div class="stat-strip">
+          <div class="stat"><b>4</b><span>sessions</span></div>
+          <div class="stat"><b>11</b><span>memories</span></div>
+          <div class="stat"><b>3</b><span>pending</span></div>
+        </div>
+        <div class="live">
+          <div class="term"><span class="p">~/Grafiki %</span> claude<br>✳ Refactoring terminal.rs…</div>
+          <div class="bar"><span class="pulse"></span> claude · capturing · 24 min <span class="open">Open →</span></div>
+        </div>
+        <div class="banner"><span class="spark">✦</span> 3 new memories from your last session <button style="background:#E9E7E1;color:#1B1A17">Review</button></div>
+        <div class="group">Yesterday</div>
+        <div class="lrow"><div class="ic">C</div><div class="t"><b>claude · terminal resume</b><span>58 min</span></div><span class="mem">4 memories</span><span class="time">7:12 PM</span></div>
+        <div class="lrow"><div class="ic">%</div><div class="t"><b>shell · release build</b><span>12 min</span></div><span class="mem">1 memory</span><span class="time">2:40 PM</span></div>
+        <div class="askbar">✳ Ask your memory… <span class="mic"></span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h2>The constant neutrals</h2>
+<p class="note">These don't change per direction — warm paper (Wispr), charcoal wells (your terminal), muted semantics (Linear). Hairlines instead of shadows.</p>
+<div class="sw">
+  <div class="chip"><div class="c" style="background:#ECEBE8"></div><div class="l"><b>frame</b><span>#ECEBE8</span></div></div>
+  <div class="chip"><div class="c" style="background:#FBFAF8"></div><div class="l"><b>sheet</b><span>#FBFAF8</span></div></div>
+  <div class="chip"><div class="c" style="background:#F4F3F0"></div><div class="l"><b>sidebar</b><span>#F4F3F0</span></div></div>
+  <div class="chip"><div class="c" style="background:#16181C"></div><div class="l"><b>well (terminal)</b><span>#16181C</span></div></div>
+  <div class="chip"><div class="c" style="background:#1B1A17"></div><div class="l"><b>ink</b><span>#1B1A17</span></div></div>
+  <div class="chip"><div class="c" style="background:#6E6C66"></div><div class="l"><b>ink-2</b><span>#6E6C66</span></div></div>
+  <div class="chip"><div class="c" style="background:#A3A199"></div><div class="l"><b>ink-3</b><span>#A3A199</span></div></div>
+</div>
+<div class="sw">
+  <div class="chip"><div class="c" style="background:#3D9A63"></div><div class="l"><b>ok</b><span>#3D9A63</span></div></div>
+  <div class="chip"><div class="c" style="background:#C7912B"></div><div class="l"><b>warn</b><span>#C7912B</span></div></div>
+  <div class="chip"><div class="c" style="background:#C4483C"></div><div class="l"><b>danger</b><span>#C4483C</span></div></div>
+</div>
+
+<h2>Usage rules (whichever direction wins)</h2>
+<p class="note">
+1 · Accent appears at most three times per screen: active nav, one primary action, one live status.<br>
+2 · Buttons are INK (dark pill) by default — accent is reserved for the single most important action, Wispr-style.<br>
+3 · The capture pulse is always accent: it is the brand moment (like Wispr's <kbd>fn</kbd> keycap).<br>
+4 · Semantic colors only ever appear as small chips/dots, never as backgrounds.<br>
+5 · Text on paper is never pure black; text on wells is never pure white.
+</p>
+
+</body>
+</html>
