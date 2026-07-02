@@ -32,6 +32,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -224,6 +225,17 @@ export default function App() {
     setSelectedResult(null);
     setRecordDetail(null);
   }, [projectRoot]);
+
+  useEffect(() => {
+    // Tray menu deep-links (e.g. "Review: n pending" in the menubar).
+    const unlisten = listen<string>("grafiki://navigate", (event) => {
+      switchPrimaryPane(event.payload as PaneKind);
+    });
+    return () => {
+      void unlisten.then((dispose) => dispose());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const onPaletteKey = (event: KeyboardEvent) => {
