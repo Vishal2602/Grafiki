@@ -102,6 +102,70 @@ fn load_descriptor(id: &str) -> Option<SessionDescriptor> {
     load_descriptors(&path).remove(id)
 }
 
+/// A live (not exited) hosted session, summarized for the Home ledger.
+#[derive(serde::Serialize, Clone)]
+pub struct LiveTerminalInfo {
+    pub id: String,
+    pub launch: String,
+    pub cwd: String,
+    /// Last few non-empty output lines, ANSI-stripped (the Home card preview).
+    pub tail: String,
+    pub capturing: bool,
+}
+
+/// Snapshot every live session (for Home's live-session card).
+pub fn live_sessions(registry: &TerminalRegistry) -> Vec<LiveTerminalInfo> {
+    let sessions = registry.0.lock().unwrap();
+    sessions
+        .iter()
+        .filter_map(|(id, session)| {
+            let state = session.shared.lock().unwrap();
+            if state.exited {
+                return None;
+            }
+            let scrollback = &state.scrollback;
+            let start = scrollback.len().saturating_sub(600);
+            let text = strip_ansi(&scrollback[start..]);
+            let mut lines: Vec<&str> = text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            let keep = lines.split_off(lines.len().saturating_sub(3));
+            Some(LiveTerminalInfo {
+                id: id.clone(),
+                launch: session.launch.clone(),
+                cwd: session.project_root.clone(),
+                tail: keep.join("\n"),
+                capturing: session.capture_id.is_some(),
+            })
+        })
+        .collect()
+}
+
+/// The most recently updated on-disk session descriptor — what "Resume last
+/// session" on Home points at after an app relaunch.
+#[derive(serde::Serialize, Clone)]
+pub struct ResumableInfo {
+    pub id: String,
+    pub launch: String,
+    pub cwd: String,
+    pub updated_at: u64,
+}
+
+pub fn latest_resumable() -> Option<ResumableInfo> {
+    let path = descriptor_path()?;
+    let _guard = DESCRIPTOR_LOCK.lock().unwrap();
+    load_descriptors(&path)
+        .into_values()
+        .max_by_key(|descriptor| descriptor.updated_at)
+        .map(|descriptor| ResumableInfo {
+            id: descriptor.id,
+            launch: descriptor.launch,
+            cwd: descriptor.cwd,
+            updated_at: descriptor.updated_at,
+        })
+}
+
 /// Refresh a session's persisted tail from its current scrollback.
 fn persist_tail(id: &str, cwd: &str, launch: &str, shared: &Arc<Mutex<TermShared>>) {
     let tail = {

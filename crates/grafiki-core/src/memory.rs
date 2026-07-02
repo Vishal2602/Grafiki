@@ -4502,6 +4502,130 @@ pub fn list_capture_events(options: ListCaptureEventsOptions) -> Result<Vec<Capt
     Ok(events)
 }
 
+/// Options for [`capture_ledger`] — the Home-screen session ledger.
+pub struct CaptureLedgerOptions {
+    pub project_name: Option<String>,
+    pub start_dir: PathBuf,
+    pub grafiki_home: Option<PathBuf>,
+    pub limit: usize,
+}
+
+/// One session row in the Home ledger: when it ran, which agent, how much was
+/// captured, and how many memories came out of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerSessionItem {
+    pub id: String,
+    pub source_app: Option<String>,
+    pub status: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub event_count: i64,
+    /// Distinct candidates whose evidence points into this session.
+    pub memory_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureLedgerReport {
+    pub sessions: Vec<LedgerSessionItem>,
+    pub pending_candidates: i64,
+    /// Titles of the newest pending candidates (for the review strip).
+    pub pending_titles: Vec<String>,
+    pub sessions_week: i64,
+    pub memories_week: i64,
+}
+
+/// The session ledger that Home renders: recent NON-EMPTY capture sessions with
+/// their extraction yield, plus review-queue and this-week counters. Read-only.
+pub fn capture_ledger(options: CaptureLedgerOptions) -> Result<CaptureLedgerReport> {
+    let (project, connection) = resolve_and_open(
+        options.project_name,
+        options.start_dir,
+        options.grafiki_home,
+    )?;
+    let limit = options.limit.clamp(1, 200) as i64;
+
+    let mut statement = connection.prepare(
+        "
+        SELECT cs.id, cs.source_app, cs.status, cs.started_at, cs.ended_at,
+               COUNT(ce.id) AS event_count,
+               (
+                   SELECT COUNT(DISTINCT el.candidate_id)
+                   FROM evidence_links el
+                   JOIN capture_events linked ON linked.id = el.source_event_id
+                   WHERE linked.capture_session = cs.id
+               ) AS memory_count
+        FROM capture_sessions cs
+        JOIN capture_events ce ON ce.capture_session = cs.id
+        WHERE cs.project = ?1
+        GROUP BY cs.id
+        ORDER BY cs.started_at DESC
+        LIMIT ?2
+        ",
+    )?;
+    let sessions = collect_rows(statement.query_map(params![project.project, limit], |row| {
+        Ok(LedgerSessionItem {
+            id: row.get(0)?,
+            source_app: row.get(1)?,
+            status: row.get(2)?,
+            started_at: row.get(3)?,
+            ended_at: row.get(4)?,
+            event_count: row.get(5)?,
+            memory_count: row.get(6)?,
+        })
+    })?)?;
+
+    let pending_candidates: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM extraction_candidates WHERE status = 'pending'",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut titles_statement = connection.prepare(
+        "
+        SELECT COALESCE(json_extract(payload, '$.title'), '')
+        FROM extraction_candidates
+        WHERE status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT 3
+        ",
+    )?;
+    let pending_titles: Vec<String> =
+        collect_rows(titles_statement.query_map([], |row| row.get::<_, String>(0))?)?
+            .into_iter()
+            .filter(|title| !title.trim().is_empty())
+            .collect();
+
+    // Timestamps are stored as '%Y-%m-%dT%H:%M:%SZ' strings, so the comparison
+    // bound must be rendered in the SAME format (plain datetime() uses a space).
+    let sessions_week: i64 = connection.query_row(
+        "
+        SELECT COUNT(DISTINCT cs.id)
+        FROM capture_sessions cs
+        JOIN capture_events ce ON ce.capture_session = cs.id
+        WHERE cs.project = ?1
+          AND cs.started_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-7 days')
+        ",
+        params![project.project],
+        |row| row.get(0),
+    )?;
+    let memories_week: i64 = connection.query_row(
+        "
+        SELECT COUNT(*)
+        FROM extraction_candidates
+        WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-7 days')
+        ",
+        [],
+        |row| row.get(0),
+    )?;
+
+    Ok(CaptureLedgerReport {
+        sessions,
+        pending_candidates,
+        pending_titles,
+        sessions_week,
+        memories_week,
+    })
+}
+
 pub fn get_capture_status(options: CaptureStatusOptions) -> Result<CaptureStatusReport> {
     let scope = Scope::new(options.scope)?;
     let scope_chain = scope.chain().into_vec();

@@ -14,6 +14,9 @@
     "tauri:build:release": "npm run prepare-sidecar:release && tauri build"
   },
   "dependencies": {
+    "@fontsource-variable/inter": "^5.2.8",
+    "@fontsource-variable/jetbrains-mono": "^5.2.8",
+    "@fontsource-variable/newsreader": "^5.2.10",
     "@tauri-apps/api": "2.11.0",
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@xterm/addon-fit": "^0.11.0",

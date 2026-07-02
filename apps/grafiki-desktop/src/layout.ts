@@ -1,15 +1,16 @@
 import type { LayoutState, PaneState } from "./types";
 
 export const defaultPanes: PaneState[] = [
-  { id: "terminal", kind: "terminal", title: "Terminal" },
+  { id: "home", kind: "home", title: "Home" },
 ];
 
 const STORAGE_KEY = "grafiki.desktop.layout";
-const LAYOUT_VERSION = 2;
+const LAYOUT_VERSION = 3;
 
 // Known pane kinds (must match PaneKind in types.ts). Used to reject panes from a
 // tampered/old URL hash before they reach the renderer.
 const PANE_KINDS: ReadonlySet<string> = new Set([
+  "home",
   "chat",
   "terminal",
   "candidates",
@@ -88,6 +89,8 @@ export function decodeLayout(value: string | null): LayoutState | null {
 export function titleForPane(pane: Pick<PaneState, "kind" | "recordId">) {
   if (pane.kind === "detail") return pane.recordId ? `Detail: ${pane.recordId}` : "Detail";
   if (pane.kind === "candidates") return "Review";
+  if (pane.kind === "chat") return "Memory";
+  if (pane.kind === "terminal") return "Session";
   const kind = pane.kind ?? "";
   if (!kind) return "Pane";
   return kind[0].toUpperCase() + kind.slice(1);

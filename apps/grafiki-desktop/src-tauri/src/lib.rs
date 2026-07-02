@@ -712,6 +712,41 @@ fn list_local_models() -> Vec<String> {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct HomeLedgerRequest {
+    start_dir: Option<String>,
+}
+
+/// Everything the Home screen needs in one call: the session ledger + review
+/// counters (project DB), live hosted sessions (PTY pool), and the newest
+/// resumable descriptor (disk).
+#[derive(Serialize)]
+struct HomeLedgerReport {
+    ledger: grafiki_core::CaptureLedgerReport,
+    live: Vec<terminal::LiveTerminalInfo>,
+    resumable: Option<terminal::ResumableInfo>,
+}
+
+#[tauri::command]
+fn get_home_ledger(
+    registry: State<terminal::TerminalRegistry>,
+    request: HomeLedgerRequest,
+) -> Result<HomeLedgerReport, String> {
+    let ledger = grafiki_core::capture_ledger(grafiki_core::CaptureLedgerOptions {
+        project_name: None,
+        start_dir: resolve_start_dir(request.start_dir),
+        grafiki_home: None,
+        limit: 60,
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(HomeLedgerReport {
+        ledger,
+        live: terminal::live_sessions(&registry),
+        resumable: terminal::latest_resumable(),
+    })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ExtractSessionRequest {
     start_dir: Option<String>,
     model: Option<String>,
@@ -2291,6 +2326,7 @@ pub fn run() {
             terminal::terminal_revive,
             extract_session_memory,
             list_local_models,
+            get_home_ledger,
             terminal::terminal_write,
             terminal::terminal_resize,
             terminal::terminal_close,

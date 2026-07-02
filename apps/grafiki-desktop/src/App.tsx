@@ -14,6 +14,7 @@ import {
   FileText,
   FolderOpen,
   History,
+  Home as HomeIcon,
   LayoutDashboard,
   MessageSquare,
   Network,
@@ -42,6 +43,7 @@ import {
   editCandidate,
   exportMemoryToFile,
   extractSessionMemory,
+  getHomeLedger,
   listLocalModels,
   getCaptureConfig,
   getDaemonStatus,
@@ -60,6 +62,7 @@ import {
   isPreviewMode,
   confirmDialog,
 } from "./api";
+import type { HomeLedgerReport } from "./api";
 import { useModalDialog } from "./useModalDialog";
 import {
   decodeLayoutFromHash,
@@ -89,8 +92,9 @@ const PROJECT_ROOT_KEY = "grafiki.desktop.projectRoot";
 // `detail` is reachable too (opened from a chat citation or an approved memory),
 // it's just not a sidebar destination.
 const navItems: Array<{ kind: PaneKind; label: string; icon: typeof LayoutDashboard }> = [
-  { kind: "terminal", label: "Terminal", icon: TerminalSquare },
-  { kind: "chat", label: "Chat", icon: MessageSquare },
+  { kind: "home", label: "Home", icon: HomeIcon },
+  { kind: "terminal", label: "Sessions", icon: TerminalSquare },
+  { kind: "chat", label: "Memory", icon: MessageSquare },
   { kind: "candidates", label: "Review", icon: ShieldQuestion },
   { kind: "settings", label: "Settings", icon: Settings },
 ];
@@ -181,6 +185,27 @@ export default function App() {
   useEffect(() => {
     persistLayout(layout);
   }, [layout]);
+
+  const [homeLedger, setHomeLedger] = useState<HomeLedgerReport | null>(null);
+  const refreshLedger = () => {
+    getHomeLedger({ startDir: projectRoot })
+      .then(setHomeLedger)
+      .catch(() => setHomeLedger(null));
+  };
+  useEffect(() => {
+    refreshLedger();
+    // Keep the ledger (and the Review badge) fresh while the app sits open.
+    const timer = window.setInterval(refreshLedger, 60_000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectRoot]);
+  useEffect(() => {
+    // Coming back to Home or Review should always show current numbers.
+    if (activePane?.kind === "home" || activePane?.kind === "candidates") {
+      refreshLedger();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layout.activePaneId]);
 
   useEffect(() => {
     if (projectRoot.trim()) localStorage.setItem(PROJECT_ROOT_KEY, projectRoot);
@@ -361,7 +386,8 @@ export default function App() {
         </div>
       ) : null}
       <Rail
-        activeKind={activePane?.kind ?? "terminal"}
+        activeKind={activePane?.kind ?? "home"}
+        pendingCount={homeLedger?.ledger.pending_candidates ?? 0}
         onOpen={(kind) => switchPrimaryPane(kind)}
         reduceMotion={reduceMotion}
       />
@@ -398,6 +424,9 @@ export default function App() {
                 onProjectRootChange={setProjectRoot}
                 onInitializeProject={initializeCurrentProject}
                 onMemoryChanged={refreshSnapshot}
+                ledger={homeLedger}
+                onRefreshLedger={refreshLedger}
+                onNavigate={switchPrimaryPane}
               />
             ))}
           </AnimatePresence>
@@ -426,6 +455,7 @@ export default function App() {
 
 function Rail(props: {
   activeKind: PaneKind;
+  pendingCount: number;
   onOpen: (kind: PaneKind) => void;
   reduceMotion: boolean;
 }) {
@@ -434,7 +464,7 @@ function Rail(props: {
       <motion.button
         className="brand"
         aria-label="Grafiki home"
-        onClick={() => props.onOpen("terminal")}
+        onClick={() => props.onOpen("home")}
         {...pressMotion(props.reduceMotion)}
       >
         <span className="brand-mark">G</span>
@@ -453,8 +483,11 @@ function Rail(props: {
               title={item.label}
               {...pressMotion(props.reduceMotion)}
             >
-              <Icon size={18} />
+              <Icon size={16} />
               <span>{item.label}</span>
+              {item.kind === "candidates" && props.pendingCount > 0 ? (
+                <span className="rail-badge">{props.pendingCount}</span>
+              ) : null}
             </motion.button>
           );
         })}
@@ -540,6 +573,9 @@ function MemoryPane(props: {
   onProjectRootChange: (path: string) => void;
   onInitializeProject: (path?: string) => Promise<void>;
   onMemoryChanged: () => Promise<ProjectSnapshot>;
+  ledger: HomeLedgerReport | null;
+  onRefreshLedger: () => void;
+  onNavigate: (kind: PaneKind, patch?: Partial<PaneState>) => void;
 }) {
   const pane = props.pane;
 
@@ -553,20 +589,35 @@ function MemoryPane(props: {
       exit={props.reduceMotion ? undefined : { opacity: 0, y: 8, scale: 0.992 }}
       transition={transition.pane}
     >
-      <header className="pane-header">
-        <div>
-          <span className="pane-kind">{pane.kind}</span>
-          <h2>{pane.title}</h2>
-        </div>
-        <div className="pane-actions">
-          <button onClick={props.onClose} title="Close pane">
-            <X size={15} />
-          </button>
-        </div>
-      </header>
+      {pane.kind !== "home" ? (
+        <header className="pane-header">
+          <div>
+            <span className="pane-kind">{pane.kind === "candidates" ? "review" : pane.kind}</span>
+            <h2>{pane.title}</h2>
+          </div>
+          <div className="pane-actions">
+            <button onClick={props.onClose} title="Close pane">
+              <X size={15} />
+            </button>
+          </div>
+        </header>
+      ) : null}
 
       <div className="pane-body">
-        {pane.kind === "terminal" ? <TerminalPane projectRoot={props.projectRoot} /> : null}
+        {pane.kind === "home" ? (
+          <HomePane
+            snapshot={props.snapshot}
+            projectRoot={props.projectRoot}
+            ledger={props.ledger}
+            onNavigate={props.onNavigate}
+          />
+        ) : null}
+        {pane.kind === "terminal" ? (
+          <TerminalPane
+            projectRoot={props.projectRoot}
+            fallbackCwd={props.snapshot?.start_dir ?? ""}
+          />
+        ) : null}
         {pane.kind === "chat" ? (
           <ChatPane
             pane={pane}
@@ -612,6 +663,213 @@ function MemoryPane(props: {
   );
 }
 
+/// "Today" / "Yesterday" / "Mon, Jun 29" — Granola-style day group labels.
+function ledgerDayLabel(iso: string): string {
+  const date = new Date(iso);
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  const sameDay = (a: Date, b: Date) =>
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate();
+  if (sameDay(date, today)) return "Today";
+  if (sameDay(date, yesterday)) return "Yesterday";
+  return date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+}
+
+function ledgerTimeLabel(iso: string): string {
+  return new Date(iso).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+}
+
+function agentGlyph(sourceApp: string | null | undefined): string {
+  const name = (sourceApp || "").toLowerCase();
+  if (name.includes("claude")) return "C";
+  if (name.includes("codex")) return "X";
+  if (name.includes("gemini")) return "G";
+  return "%";
+}
+
+function agentLabel(sourceApp: string | null | undefined): string {
+  const name = (sourceApp || "").toLowerCase();
+  if (name === "grafiki-terminal") return "session";
+  if (name.includes("claude")) return "claude";
+  if (name.includes("codex")) return "codex";
+  return sourceApp || "session";
+}
+
+function HomePane(props: {
+  snapshot: ProjectSnapshot | null;
+  projectRoot: string;
+  ledger: HomeLedgerReport | null;
+  onNavigate: (kind: PaneKind, patch?: Partial<PaneState>) => void;
+}) {
+  const [ask, setAsk] = useState("");
+  const ledger = props.ledger?.ledger;
+  const live = props.ledger?.live?.[0] ?? null;
+  const resumable = props.ledger?.resumable ?? null;
+  const sessions = ledger?.sessions ?? [];
+  const projectLabel =
+    props.projectRoot || props.snapshot?.start_dir || "no project folder set";
+
+  const submitAsk = () => {
+    const question = ask.trim();
+    if (!question) return;
+    props.onNavigate("chat", { query: question, title: `Memory: ${question}` });
+  };
+
+  const resume = () => {
+    if (!resumable) return;
+    // Point the terminal pane at the resumable session, then open it — the
+    // pane's attach-miss path revives from the on-disk descriptor.
+    localStorage.setItem(
+      terminalStorageKey(props.projectRoot),
+      JSON.stringify({ id: resumable.id, launch: resumable.launch }),
+    );
+    props.onNavigate("terminal");
+  };
+
+  // Grouped by day label, preserving the newest-first order.
+  const groups: Array<{ day: string; items: typeof sessions }> = [];
+  for (const session of sessions) {
+    const day = ledgerDayLabel(session.started_at);
+    const group = groups[groups.length - 1];
+    if (group && group.day === day) group.items.push(session);
+    else groups.push({ day, items: [session] });
+  }
+
+  return (
+    <>
+      <div className="home-view">
+        <h1 className="home-title">Today</h1>
+        <p className="home-meta">
+          {projectLabel}
+          {props.snapshot?.memory_available ? " · memory online" : " · initialize in Settings"}
+        </p>
+
+        <div className="stat-strip">
+          <div className="stat-card">
+            <b>{ledger?.sessions_week ?? "–"}</b>
+            <span>sessions this week</span>
+          </div>
+          <div className="stat-card">
+            <b>{ledger?.memories_week ?? "–"}</b>
+            <span>memories this week</span>
+          </div>
+          <div className="stat-card">
+            <b>{ledger?.pending_candidates ?? "–"}</b>
+            <span>waiting for review</span>
+          </div>
+        </div>
+
+        {live ? (
+          <div className="live-card">
+            <div className="term-preview">{live.tail || "…"}</div>
+            <div className="live-bar">
+              <span className="pulse-dot" />
+              {live.launch || "shell"} · {live.capturing ? "capturing" : "not capturing"} ·{" "}
+              {live.cwd}
+              <button
+                className="link-button open-link"
+                onClick={() => props.onNavigate("terminal")}
+              >
+                Open →
+              </button>
+            </div>
+          </div>
+        ) : resumable ? (
+          <div className="suggest-banner">
+            <span className="spark">↻</span>
+            Pick up where you left off — {resumable.launch || "shell"} in {resumable.cwd}
+            <span className="banner-action">
+              <button className="button primary" onClick={resume}>
+                Resume session
+              </button>
+            </span>
+          </div>
+        ) : null}
+
+        {(ledger?.pending_candidates ?? 0) > 0 ? (
+          <div className="suggest-banner">
+            <span className="spark">✦</span>
+            {ledger?.pending_candidates} new{" "}
+            {ledger?.pending_candidates === 1 ? "memory" : "memories"} from your sessions
+            {ledger?.pending_titles?.length ? ` — “${ledger.pending_titles[0]}”` : ""}
+            <span className="banner-action">
+              <button className="button primary" onClick={() => props.onNavigate("candidates")}>
+                Review
+              </button>
+            </span>
+          </div>
+        ) : null}
+
+        {sessions.length === 0 ? (
+          <div className="home-empty">
+            <h3>
+              Your agent forgets every session. Grafiki <em>remembers</em>.
+            </h3>
+            <p className="muted" style={{ maxWidth: 420 }}>
+              Start a session below — work normally, and everything worth keeping comes back
+              here as memory.
+            </p>
+            <div className="agent-buttons">
+              <button className="button primary" onClick={() => props.onNavigate("terminal")}>
+                Start a session
+              </button>
+            </div>
+          </div>
+        ) : (
+          groups.map((group) => (
+            <div key={group.day}>
+              <div className="ledger-day">{group.day}</div>
+              {group.items.map((session) => (
+                <div
+                  key={session.id}
+                  className="ledger-row"
+                  onClick={() => props.onNavigate("terminal")}
+                >
+                  <div className="ledger-icon">{agentGlyph(session.source_app)}</div>
+                  <div className="ledger-body">
+                    <b>
+                      {agentLabel(session.source_app)} ·{" "}
+                      {session.status === "active" ? "in progress" : "session"}
+                    </b>
+                    <span>{session.event_count} captured events</span>
+                  </div>
+                  {session.memory_count > 0 ? (
+                    <span className="ledger-mem">
+                      {session.memory_count} {session.memory_count === 1 ? "memory" : "memories"}
+                    </span>
+                  ) : null}
+                  <span className="ledger-time">{ledgerTimeLabel(session.started_at)}</span>
+                </div>
+              ))}
+            </div>
+          ))
+        )}
+      </div>
+
+      <div className="ask-bar-wrap">
+        <div className="search-box">
+          <Sparkles size={15} />
+          <input
+            value={ask}
+            onChange={(event) => setAsk(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                submitAsk();
+              }
+            }}
+            placeholder="Ask your memory…"
+          />
+          <button onClick={submitAsk}>Ask</button>
+        </div>
+      </div>
+    </>
+  );
+}
+
 type TerminalSessionRef = { id: string; launch: string };
 
 function terminalStorageKey(projectRoot: string) {
@@ -631,7 +889,7 @@ function loadTerminalSession(projectRoot: string): TerminalSessionRef | null {
   }
 }
 
-function TerminalPane(props: { projectRoot: string }) {
+function TerminalPane(props: { projectRoot: string; fallbackCwd: string }) {
   // The session id is STABLE and persisted per project: switching tabs detaches
   // the UI but the PTY (and the agent inside it) keeps running; coming back
   // reattaches and replays scrollback. Only "End session" kills the process.
@@ -708,7 +966,7 @@ function TerminalPane(props: { projectRoot: string }) {
           // Spawn the login shell (full PATH); the agent is typed in after.
           const opened = await invoke<{ id: string; capturing: boolean }>("terminal_open", {
             id,
-            cwd: props.projectRoot,
+            cwd: props.projectRoot || props.fallbackCwd,
             command: "",
             launch,
             rows: term.rows,
@@ -839,7 +1097,7 @@ function TerminalPane(props: { projectRoot: string }) {
         <div>
           <h2 style={{ margin: 0 }}>Start a session</h2>
           <p className="muted" style={{ marginTop: 6, maxWidth: 460 }}>
-            It runs inside Grafiki, in <code>{props.projectRoot || "this project"}</code>. Work
+            It runs inside Grafiki, in <code>{props.projectRoot || props.fallbackCwd || "this project"}</code>. Work
             normally — everything in this session is captured automatically, no setup.
           </p>
         </div>
@@ -859,7 +1117,7 @@ function TerminalPane(props: { projectRoot: string }) {
       <div className="toolbar-row" style={{ alignItems: "center", gap: 10 }}>
         <span className="muted" style={{ fontSize: 12 }}>
           {session.launch ? `Running: ${session.launch}` : "Shell"} ·{" "}
-          {props.projectRoot || "this project"}
+          {props.projectRoot || props.fallbackCwd || "this project"}
           {capturing === true ? " · capturing" : ""}
           {capturing === false ? " · not capturing — initialize this folder in Settings" : ""}
           {ended ? " · session ended" : ""}
@@ -895,6 +1153,17 @@ function ChatPane(props: {
   >([]);
   const [sending, setSending] = useState(false);
 
+  // A question routed in from Home's ask bar starts the conversation.
+  const askedInitial = useRef(false);
+  useEffect(() => {
+    const initial = props.pane.query?.trim();
+    if (initial && !askedInitial.current) {
+      askedInitial.current = true;
+      void ask(initial);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Offer the models the user actually HAS: keep the default only if it's
   // installed, otherwise switch to the first installed model. Never leave the
   // field pointing at a model that would silently fail.
@@ -920,8 +1189,8 @@ function ChatPane(props: {
     };
   }, []);
 
-  async function ask() {
-    const q = question.trim();
+  async function ask(preset?: string) {
+    const q = (preset ?? question).trim();
     if (!q || sending) return;
     setSending(true);
     setQuestion("");
@@ -1455,6 +1724,26 @@ function CandidatesPane(props: {
         loading={loading}
         onRefresh={load}
       />
+      <p className="subtle" style={{ display: "flex", gap: 10, alignItems: "center" }}>
+        <span>
+          <kbd>j</kbd>/<kbd>k</kbd> move
+        </span>
+        <span>
+          <kbd>a</kbd> approve
+        </span>
+        <span>
+          <kbd>r</kbd> reject
+        </span>
+        <span>
+          <kbd>e</kbd> edit
+        </span>
+        <span>
+          <kbd>v</kbd> evidence
+        </span>
+        <span>
+          <kbd>space</kbd> select
+        </span>
+      </p>
       <div className="toolbar-row candidate-toolbar">
         <label className="compact-select">
           <span>Status</span>

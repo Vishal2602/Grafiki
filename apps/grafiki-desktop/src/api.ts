@@ -169,6 +169,56 @@ export async function chatWithMemory(input: {
   });
 }
 
+export interface HomeLedgerReport {
+  ledger: {
+    sessions: Array<{
+      id: string;
+      source_app: string | null;
+      status: string;
+      started_at: string;
+      ended_at: string | null;
+      event_count: number;
+      memory_count: number;
+    }>;
+    pending_candidates: number;
+    pending_titles: string[];
+    sessions_week: number;
+    memories_week: number;
+  };
+  live: Array<{ id: string; launch: string; cwd: string; tail: string; capturing: boolean }>;
+  resumable: { id: string; launch: string; cwd: string; updated_at: number } | null;
+}
+
+/// Everything the Home ledger renders, in one call.
+export async function getHomeLedger(input: { startDir?: string }): Promise<HomeLedgerReport> {
+  if (!hasTauri()) {
+    return {
+      ledger: {
+        sessions: [
+          {
+            id: "mock-1",
+            source_app: "grafiki-terminal",
+            status: "stopped",
+            started_at: new Date(Date.now() - 3600e3).toISOString(),
+            ended_at: new Date().toISOString(),
+            event_count: 12,
+            memory_count: 3,
+          },
+        ],
+        pending_candidates: 2,
+        pending_titles: ["Pin CI timezone to UTC", "Thin LTO for release builds"],
+        sessions_week: 4,
+        memories_week: 11,
+      },
+      live: [],
+      resumable: null,
+    };
+  }
+  return invoke<HomeLedgerReport>("get_home_ledger", {
+    request: { startDir: input.startDir ?? "" },
+  });
+}
+
 /// Models the local Ollama server has pulled ([] when Ollama isn't running).
 export async function listLocalModels(): Promise<string[]> {
   if (!hasTauri()) {
