@@ -54,6 +54,43 @@
   --titlebar: 40px; /* traffic-light overlay clearance */
 }
 
+/* ------------------------------------------------- dark theme (Snowy night)
+   The evergreen rail/frame NEVER changes — only the sheet flips. */
+[data-theme="dark"] {
+  --sheet: #101915;
+  --card: #16221c;
+  --banner-tint: #12241b;
+  --ink: #e9efe9;
+  --ink-2: #a5b3a9;
+  --ink-3: #77857c;
+  --hairline: rgba(255, 255, 255, 0.08);
+  --hairline-2: rgba(255, 255, 255, 0.15);
+  --accent: #58b98a;
+  --accent-live: #3fcf8e;
+  --accent-soft: rgba(46, 158, 107, 0.14);
+  --accent-ink: #7fd3ac;
+  --danger-soft: rgba(196, 72, 60, 0.15);
+}
+[data-theme="dark"] .button.primary,
+[data-theme="dark"] .pane-body button.primary,
+[data-theme="dark"] .search-box button {
+  color: #04150c;
+}
+[data-theme="dark"] .button.primary:hover,
+[data-theme="dark"] .pane-body button.primary:hover {
+  background: #6cc79c;
+}
+[data-theme="dark"] .lens-inline-code {
+  background: rgba(255, 255, 255, 0.09);
+}
+[data-theme="dark"] .ledger-row:hover,
+[data-theme="dark"] .candidate-card:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+[data-theme="dark"] .suggest-banner .banner-action .button.primary {
+  color: #04150c;
+}
+
 /* Focus: accent ring, never the UA blue */
 :focus {
   outline: none;
@@ -1339,6 +1376,31 @@ textarea {
   background: var(--card);
   border: 1px solid var(--hairline);
   border-bottom-left-radius: 4px;
+}
+
+.lens-code {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  background: var(--well);
+  color: var(--ink-on-well);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 6px 0;
+  overflow-x: auto;
+  white-space: pre;
+}
+.lens-inline-code {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  background: rgba(27, 26, 23, 0.06);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.lens-expand {
+  display: block;
+  margin-top: 6px;
+  font-size: 11.5px;
 }
 
 /* ------------------------------------------------------ session side peek */

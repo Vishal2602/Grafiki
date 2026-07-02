@@ -95,6 +95,16 @@ import type {
 } from "./types";
 
 const PROJECT_ROOT_KEY = "grafiki.desktop.projectRoot";
+const THEME_KEY = "grafiki.theme";
+
+type ThemePref = "system" | "light" | "dark";
+
+function applyTheme(pref: ThemePref) {
+  const dark =
+    pref === "dark" ||
+    (pref === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+}
 
 // Ultra-minimal nav (Wispr/Granola feel): the whole app is this core loop.
 // `detail` is reachable too (opened from a chat citation or an approved memory),
@@ -225,6 +235,19 @@ export default function App() {
     setSelectedResult(null);
     setRecordDetail(null);
   }, [projectRoot]);
+
+  useEffect(() => {
+    const pref = (localStorage.getItem(THEME_KEY) as ThemePref) ?? "light";
+    applyTheme(pref);
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const onSystemChange = () => {
+      if (((localStorage.getItem(THEME_KEY) as ThemePref) ?? "light") === "system") {
+        applyTheme("system");
+      }
+    };
+    media.addEventListener("change", onSystemChange);
+    return () => media.removeEventListener("change", onSystemChange);
+  }, []);
 
   useEffect(() => {
     // Tray menu deep-links (e.g. "Review: n pending" in the menubar).
@@ -523,6 +546,17 @@ export default function App() {
                   ]
                 : []),
               {
+                id: "theme",
+                label: "Toggle dark mode",
+                run: () => {
+                  const current =
+                    (localStorage.getItem(THEME_KEY) as ThemePref) ?? "light";
+                  const next: ThemePref = current === "dark" ? "light" : "dark";
+                  localStorage.setItem(THEME_KEY, next);
+                  applyTheme(next);
+                },
+              },
+              {
                 id: "extract",
                 label: "Extract memories now",
                 hint: "runs the local model",
@@ -758,6 +792,51 @@ function MemoryPane(props: {
         ) : null}
       </div>
     </motion.article>
+  );
+}
+
+/// Minimal, dependency-free rendering for lens bubbles: fenced code blocks
+/// become <pre>, inline backticks become <code>. No HTML injection surface —
+/// everything stays React text nodes.
+function renderLensText(text: string) {
+  const segments = text.split(/```[a-zA-Z0-9_-]*\n?/);
+  return segments.map((segment, index) =>
+    index % 2 === 1 ? (
+      <pre key={index} className="lens-code">
+        {segment.replace(/\n?$/, "")}
+      </pre>
+    ) : (
+      <span key={index}>
+        {segment.split(/(`[^`\n]+`)/).map((piece, pieceIndex) =>
+          piece.startsWith("`") && piece.endsWith("`") ? (
+            <code key={pieceIndex} className="lens-inline-code">
+              {piece.slice(1, -1)}
+            </code>
+          ) : (
+            piece
+          ),
+        )}
+      </span>
+    ),
+  );
+}
+
+/// One conversation bubble. Long tool-output walls collapse to a preview with
+/// an expand control — the Granola calm rule applied to agent transcripts.
+function LensBubble(props: { role: string; text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const lines = props.text.split("\n");
+  const isWall = props.text.length > 600 || lines.length > 10;
+  const shown = expanded || !isWall ? props.text : lines.slice(0, 6).join("\n");
+  return (
+    <div className={`lens-bubble ${props.role === "user" ? "user" : "assistant"}`}>
+      {renderLensText(shown)}
+      {isWall ? (
+        <button className="link-button lens-expand" onClick={() => setExpanded(!expanded)}>
+          {expanded ? "Show less" : `Show all ${lines.length} lines`}
+        </button>
+      ) : null}
+    </div>
   );
 }
 
@@ -1419,6 +1498,7 @@ function TerminalPane(props: {
           });
           if (!cancelled) {
             setCapturing(opened.capturing);
+            window.setTimeout(resize, 350); // refit after the pane settles
             scheduleType(launch);
             scheduleHandoff();
           }
@@ -1465,6 +1545,7 @@ function TerminalPane(props: {
         // Reattached to a live session: sync the PTY to the new pane size and
         // finish the launch typing if a dev remount interrupted it.
         resize();
+        window.setTimeout(resize, 350); // second fit once layout has settled
         scheduleType(launch);
       } catch (connectError) {
         if (!cancelled) {
@@ -1621,12 +1702,7 @@ function TerminalPane(props: {
                 </p>
               ) : (
                 turns.map((turn, index) => (
-                  <div
-                    key={index}
-                    className={`lens-bubble ${turn.role === "user" ? "user" : "assistant"}`}
-                  >
-                    {turn.text}
-                  </div>
+                  <LensBubble key={index} role={turn.role} text={turn.text} />
                 ))
               )}
             </div>
@@ -2633,6 +2709,14 @@ function SettingsPane(props: {
   onProjectRootChange: (path: string) => void;
   onInitializeProject: (path?: string) => Promise<void>;
 }) {
+  const [themePref, setThemePref] = useState<ThemePref>(
+    () => (localStorage.getItem(THEME_KEY) as ThemePref) ?? "light",
+  );
+  const changeTheme = (pref: ThemePref) => {
+    setThemePref(pref);
+    localStorage.setItem(THEME_KEY, pref);
+    applyTheme(pref);
+  };
   const snapshot = props.snapshot;
   const embedding = snapshot?.embedding?.runtime;
   const [draftRoot, setDraftRoot] = useState(props.projectRoot || snapshot?.start_dir || "");
@@ -2858,6 +2942,22 @@ function SettingsPane(props: {
 
   return (
     <div className="view-stack">
+      <section className="settings-grid">
+        <div className="settings-editor">
+          <div className="setting-row">
+            <span>Appearance</span>
+            <select
+              value={themePref}
+              onChange={(event) => changeTheme(event.target.value as ThemePref)}
+            >
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+              <option value="system">System</option>
+            </select>
+          </div>
+        </div>
+      </section>
+
       <section className="settings-grid">
         <div className="settings-editor">
           <label>
