@@ -33,8 +33,11 @@ pub fn build_extraction_messages(transcript: &str) -> Vec<ChatMessage> {
          {\"kind\": \"decision\" or \"context\", \"title\": a short label, \"content\": one or two \
          sentences}. Use \"decision\" for a choice plus its reasoning; use \"context\" for a durable \
          note such as a convention, gotcha, constraint, or architecture fact. IGNORE chit-chat, \
-         transient steps, raw tool output, and anything not durable. If nothing durable is present, \
-         output []. Output ONLY the JSON array — no prose, no markdown, no code fences.";
+         transient steps, raw tool output, and anything not durable. IGNORE agent startup screens \
+         and UI boilerplate — trust/permission prompts, welcome banners, security notes, keyboard \
+         hints; a user answering a tool's own dialog is never engineering memory. If nothing \
+         durable is present, output []. Output ONLY the JSON array — no prose, no markdown, no \
+         code fences.";
     vec![
         ChatMessage {
             role: "system".to_owned(),
@@ -90,6 +93,57 @@ pub fn parse_extracted_memories(response: &str) -> Vec<ExtractedMemory> {
             })
         })
         .collect()
+}
+
+/// Lines of agent-TUI chrome that must never reach the extraction model. These
+/// are verbatim, stable strings from Claude Code's startup/trust screens and
+/// status footers — the first real QA campaign proved the model happily turns
+/// them into junk candidates ("Project Trust Confirmation") if they get through.
+const AGENT_CHROME_MARKERS: &[&str] = &[
+    "do you trust the files in this folder",
+    "yes, i trust this folder",
+    "yes, proceed",
+    "no, exit",
+    "welcome to claude code",
+    "security notes",
+    "security guide",
+    "enter to confirm",
+    "esc to cancel",
+    "? for shortcuts",
+    "esc to interrupt",
+    "press ctrl-c again",
+];
+
+/// Strip agent-TUI chrome (trust prompts, welcome banners, keyboard-hint
+/// footers) from captured terminal text before it is shown to the extraction
+/// model. Drops whole lines that contain a known marker; real session content
+/// on other lines is untouched.
+pub fn scrub_agent_chrome(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let lowered = line.to_lowercase();
+            !AGENT_CHROME_MARKERS
+                .iter()
+                .any(|marker| lowered.contains(marker))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
+}
+
+/// Backstop for chrome the line scrub can't catch: the model paraphrases a
+/// trust dialog into something like "Project Trust Confirmation", so an
+/// extracted item ABOUT the boilerplate is rejected before it becomes a review
+/// candidate. Kept narrow — a false positive here silently hides a memory.
+pub fn is_agent_chrome_memory(item: &ExtractedMemory) -> bool {
+    let haystack = format!("{} {}", item.title, item.content).to_lowercase();
+    (haystack.contains("trust") && haystack.contains("folder"))
+        || haystack.contains("workspace access")
+        || haystack.contains("permission prompt")
+        || haystack.contains("trust confirmation")
+        || haystack.contains("security guide")
+        || haystack.contains("welcome screen")
 }
 
 /// Slice out the first `[ … ]` span, so a code-fenced or prose-wrapped array from
@@ -148,5 +202,52 @@ mod tests {
         assert!(parse_extracted_memories("[]").is_empty());
         assert!(parse_extracted_memories("I found nothing durable.").is_empty());
         assert!(parse_extracted_memories("[not valid json").is_empty());
+    }
+
+    #[test]
+    fn scrub_drops_agent_chrome_lines_and_keeps_real_content() {
+        // A captured claude startup screen (as strip_ansi renders it) around one
+        // real line of session content.
+        let text = "Welcome to Claude Code\n\
+                    Do you trust the files in this folder?\n\
+                    ❯ 1. Yes, I trust this folder\n\
+                    2. No, exit\n\
+                    Enter to confirm · Esc to cancel\n\
+                    We decided to pin the CI timezone to UTC.\n\
+                    ? for shortcuts";
+        let scrubbed = scrub_agent_chrome(text);
+        assert_eq!(scrubbed, "We decided to pin the CI timezone to UTC.");
+
+        // A chrome-only screen scrubs to nothing (the caller then drops the event).
+        assert!(scrub_agent_chrome("Welcome to Claude Code\n? for shortcuts").is_empty());
+        // Text with no chrome passes through untouched.
+        assert_eq!(scrub_agent_chrome("plain output"), "plain output");
+    }
+
+    #[test]
+    fn rejects_memories_that_are_about_the_boilerplate_itself() {
+        // The two junk candidates the first real QA campaign produced.
+        let junk = [
+            ExtractedMemory {
+                kind: "context".to_owned(),
+                title: "Workspace Access Protocol".to_owned(),
+                content: "The user granted the agent workspace access to the folder.".to_owned(),
+            },
+            ExtractedMemory {
+                kind: "decision".to_owned(),
+                title: "Project Trust Confirmation".to_owned(),
+                content: "The user confirmed they trust the files in this folder.".to_owned(),
+            },
+        ];
+        for item in &junk {
+            assert!(is_agent_chrome_memory(item), "should reject: {}", item.title);
+        }
+
+        let real = ExtractedMemory {
+            kind: "decision".to_owned(),
+            title: "Use SQLite".to_owned(),
+            content: "Chosen for V1 because it is embedded and needs no server.".to_owned(),
+        };
+        assert!(!is_agent_chrome_memory(&real));
     }
 }

@@ -3863,6 +3863,12 @@ pub fn list_candidates(options: ListCandidatesOptions) -> Result<Vec<ExtractionC
         .map(validate_candidate_status)
         .transpose()?;
     let scope = Scope::new(options.scope)?;
+    // An empty scope means "the whole review queue", not "root-scoped only": the
+    // queue is a human inbox, and a candidate parked in a sub-scope must never be
+    // invisible by default (the Home ledger badge counts every pending candidate,
+    // so the default listing has to agree with it). A non-empty scope still
+    // narrows to that scope's chain.
+    let all_scopes = scope.as_str().is_empty();
     let scope_chain = scope.chain().into_vec();
     let (_project, connection) = resolve_and_open(
         options.project_name,
@@ -3880,57 +3886,39 @@ pub fn list_candidates(options: ListCandidatesOptions) -> Result<Vec<ExtractionC
         requested_limit
     };
 
-    let mut rows = match status {
-        Some(status) => {
-            let sql = scoped_query(
-                "
-                SELECT id, source_type, source, proposed_record_type, payload, scope,
-                       confidence, status, rationale, trusted_record_type, trusted_record_id,
-                       created_at, reviewed_at
-                FROM extraction_candidates
-                WHERE status = ? AND scope IN ({scopes})
-                ORDER BY created_at DESC, id DESC
-                LIMIT ?
-                ",
-                scope_chain.len(),
-            );
-            let mut params: Vec<&dyn rusqlite::ToSql> = vec![&status];
+    let mut rows = {
+        let mut sql = String::from(
+            "
+            SELECT id, source_type, source, proposed_record_type, payload, scope,
+                   confidence, status, rationale, trusted_record_type, trusted_record_id,
+                   created_at, reviewed_at
+            FROM extraction_candidates
+            WHERE 1 = 1
+            ",
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        if let Some(status) = &status {
+            sql.push_str(" AND status = ?");
+            params.push(status);
+        }
+        if !all_scopes {
+            sql.push_str(&format!(
+                " AND scope IN ({})",
+                vec!["?"; scope_chain.len()].join(", ")
+            ));
             params.extend(
                 scope_chain
                     .iter()
                     .map(|scope| scope as &dyn rusqlite::ToSql),
             );
-            params.push(&limit);
-            let mut statement = connection.prepare(&sql)?;
-            let candidates = collect_rows(
-                statement.query_map(params.as_slice(), extraction_candidate_from_row)?,
-            )?;
-            candidates
         }
-        None => {
-            let sql = scoped_query(
-                "
-                SELECT id, source_type, source, proposed_record_type, payload, scope,
-                       confidence, status, rationale, trusted_record_type, trusted_record_id,
-                       created_at, reviewed_at
-                FROM extraction_candidates
-                WHERE scope IN ({scopes})
-                ORDER BY created_at DESC, id DESC
-                LIMIT ?
-                ",
-                scope_chain.len(),
-            );
-            let mut params: Vec<&dyn rusqlite::ToSql> = scope_chain
-                .iter()
-                .map(|scope| scope as &dyn rusqlite::ToSql)
-                .collect();
-            params.push(&limit);
-            let mut statement = connection.prepare(&sql)?;
-            let candidates = collect_rows(
-                statement.query_map(params.as_slice(), extraction_candidate_from_row)?,
-            )?;
-            candidates
-        }
+        sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
+        params.push(&limit);
+        let mut statement = connection.prepare(&sql)?;
+        let candidates = collect_rows(
+            statement.query_map(params.as_slice(), extraction_candidate_from_row)?,
+        )?;
+        candidates
     };
 
     for candidate in &mut rows {
@@ -4905,19 +4893,36 @@ pub fn extract_capture_memory(options: ExtractCaptureOptions) -> Result<CaptureE
     }
 
     // Assemble the transcript the model reads (already redacted at capture time).
+    // Agent-TUI chrome (trust prompts, welcome banners) is scrubbed first — the
+    // model turns it into junk candidates if it gets through; an event that was
+    // ONLY chrome is dropped entirely.
     let transcript = events
         .iter()
-        .map(|event| {
+        .filter_map(|event| {
             let title = event.title.as_deref().unwrap_or("");
-            let text = event.text.as_deref().unwrap_or("");
-            format!("[{}] {}\n{}", event.source_type, title, text)
+            let text = crate::extract::scrub_agent_chrome(event.text.as_deref().unwrap_or(""));
+            if text.is_empty() && event.text.as_deref().is_some_and(|raw| !raw.trim().is_empty())
+            {
+                return None;
+            }
+            Some(format!("[{}] {}\n{}", event.source_type, title, text))
         })
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    let provider = crate::chat::OllamaProvider::new(options.ollama_url, options.model);
-    let response = provider.complete(&crate::extract::build_extraction_messages(&transcript))?;
-    let items = crate::extract::parse_extracted_memories(&response);
+    // A session that was nothing but chrome has nothing durable in it: skip the
+    // model call, but still advance the cursor below so it isn't re-read forever.
+    let items = if transcript.trim().is_empty() {
+        Vec::new()
+    } else {
+        let provider = crate::chat::OllamaProvider::new(options.ollama_url, options.model);
+        let response =
+            provider.complete(&crate::extract::build_extraction_messages(&transcript))?;
+        crate::extract::parse_extracted_memories(&response)
+            .into_iter()
+            .filter(|item| !crate::extract::is_agent_chrome_memory(item))
+            .collect()
+    };
 
     let evidence = events
         .iter()
@@ -11786,6 +11791,58 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|c| c.source_type == "capture:llm" && c.record_type == "decision"));
+    }
+
+    #[test]
+    fn empty_scope_lists_the_whole_review_queue() {
+        // Regression for the first QA campaign's badge/Review mismatch: the Home
+        // badge counts EVERY pending candidate, but listing with the default ""
+        // scope hid sub-scoped ones (chain of "" is just [""]). Empty scope now
+        // means the whole queue; a non-empty scope still narrows to its chain.
+        let (_temp, home, project_dir) = setup_project();
+
+        let propose = |scope: &str, title: &str| {
+            propose_candidate(ProposeCandidateOptions {
+                project_name: None,
+                start_dir: project_dir.clone(),
+                grafiki_home: Some(home.clone()),
+                source_type: "capture:llm".to_owned(),
+                source: Some("recent-capture".to_owned()),
+                record_type: "decision".to_owned(),
+                payload: serde_json::json!({ "title": title, "reasoning": "because" }),
+                scope: scope.to_owned(),
+                confidence: 0.6,
+                rationale: None,
+                evidence: Vec::new(),
+            })
+            .unwrap()
+        };
+        propose("", "Root-scoped decision");
+        propose("example-project/core", "Sub-scoped decision");
+
+        let list = |scope: &str| {
+            list_candidates(ListCandidatesOptions {
+                project_name: None,
+                start_dir: project_dir.clone(),
+                grafiki_home: Some(home.clone()),
+                status: Some("pending".to_owned()),
+                scope: scope.to_owned(),
+                limit: 50,
+                order: CandidateOrder::Recent,
+            })
+            .unwrap()
+        };
+        assert_eq!(list("").len(), 2, "default scope = the whole review queue");
+        assert_eq!(
+            list("example-project/core").len(),
+            2,
+            "a sub-scope still sees its chain (root + itself)"
+        );
+        assert_eq!(
+            list("unrelated").len(),
+            1,
+            "an unrelated scope narrows to its chain (root only)"
+        );
     }
 
     #[test]

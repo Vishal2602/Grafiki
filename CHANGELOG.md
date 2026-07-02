@@ -17,6 +17,10 @@
 - Menubar presence: capture dot while a session records, live review count, open/quit.
 - "Continue this with Claude": any cited memory answer can hand off into a live pre-briefed session.
 
+### QA-campaign fixes (Jul 2)
+- Review queue no longer hides sub-scoped candidates: listing with the default empty scope now returns the whole queue (previously root-scoped only), so the Home badge, the Review pane, and `grafiki candidates list` finally agree on the pending count.
+- Extraction no longer proposes agent-UI boilerplate: Claude Code trust prompts, welcome banners, and keyboard-hint footers are scrubbed from captured terminal text before the model reads it, chrome-only sessions skip the model call entirely, and a paraphrase backstop rejects extracted items that are about the boilerplate itself (e.g. "Project Trust Confirmation").
+
 - Added evidence links for review candidates and approved memory.
 - Added local agent query audit logs for `grafiki ask`.
 - Added init-time import of `CLAUDE.md`, Cursor rules, Cline memory bank files, and recent git history into reviewable candidates.
