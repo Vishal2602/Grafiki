@@ -36,7 +36,8 @@
         "base-uri": "'self'",
         "frame-ancestors": "'none'"
       }
-    }
+    },
+    "withGlobalTauri": true
   },
   "bundle": {
     "active": true,

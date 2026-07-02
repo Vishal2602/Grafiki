@@ -31,6 +31,15 @@ export const config = {
   mochaOpts: { ui: "bdd", timeout: 90_000 },
   reporters: ["spec"],
   waitforTimeout: 15_000,
+
+  // First page load pays vite's cold module-transform tax (the debug binary
+  // loads devUrl) — absorb it once here instead of inside the first spec.
+  before: async () => {
+    await browser
+      .$(".rail-nav")
+      .waitForExist({ timeout: 120_000 })
+      .catch(() => Promise.resolve()); // fresh profiles show onboarding instead
+  },
   connectionRetryTimeout: 60_000,
   connectionRetryCount: 2,
   logLevel: "warn",

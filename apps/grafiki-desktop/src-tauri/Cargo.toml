@@ -26,3 +26,4 @@ tauri = { version = "2.11.2", features = ["tray-icon", "image-png"] }
 tauri-plugin-dialog = "2.7.1"
 tauri-plugin-wdio-webdriver = "1.2.0"
 tauri-plugin-webdriver-automation = "0.1.3"
+tauri-plugin-wdio = "1.2.0"

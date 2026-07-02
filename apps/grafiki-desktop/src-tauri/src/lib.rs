@@ -2440,6 +2440,7 @@ pub fn run() {
     #[cfg(debug_assertions)]
     let builder = builder
         .plugin(tauri_plugin_wdio_webdriver::init())
+        .plugin(tauri_plugin_wdio::init())
         .plugin(tauri_plugin_webdriver_automation::init());
     builder
         .plugin(tauri_plugin_dialog::init())

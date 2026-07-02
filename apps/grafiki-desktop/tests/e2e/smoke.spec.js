@@ -1,49 +1,119 @@
 // Smoke suite: boots the real app and walks the primary surfaces.
-// Selectors are the app's real classes (see src/styles.css) — no test doubles.
+//
+// DRIVER NOTE: the embedded macOS driver (tauri-plugin-wdio-webdriver 1.2)
+// intermittently stalls WebDriver element-find calls for 90s+ on this app,
+// and its select action doesn't fire React's change event. Every query and
+// interaction below therefore goes through `browser.execute` (in-page DOM),
+// which has been reliable in every run. Revisit native finds when the driver
+// matures. Keyboard input via browser.keys() works and is used as-is.
 
-/// First-run state shows onboarding; a configured machine shows Home. Both are
-/// valid boots — this helper lands us on Home either way.
+const q = {
+  exists: (sel) =>
+    browser.execute((s) => Boolean(document.querySelector(s)), sel),
+  count: (sel) =>
+    browser.execute((s) => document.querySelectorAll(s).length, sel),
+  text: (sel) =>
+    browser.execute((s) => document.querySelector(s)?.textContent?.trim() ?? null, sel),
+  attr: (sel, name) =>
+    browser.execute(
+      (s, a) => document.querySelector(s)?.getAttribute(a) ?? null,
+      sel,
+      name,
+    ),
+  click: (sel) =>
+    browser.execute((s) => {
+      const el = document.querySelector(s);
+      if (!el) return false;
+      el.click();
+      return true;
+    }, sel),
+  clickByText: (sel, textContent) =>
+    browser.execute(
+      (s, t) => {
+        const el = [...document.querySelectorAll(s)].find((node) =>
+          (node.textContent ?? "").trim().includes(t),
+        );
+        if (!el) return false;
+        el.click();
+        return true;
+      },
+      sel,
+      textContent,
+    ),
+  // React controlled inputs need the native value setter + an input event.
+  setValue: (sel, value) =>
+    browser.execute(
+      (s, v) => {
+        const el = document.querySelector(s);
+        if (!el) return false;
+        const proto =
+          el instanceof HTMLTextAreaElement
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+        Object.getOwnPropertyDescriptor(proto, "value").set.call(el, v);
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        return true;
+      },
+      sel,
+      value,
+    ),
+  selectValue: (sel, value) =>
+    browser.execute(
+      (s, v) => {
+        const el = document.querySelector(s);
+        if (!el) return false;
+        el.value = v;
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+      },
+      sel,
+      value,
+    ),
+  waitFor: (sel, timeoutMsg) =>
+    browser.waitUntil(() => q.exists(sel), {
+      timeoutMsg: timeoutMsg ?? `${sel} never appeared`,
+    }),
+};
+
+/// First-run profiles boot into onboarding; configured ones restore whatever
+/// pane was persisted. Either way, land on Home.
 async function landOnHome() {
-  // Whichever arrives first: onboarding (fresh profile) or the app shell
-  // (which restores whatever pane was persisted — NOT necessarily Home).
-  const getStarted = $("button=Get started");
-  const rail = $(".rail-nav");
   await browser.waitUntil(
-    async () => (await getStarted.isExisting()) || (await rail.isExisting()),
+    async () =>
+      (await q.exists(".onboarding")) || (await q.exists(".rail-nav")),
     { timeoutMsg: "neither onboarding nor the app shell appeared" },
   );
 
-  if (await getStarted.isExisting()) {
-    // Drive onboarding with a disposable project folder.
-    await getStarted.click();
-    const folder = $(".onboarding-folder input");
-    await folder.waitForExist();
-    await folder.setValue(`/tmp/grafiki-e2e-${Date.now()}`);
-    await $("button=Create memory here").click();
-    // Local AI step: either "Continue" (Ollama found) or "Skip for now".
-    const cont = $("button=Continue");
-    const skip = $("button=Skip for now");
+  if (await q.exists(".onboarding")) {
+    await q.clickByText("button", "Get started");
+    await q.waitFor(".onboarding-folder input");
+    await q.setValue(".onboarding-folder input", `/tmp/grafiki-e2e-${Date.now()}`);
+    await q.clickByText("button", "Create memory here");
     await browser.waitUntil(
-      async () => (await cont.isExisting()) || (await skip.isExisting()),
+      async () => ((await q.text(".onboarding-step h1")) ?? "").includes("Local AI"),
+      { timeoutMsg: "local AI step never appeared" },
     );
-    await ((await cont.isExisting()) ? cont : skip).click();
-    // First-session step: skip straight to the app.
-    await $("button=Skip — take me to the app").click();
+    // "Continue" when Ollama is present, "Skip for now" otherwise.
+    if (!(await q.clickByText("button", "Continue"))) {
+      await q.clickByText("button", "Skip for now");
+    }
+    await browser.waitUntil(() => q.clickByText("button", "Skip — take me to the app"));
   }
 
-  // Navigate deterministically — the brand mark always goes Home.
-  await $(".brand").click();
-  await $(".home-title").waitForExist();
+  await q.click(".brand");
+  await q.waitFor(".home-title", "Home never rendered");
 }
 
 describe("Grafiki desktop", () => {
   it("boots to the Home ledger", async () => {
     await landOnHome();
-    expect(await $(".home-title").getText()).toBe("Today");
-    // The stat strip renders all three counters.
-    expect(await $$(".stat-card")).toHaveLength(3);
-    // The ask bar is pinned and ready.
-    await expect($(".ask-bar-wrap input")).toExist();
+    const title = await q.text(".home-title");
+    if (title !== "Today") throw new Error(`home title was ${title}`);
+    const cards = await q.count(".stat-card");
+    if (cards !== 3) throw new Error(`expected 3 stat cards, got ${cards}`);
+    if (!(await q.exists(".ask-bar-wrap input"))) {
+      throw new Error("ask bar input missing");
+    }
   });
 
   it("navigates every rail destination", async () => {
@@ -55,53 +125,47 @@ describe("Grafiki desktop", () => {
       ["Settings", ".settings-grid"],
     ];
     for (const [label, marker] of destinations) {
-      await $(`button*=${label}`).click();
-      await $(marker).waitForExist({
-        timeoutMsg: `${label} pane did not render ${marker}`,
-      });
+      if (!(await q.clickByText(".rail-item", label))) {
+        throw new Error(`rail item ${label} not found`);
+      }
+      await q.waitFor(marker, `${label} pane did not render ${marker}`);
     }
-    // Back home via the brand mark.
-    await $(".brand").click();
-    await $(".home-title").waitForExist();
+    await q.click(".brand");
+    await q.waitFor(".home-title");
   });
 
   it("opens the command palette and routes a question to Memory chat", async () => {
     await landOnHome();
     await browser.keys(["Meta", "k"]);
-    const paletteInput = $(".palette input");
-    await paletteInput.waitForExist({ timeoutMsg: "⌘K palette did not open" });
-    // Free text that matches no command becomes an Ask-memory row.
-    await paletteInput.setValue("what did we decide about testing");
+    await q.waitFor(".palette input", "⌘K palette did not open");
+    await q.setValue(".palette input", "what did we decide about testing");
     await browser.keys(["Enter"]);
-    // Lands in the Memory pane with the question asked.
-    await $(".chat-view").waitForExist();
+    await q.waitFor(".chat-view", "Memory chat did not open from the palette");
   });
 
   it("Review advertises its keyboard triage", async () => {
     await landOnHome();
-    await $("button*=Review").click();
-    await $(".candidate-toolbar").waitForExist();
-    const kbd = await $$("kbd");
-    // j/k a r e v space — at least six advertised keys.
-    expect(kbd.length).toBeGreaterThanOrEqual(6);
+    await q.clickByText(".rail-item", "Review");
+    await q.waitFor(".candidate-toolbar");
+    const kbd = await q.count("kbd");
+    if (kbd < 6) throw new Error(`expected ≥6 kbd chips, got ${kbd}`);
   });
 
   it("Settings switches the theme and back", async () => {
     await landOnHome();
-    await $("button*=Settings").click();
-    const select = $(".setting-row select");
-    await select.waitForExist();
-    await select.selectByVisibleText("Dark");
+    await q.clickByText(".rail-item", "Settings");
+    await q.waitFor(".setting-row select");
+    const initial = (await q.attr("html", "data-theme")) ?? "light";
+    const flipped = initial === "dark" ? "light" : "dark";
+    await q.selectValue(".setting-row select", flipped);
     await browser.waitUntil(
-      async () =>
-        (await $("html").getAttribute("data-theme")) === "dark",
-      { timeoutMsg: "dark theme did not apply" },
+      async () => (await q.attr("html", "data-theme")) === flipped,
+      { timeoutMsg: `${flipped} theme did not apply` },
     );
-    await select.selectByVisibleText("Light");
+    await q.selectValue(".setting-row select", initial);
     await browser.waitUntil(
-      async () =>
-        (await $("html").getAttribute("data-theme")) === "light",
-      { timeoutMsg: "light theme did not restore" },
+      async () => (await q.attr("html", "data-theme")) === initial,
+      { timeoutMsg: `${initial} theme did not restore` },
     );
   });
 });

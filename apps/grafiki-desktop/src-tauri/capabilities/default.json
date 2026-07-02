@@ -11,6 +11,7 @@
     "dialog:allow-save",
     "dialog:allow-message",
     "wdio-webdriver:default",
-    "webdriver-automation:default"
+    "webdriver-automation:default",
+    "wdio:default"
   ]
 }

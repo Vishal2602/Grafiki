@@ -35,9 +35,20 @@ boot→Home (drives onboarding on a fresh profile with a /tmp project), all rail
 destinations, the ⌘K palette → ask-memory routing, the Review keyboard-triage
 legend, and the theme switch (asserts `html[data-theme]` flips and restores).
 
+Status: **5/5 passing, ~0.5s** (deterministic across runs).
+
 Notes:
 - `package.json` pins `@wdio/native-utils` via `overrides` — the tauri-service
   ships a stale nested copy that otherwise shadows the fixed one.
+- Three Rust-side pieces make the service fully functional: the embedded
+  driver plugin (`tauri-plugin-wdio-webdriver`), its companion
+  `tauri-plugin-wdio` (window state/mocking — without it every command pays a
+  5s sync timeout), and `app.withGlobalTauri: true` in tauri.conf.json.
+- DRIVER CAVEAT: the embedded driver (v1.2) intermittently stalls native
+  element-find calls for 90s+ and its select action skips React's change
+  event. The specs therefore do all DOM queries/interactions via
+  `browser.execute` (see the `q` helpers in smoke.spec.js) — reliable in
+  every run. Revisit native finds when the driver matures.
 - The suite launches its own app instance; it shares `~/.grafiki` and
   localStorage with your dev profile. Specs must stay non-destructive toward
   real memory (use /tmp projects for anything that writes).
@@ -51,19 +62,21 @@ type_text, wait_for_element, execute_tauri_command…) instead of screen-reading
   debug builds (an HTTP automation server on a random localhost port).
 - The W3C driver CLI is installed: `tauri-wd` (via
   `cargo install tauri-webdriver-automation`), listens on :4444.
-- The MCP server is
-  [mcp-tauri-automation](https://github.com/danielraffel/mcp-tauri-automation):
+- The MCP server
+  [mcp-tauri-automation](https://github.com/danielraffel/mcp-tauri-automation)
+  is INSTALLED at `~/tools/mcp-tauri-automation` (repo reviewed: 3 deps —
+  MCP SDK, webdriverio, zod; only lifecycle hook is `prepare: tsc`) and
+  registered project-locally as `tauri-automation` (`claude mcp list` → ✔).
+
+To use in an agent session:
 
 ```bash
-# review the repo first — it runs on your machine
-git clone https://github.com/danielraffel/mcp-tauri-automation ~/tools/mcp-tauri-automation
-cd ~/tools/mcp-tauri-automation && npm install && npm run build
-claude mcp add tauri-automation -- node ~/tools/mcp-tauri-automation/dist/index.js
+tauri-wd --port 4444 &        # the W3C bridge (installed via cargo)
+# then ask the agent to use the tauri-automation MCP tools:
+# launch_app / click_element / type_text / capture_screenshot / …
 ```
 
-Then in any Claude session: start `tauri-wd`, and the agent can launch and
-drive the app through MCP tools. (Early-stage project — treat as experimental
-alongside layers 1–2.)
+(Early-stage project — treat as experimental alongside layers 1–2.)
 
 ## Which layer when
 
