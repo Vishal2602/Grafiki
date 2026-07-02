@@ -4626,6 +4626,99 @@ pub fn capture_ledger(options: CaptureLedgerOptions) -> Result<CaptureLedgerRepo
     })
 }
 
+/// Options for [`capture_session_detail`] — one past session, fully opened.
+pub struct CaptureSessionDetailOptions {
+    pub project_name: Option<String>,
+    pub start_dir: PathBuf,
+    pub grafiki_home: Option<PathBuf>,
+    pub capture_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureSessionDetail {
+    pub session: LedgerSessionItem,
+    /// The memories this session produced (candidates whose evidence points
+    /// into it), any review status.
+    pub memories: Vec<ExtractionCandidate>,
+    /// The raw, redacted capture events — the audit trail.
+    pub events: Vec<CaptureEvent>,
+}
+
+/// Open one session from the Home ledger: its header, the memories it
+/// produced, and its raw event trail. Read-only.
+pub fn capture_session_detail(
+    options: CaptureSessionDetailOptions,
+) -> Result<CaptureSessionDetail> {
+    let (project, connection) = resolve_and_open(
+        options.project_name.clone(),
+        options.start_dir.clone(),
+        options.grafiki_home.clone(),
+    )?;
+
+    let session = connection.query_row(
+        "
+        SELECT cs.id, cs.source_app, cs.status, cs.started_at, cs.ended_at,
+               (SELECT COUNT(*) FROM capture_events ce WHERE ce.capture_session = cs.id),
+               (
+                   SELECT COUNT(DISTINCT el.candidate_id)
+                   FROM evidence_links el
+                   JOIN capture_events linked ON linked.id = el.source_event_id
+                   WHERE linked.capture_session = cs.id
+               )
+        FROM capture_sessions cs
+        WHERE cs.id = ?1 AND cs.project = ?2
+        ",
+        params![options.capture_id, project.project],
+        |row| {
+            Ok(LedgerSessionItem {
+                id: row.get(0)?,
+                source_app: row.get(1)?,
+                status: row.get(2)?,
+                started_at: row.get(3)?,
+                ended_at: row.get(4)?,
+                event_count: row.get(5)?,
+                memory_count: row.get(6)?,
+            })
+        },
+    )?;
+
+    let mut memories_statement = connection.prepare(
+        "
+        SELECT DISTINCT ec.id, ec.source_type, ec.source, ec.proposed_record_type, ec.payload,
+               ec.scope, ec.confidence, ec.status, ec.rationale, ec.trusted_record_type,
+               ec.trusted_record_id, ec.created_at, ec.reviewed_at
+        FROM extraction_candidates ec
+        JOIN evidence_links el ON el.candidate_id = ec.id
+        JOIN capture_events ce ON ce.id = el.source_event_id
+        WHERE ce.capture_session = ?1
+        ORDER BY ec.created_at DESC
+        LIMIT 100
+        ",
+    )?;
+    let mut memories = collect_rows(
+        memories_statement.query_map(params![options.capture_id], extraction_candidate_from_row)?,
+    )?;
+    for memory in &mut memories {
+        attach_candidate_evidence(&connection, memory)?;
+    }
+
+    let events = list_capture_events(ListCaptureEventsOptions {
+        project_name: options.project_name,
+        start_dir: options.start_dir,
+        grafiki_home: options.grafiki_home,
+        capture_id: Some(options.capture_id),
+        source_type: None,
+        scope: String::new(),
+        limit: 200,
+    })?;
+
+    Ok(CaptureSessionDetail {
+        session,
+        memories,
+        events,
+    })
+}
+
 pub fn get_capture_status(options: CaptureStatusOptions) -> Result<CaptureStatusReport> {
     let scope = Scope::new(options.scope)?;
     let scope_chain = scope.chain().into_vec();

@@ -11,6 +11,7 @@ const LAYOUT_VERSION = 3;
 // tampered/old URL hash before they reach the renderer.
 const PANE_KINDS: ReadonlySet<string> = new Set([
   "home",
+  "session",
   "chat",
   "terminal",
   "candidates",
@@ -89,6 +90,7 @@ export function decodeLayout(value: string | null): LayoutState | null {
 export function titleForPane(pane: Pick<PaneState, "kind" | "recordId">) {
   if (pane.kind === "detail") return pane.recordId ? `Detail: ${pane.recordId}` : "Detail";
   if (pane.kind === "candidates") return "Review";
+  if (pane.kind === "session") return "Session";
   if (pane.kind === "chat") return "Memory";
   if (pane.kind === "terminal") return "Session";
   const kind = pane.kind ?? "";

@@ -1,5 +1,6 @@
 export type PaneKind =
   | "home"
+  | "session"
   | "chat"
   | "terminal"
   | "candidates"

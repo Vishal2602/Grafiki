@@ -333,7 +333,7 @@ button {
   cursor: pointer;
 }
 .button,
-.pane-body button:not(.link-button):not(.icon-button):not(.evidence-chip),
+.pane-body button:not(.link-button):not(.icon-button):not(.evidence-chip):not(.seg-tab),
 .prompt-actions button,
 .inspector button {
   background: var(--card);
@@ -1165,6 +1165,62 @@ textarea {
   gap: 10px;
   flex-wrap: wrap;
   justify-content: center;
+}
+
+/* --------------------------------------------------------- session detail */
+.session-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.session-head b {
+  display: block;
+  font-size: 14px;
+  font-weight: 550;
+}
+.seg-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--hairline-2);
+}
+.seg-tabs button.seg-tab {
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 7px 12px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--ink-2);
+  margin-bottom: -1px;
+}
+.seg-tabs button.seg-tab.active {
+  color: var(--ink);
+  border-bottom-color: var(--accent);
+}
+.event-row {
+  border-bottom: 1px solid var(--hairline);
+  padding: 8px 2px;
+}
+.event-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.event-text {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  color: var(--ink-2);
+  background: var(--card);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-top: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+  user-select: text;
 }
 
 /* ------------------------------------------------------ session side peek */

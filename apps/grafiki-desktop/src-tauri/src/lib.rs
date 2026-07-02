@@ -712,6 +712,28 @@ fn list_local_models() -> Vec<String> {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SessionDetailRequest {
+    start_dir: Option<String>,
+    capture_id: String,
+}
+
+/// One past session, fully opened: header, the memories it produced, and the
+/// raw event trail (the Home ledger row's destination).
+#[tauri::command]
+fn get_session_detail(
+    request: SessionDetailRequest,
+) -> Result<grafiki_core::CaptureSessionDetail, String> {
+    grafiki_core::capture_session_detail(grafiki_core::CaptureSessionDetailOptions {
+        project_name: None,
+        start_dir: resolve_start_dir(request.start_dir),
+        grafiki_home: None,
+        capture_id: request.capture_id,
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct HomeLedgerRequest {
     start_dir: Option<String>,
 }
@@ -2327,6 +2349,7 @@ pub fn run() {
             extract_session_memory,
             list_local_models,
             get_home_ledger,
+            get_session_detail,
             terminal::terminal_write,
             terminal::terminal_resize,
             terminal::terminal_close,

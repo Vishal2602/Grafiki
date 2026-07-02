@@ -189,6 +189,25 @@ export interface HomeLedgerReport {
   resumable: { id: string; launch: string; cwd: string; updated_at: number } | null;
 }
 
+export interface SessionDetailReport {
+  session: HomeLedgerReport["ledger"]["sessions"][number];
+  memories: ExtractionCandidate[];
+  events: RawCaptureEvent[];
+}
+
+/// One past session opened from the Home ledger.
+export async function getSessionDetail(input: {
+  startDir?: string;
+  captureId: string;
+}): Promise<SessionDetailReport> {
+  if (!hasTauri()) {
+    return { session: (await getHomeLedger({})).ledger.sessions[0], memories: [], events: [] };
+  }
+  return invoke<SessionDetailReport>("get_session_detail", {
+    request: { startDir: input.startDir ?? "", captureId: input.captureId },
+  });
+}
+
 /// Everything the Home ledger renders, in one call.
 export async function getHomeLedger(input: { startDir?: string }): Promise<HomeLedgerReport> {
   if (!hasTauri()) {

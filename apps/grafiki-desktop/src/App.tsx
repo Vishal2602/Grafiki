@@ -44,6 +44,7 @@ import {
   exportMemoryToFile,
   extractSessionMemory,
   getHomeLedger,
+  getSessionDetail,
   listLocalModels,
   getCaptureConfig,
   getDaemonStatus,
@@ -62,7 +63,7 @@ import {
   isPreviewMode,
   confirmDialog,
 } from "./api";
-import type { HomeLedgerReport } from "./api";
+import type { HomeLedgerReport, SessionDetailReport } from "./api";
 import Onboarding from "./Onboarding";
 import { useModalDialog } from "./useModalDialog";
 import {
@@ -612,6 +613,13 @@ function MemoryPane(props: {
             onNavigate={props.onNavigate}
           />
         ) : null}
+        {pane.kind === "session" ? (
+          <SessionDetailPane
+            captureId={pane.recordId ?? ""}
+            projectRoot={props.projectRoot}
+            onNavigate={props.onNavigate}
+          />
+        ) : null}
         {pane.kind === "terminal" ? (
           <TerminalPane
             projectRoot={props.projectRoot}
@@ -661,6 +669,109 @@ function MemoryPane(props: {
         ) : null}
       </div>
     </motion.article>
+  );
+}
+
+function SessionDetailPane(props: {
+  captureId: string;
+  projectRoot: string;
+  onNavigate: (kind: PaneKind, patch?: Partial<PaneState>) => void;
+}) {
+  const [detail, setDetail] = useState<SessionDetailReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [tab, setTab] = useState<"memories" | "events">("memories");
+
+  useEffect(() => {
+    let cancelled = false;
+    setDetail(null);
+    setError(null);
+    getSessionDetail({ startDir: props.projectRoot, captureId: props.captureId })
+      .then((next) => {
+        if (!cancelled) setDetail(next);
+      })
+      .catch((detailError) => {
+        if (!cancelled) setError(String(detailError));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [props.captureId, props.projectRoot]);
+
+  if (error) {
+    return <p style={{ color: "var(--danger)" }}>{error}</p>;
+  }
+  if (!detail) {
+    return <p className="muted">Opening session…</p>;
+  }
+  const session = detail.session;
+
+  return (
+    <div className="view-stack">
+      <div className="session-head">
+        <div className="ledger-icon">{agentGlyph(session.source_app)}</div>
+        <div>
+          <b>
+            {agentLabel(session.source_app)} · {ledgerDayLabel(session.started_at)} ·{" "}
+            {ledgerTimeLabel(session.started_at)}
+            {session.ended_at ? `–${ledgerTimeLabel(session.ended_at)}` : " · in progress"}
+          </b>
+          <span className="subtle">
+            {session.event_count} captured events · {session.memory_count}{" "}
+            {session.memory_count === 1 ? "memory" : "memories"}
+          </span>
+        </div>
+      </div>
+
+      <div className="seg-tabs">
+        <button className={`seg-tab ${tab === "memories" ? "active" : ""}`} onClick={() => setTab("memories")}>
+          Memories ({detail.memories.length})
+        </button>
+        <button className={`seg-tab ${tab === "events" ? "active" : ""}`} onClick={() => setTab("events")}>
+          Raw events ({detail.events.length})
+        </button>
+      </div>
+
+      {tab === "memories" ? (
+        detail.memories.length === 0 ? (
+          <div className="empty-record-list">
+            Nothing was extracted from this session{session.ended_at ? "" : " yet"}.
+          </div>
+        ) : (
+          <div className="dense-list">
+            {detail.memories.map((memory) => (
+              <div key={memory.id} className="data-row">
+                <span className="record-type">{memory.record_type}</span>
+                <b style={{ fontWeight: 550 }}>{candidateTitle(memory)}</b>
+                <span className="subtle" style={{ marginLeft: "auto" }}>
+                  {memory.status}
+                  {memory.status === "pending" ? " · review it" : ""}
+                </span>
+                {memory.status === "pending" ? (
+                  <button className="link-button" onClick={() => props.onNavigate("candidates")}>
+                    Review
+                  </button>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        )
+      ) : (
+        <div className="dense-list">
+          {detail.events.map((event) => (
+            <div key={event.id} className="event-row">
+              <div className="event-row-head">
+                <span className="record-type">{event.source_type}</span>
+                <span className="subtle">{event.title ?? ""}</span>
+                <span className="subtle" style={{ marginLeft: "auto" }}>
+                  {ledgerTimeLabel(event.captured_at)}
+                </span>
+              </div>
+              {event.text ? <pre className="event-text">{event.text}</pre> : null}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -819,7 +930,7 @@ function HomePane(props: {
           </motion.div>
         ) : null}
 
-        {sessions.length === 0 ? (
+        {sessions.length === 0 && !live ? (
           <div className="home-empty">
             <h3>
               Your agent forgets every session. Grafiki <em>remembers</em>.
@@ -842,13 +953,18 @@ function HomePane(props: {
                 <div
                   key={session.id}
                   className="ledger-row"
-                  onClick={() => props.onNavigate("terminal")}
+                  onClick={() =>
+                    props.onNavigate("session", {
+                      recordId: session.id,
+                      title: `Session · ${ledgerDayLabel(session.started_at)}`,
+                    })
+                  }
                 >
                   <div className="ledger-icon">{agentGlyph(session.source_app)}</div>
                   <div className="ledger-body">
                     <b>
-                      {agentLabel(session.source_app)} ·{" "}
-                      {session.status === "active" ? "in progress" : "session"}
+                      {agentLabel(session.source_app)}
+                      {session.status === "active" ? " · in progress" : ""}
                     </b>
                     <span>{session.event_count} captured events</span>
                   </div>
