@@ -53,6 +53,8 @@ import {
   importMemoryFromFile,
   initializeProject,
   listCandidates,
+  listProjectContext,
+  listProjectDecisions,
   pickProjectFolder,
   processProjectEmbeddings,
   startDaemon,
@@ -77,6 +79,8 @@ import type {
   CaptureConfigReport,
   CaptureSourceConfig,
   ChatReply,
+  ContextSummary,
+  DecisionItem,
   DaemonStatus,
   EvidenceLink,
   ExtractionCandidate,
@@ -1568,6 +1572,23 @@ function ChatPane(props: {
     Array<{ question: string; reply: ChatReply | null; error: string | null }>
   >([]);
   const [sending, setSending] = useState(false);
+  const [memTab, setMemTab] = useState<"chat" | "decisions" | "context">("chat");
+  const [decisions, setDecisions] = useState<DecisionItem[] | null>(null);
+  const [contexts, setContexts] = useState<ContextSummary[] | null>(null);
+
+  useEffect(() => {
+    if (memTab === "decisions" && decisions === null) {
+      listProjectDecisions({ startDir: props.projectRoot, scope })
+        .then(setDecisions)
+        .catch(() => setDecisions([]));
+    }
+    if (memTab === "context" && contexts === null) {
+      listProjectContext({ startDir: props.projectRoot, scope })
+        .then(setContexts)
+        .catch(() => setContexts([]));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [memTab]);
 
   // A question routed in from Home's ask bar starts the conversation.
   const askedInitial = useRef(false);
@@ -1638,11 +1659,92 @@ function ChatPane(props: {
       className="view-stack chat-view"
       style={{ display: "flex", flexDirection: "column", height: "100%", gap: 12 }}
     >
+      <div className="seg-tabs">
+        <button className={`seg-tab ${memTab === "chat" ? "active" : ""}`} onClick={() => setMemTab("chat")}>
+          Chat
+        </button>
+        <button
+          className={`seg-tab ${memTab === "decisions" ? "active" : ""}`}
+          onClick={() => setMemTab("decisions")}
+        >
+          Decisions
+        </button>
+        <button
+          className={`seg-tab ${memTab === "context" ? "active" : ""}`}
+          onClick={() => setMemTab("context")}
+        >
+          Context
+        </button>
+      </div>
+      {memTab === "decisions" ? (
+        decisions === null ? (
+          <p className="muted">Loading…</p>
+        ) : decisions.length === 0 ? (
+          <div className="empty-record-list">No decisions yet — approve some in Review.</div>
+        ) : (
+          <div className="dense-list" style={{ overflowY: "auto" }}>
+            {decisions.map((decision) => (
+              <div
+                key={decision.id}
+                className="data-row"
+                style={{ cursor: "pointer" }}
+                onClick={() =>
+                  props.onOpenResult({
+                    record_type: "decision",
+                    id: decision.id,
+                    title: decision.title,
+                    snippet: decision.reasoning ?? "",
+                    scope: decision.scope,
+                  })
+                }
+              >
+                <span className="record-type">decision</span>
+                <b style={{ fontWeight: 550 }}>{decision.title}</b>
+                <span className="subtle" style={{ marginLeft: "auto" }}>
+                  {decision.status}
+                </span>
+              </div>
+            ))}
+          </div>
+        )
+      ) : null}
+      {memTab === "context" ? (
+        contexts === null ? (
+          <p className="muted">Loading…</p>
+        ) : contexts.length === 0 ? (
+          <div className="empty-record-list">No context documents yet.</div>
+        ) : (
+          <div className="dense-list" style={{ overflowY: "auto" }}>
+            {contexts.map((context) => (
+              <div
+                key={context.key}
+                className="data-row"
+                style={{ cursor: "pointer" }}
+                onClick={() =>
+                  props.onOpenResult({
+                    record_type: "context",
+                    id: context.key,
+                    title: context.title,
+                    snippet: "",
+                    scope: context.scope,
+                  })
+                }
+              >
+                <span className="record-type">context</span>
+                <b style={{ fontWeight: 550 }}>{context.title}</b>
+                <span className="subtle" style={{ marginLeft: "auto" }}>
+                  {context.category}
+                </span>
+              </div>
+            ))}
+          </div>
+        )
+      ) : null}
       <div
         style={{
           flex: 1,
           overflowY: "auto",
-          display: "flex",
+          display: memTab === "chat" ? "flex" : "none",
           flexDirection: "column",
           gap: 16,
         }}
