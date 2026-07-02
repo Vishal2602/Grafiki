@@ -44,6 +44,7 @@ import {
   exportMemoryToFile,
   extractSessionMemory,
   getHomeLedger,
+  getLiveTranscript,
   getSessionDetail,
   listLocalModels,
   getCaptureConfig,
@@ -65,7 +66,7 @@ import {
   isPreviewMode,
   confirmDialog,
 } from "./api";
-import type { HomeLedgerReport, SessionDetailReport } from "./api";
+import type { HomeLedgerReport, LiveTranscriptTurn, SessionDetailReport } from "./api";
 import Onboarding from "./Onboarding";
 import { useModalDialog } from "./useModalDialog";
 import {
@@ -1265,6 +1266,42 @@ function TerminalPane(props: {
   const peekNew = peek.filter((candidate) => candidate.created_at >= sessionStartRef.current);
   const peekOlder = peek.length - peekNew.length;
 
+  // The chat LENS: the same session rendered as a conversation (Claude Code
+  // only — we tail its transcript with the parser capture already uses).
+  const [lens, setLens] = useState<"terminal" | "chat">("terminal");
+  const [turns, setTurns] = useState<LiveTranscriptTurn[]>([]);
+  const [composer, setComposer] = useState("");
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const chatCapable = session?.launch === "claude";
+  useEffect(() => {
+    if (!session || lens !== "chat") {
+      return;
+    }
+    let cancelled = false;
+    const load = () =>
+      getLiveTranscript({ startDir: props.projectRoot || props.fallbackCwd })
+        .then((next) => {
+          if (!cancelled) setTurns(next);
+        })
+        .catch(() => undefined);
+    void load();
+    const timer = window.setInterval(() => void load(), 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lens, session?.id]);
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ block: "end" });
+  }, [turns.length]);
+  const sendComposer = () => {
+    const text = composer.trim();
+    if (!text || !session) return;
+    void invoke("terminal_write", { id: session.id, data: `${text}\r` });
+    setComposer("");
+  };
+
   const reviewPeek = async (candidate: ExtractionCandidate, accept: boolean) => {
     setPeekBusy(candidate.id);
     try {
@@ -1491,6 +1528,22 @@ function TerminalPane(props: {
           {capturing === false ? " · not capturing — initialize this folder in Settings" : ""}
           {ended ? " · session ended" : ""}
         </span>
+        {chatCapable ? (
+          <span className="seg-tabs lens-tabs">
+            <button
+              className={`seg-tab ${lens === "terminal" ? "active" : ""}`}
+              onClick={() => setLens("terminal")}
+            >
+              Terminal
+            </button>
+            <button
+              className={`seg-tab ${lens === "chat" ? "active" : ""}`}
+              onClick={() => setLens("chat")}
+            >
+              Chat
+            </button>
+          </span>
+        ) : null}
         <button
           className="peek-toggle"
           style={{ marginLeft: "auto", padding: "4px 10px" }}
@@ -1506,8 +1559,52 @@ function TerminalPane(props: {
       <div style={{ flex: 1, minHeight: 0, display: "flex", gap: 10 }}>
         <div
           ref={containerRef}
-          style={{ flex: 1, minHeight: 0, background: "#16181c", borderRadius: 8, overflow: "hidden", padding: 6 }}
+          style={{
+            flex: 1,
+            minHeight: 0,
+            background: "#16181c",
+            borderRadius: 8,
+            overflow: "hidden",
+            padding: 6,
+            display: lens === "chat" ? "none" : "block",
+          }}
         />
+        {lens === "chat" ? (
+          <div className="chat-lens">
+            <div className="chat-lens-scroll">
+              {turns.length === 0 ? (
+                <p className="muted" style={{ margin: "auto", textAlign: "center" }}>
+                  Waiting for the conversation… (the transcript appears after Claude's first
+                  reply — flip to Terminal for permission prompts)
+                </p>
+              ) : (
+                turns.map((turn, index) => (
+                  <div
+                    key={index}
+                    className={`lens-bubble ${turn.role === "user" ? "user" : "assistant"}`}
+                  >
+                    {turn.text}
+                  </div>
+                ))
+              )}
+              <div ref={chatEndRef} />
+            </div>
+            <div className="search-box">
+              <input
+                value={composer}
+                placeholder="Message Claude… (sent to the live session)"
+                onChange={(event) => setComposer(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    sendComposer();
+                  }
+                }}
+              />
+              <button onClick={sendComposer}>Send</button>
+            </div>
+          </div>
+        ) : null}
         {peekOpen ? (
           <aside className="term-peek">
             <div className="term-peek-title">Learned this session</div>

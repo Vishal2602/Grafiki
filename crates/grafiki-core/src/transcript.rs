@@ -262,6 +262,59 @@ fn encode_claude_project_name(absolute: &str) -> String {
     absolute.replace(['/', '.', ' '], "-")
 }
 
+/// One conversational turn from a live agent transcript — what the desktop's
+/// chat lens renders as a bubble.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveTranscriptTurn {
+    pub role: String,
+    pub text: String,
+    pub timestamp: Option<String>,
+}
+
+/// Tail THIS project's newest Claude Code transcript as conversation turns —
+/// the read side of the desktop "chat lens" over a live hosted session. Uses
+/// the same parser as capture import; read-only, no DB. Returns empty when no
+/// transcript exists yet (session just started, or the agent isn't Claude Code).
+pub fn read_live_transcript(start_dir: &Path, limit: usize) -> Result<Vec<LiveTranscriptTurn>> {
+    let Some(dir) = claude_code_project_dir(start_dir) else {
+        return Ok(Vec::new());
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        if newest
+            .as_ref()
+            .map(|(newest_time, _)| modified > *newest_time)
+            .unwrap_or(true)
+        {
+            newest = Some((modified, path));
+        }
+    }
+    let Some((_, path)) = newest else {
+        return Ok(Vec::new());
+    };
+
+    let mut events = parse_transcript_file("claude-code", &path, 2000)?;
+    let keep_from = events.len().saturating_sub(limit.clamp(1, 500));
+    Ok(events
+        .drain(keep_from..)
+        .map(|event| LiveTranscriptTurn {
+            role: event.role,
+            text: event.text,
+            timestamp: event.timestamp,
+        })
+        .collect())
+}
+
 fn default_transcript_roots(agent: &str, start_dir: &Path) -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     match (agent, home) {

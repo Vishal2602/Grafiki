@@ -88,6 +88,6 @@ pub use reflection::{CommunityDetail, ReflectionReport, RunReflectionOptions};
 pub use scope::{Scope, ScopeChain};
 pub use session::{start_session, StartSessionOptions, StartSessionReport};
 pub use transcript::{
-    import_agent_transcripts, AgentTranscriptImportReport, ImportAgentTranscriptsOptions,
-    TranscriptImportSource,
+    import_agent_transcripts, read_live_transcript, AgentTranscriptImportReport,
+    ImportAgentTranscriptsOptions, LiveTranscriptTurn, TranscriptImportSource,
 };

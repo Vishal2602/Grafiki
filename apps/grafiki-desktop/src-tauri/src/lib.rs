@@ -734,6 +734,22 @@ fn get_session_detail(
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct LiveTranscriptRequest {
+    start_dir: Option<String>,
+}
+
+/// Tail this project's newest Claude Code transcript as conversation turns —
+/// the chat lens over the hosted terminal session.
+#[tauri::command]
+fn get_live_transcript(
+    request: LiveTranscriptRequest,
+) -> Result<Vec<grafiki_core::LiveTranscriptTurn>, String> {
+    grafiki_core::read_live_transcript(&resolve_start_dir(request.start_dir), 80)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct HomeLedgerRequest {
     start_dir: Option<String>,
 }
@@ -2350,6 +2366,7 @@ pub fn run() {
             list_local_models,
             get_home_ledger,
             get_session_detail,
+            get_live_transcript,
             terminal::terminal_write,
             terminal::terminal_resize,
             terminal::terminal_close,

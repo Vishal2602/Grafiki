@@ -238,6 +238,24 @@ export async function getHomeLedger(input: { startDir?: string }): Promise<HomeL
   });
 }
 
+export interface LiveTranscriptTurn {
+  role: string;
+  text: string;
+  timestamp?: string | null;
+}
+
+/// Tail this project's newest Claude Code transcript (the chat lens).
+export async function getLiveTranscript(input: {
+  startDir?: string;
+}): Promise<LiveTranscriptTurn[]> {
+  if (!hasTauri()) {
+    return [];
+  }
+  return invoke<LiveTranscriptTurn[]>("get_live_transcript", {
+    request: { startDir: input.startDir ?? "" },
+  });
+}
+
 /// Models the local Ollama server has pulled ([] when Ollama isn't running).
 export async function listLocalModels(): Promise<string[]> {
   if (!hasTauri()) {
