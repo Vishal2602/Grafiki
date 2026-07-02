@@ -63,6 +63,7 @@ import {
   confirmDialog,
 } from "./api";
 import type { HomeLedgerReport } from "./api";
+import Onboarding from "./Onboarding";
 import { useModalDialog } from "./useModalDialog";
 import {
   decodeLayoutFromHash,
@@ -168,7 +169,18 @@ export default function App() {
   const [recordDetailError, setRecordDetailError] = useState<string | null>(null);
   const [recordDetailLoading, setRecordDetailLoading] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [onboarding, setOnboarding] = useState(
+    () => !localStorage.getItem("grafiki.onboarded") && !localStorage.getItem(PROJECT_ROOT_KEY),
+  );
   const reduceMotion = useReducedMotion() ?? false;
+
+  const finishOnboarding = (launch: string | null) => {
+    localStorage.setItem("grafiki.onboarded", "1");
+    setOnboarding(false);
+    if (launch !== null) {
+      switchPrimaryPane("terminal", { query: launch });
+    }
+  };
 
   useEffect(() => {
     refreshSnapshot();
@@ -362,6 +374,15 @@ export default function App() {
       return;
     }
     if (result) openResultInPane(result);
+  }
+
+  if (onboarding) {
+    return (
+      <Onboarding
+        onProjectReady={(dir) => setProjectRoot(dir)}
+        onFinished={finishOnboarding}
+      />
+    );
   }
 
   return (
@@ -595,6 +616,7 @@ function MemoryPane(props: {
           <TerminalPane
             projectRoot={props.projectRoot}
             fallbackCwd={props.snapshot?.start_dir ?? ""}
+            initialLaunch={pane.query}
           />
         ) : null}
         {pane.kind === "chat" ? (
@@ -883,7 +905,11 @@ function loadTerminalSession(projectRoot: string): TerminalSessionRef | null {
   }
 }
 
-function TerminalPane(props: { projectRoot: string; fallbackCwd: string }) {
+function TerminalPane(props: {
+  projectRoot: string;
+  fallbackCwd: string;
+  initialLaunch?: string;
+}) {
   // The session id is STABLE and persisted per project: switching tabs detaches
   // the UI but the PTY (and the agent inside it) keeps running; coming back
   // reattaches and replays scrollback. Only "End session" kills the process.
@@ -905,6 +931,61 @@ function TerminalPane(props: { projectRoot: string; fallbackCwd: string }) {
     setError(null);
     setEnded(false);
   }, [props.projectRoot]);
+
+  // Onboarding (or Home) can hand us an agent to launch immediately.
+  useEffect(() => {
+    if (props.initialLaunch !== undefined && loadTerminalSession(props.projectRoot) === null) {
+      startSession(props.initialLaunch);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // "Learned this session" side peek: pending LLM-extracted candidates that
+  // appeared since this pane opened, refreshed on the extraction cadence.
+  const [peek, setPeek] = useState<ExtractionCandidate[]>([]);
+  const [peekBusy, setPeekBusy] = useState<string | null>(null);
+  const [peekOpen, setPeekOpen] = useState(true);
+  const sessionStartRef = useRef(new Date().toISOString());
+  const loadPeek = async () => {
+    try {
+      const candidates = await listCandidates({
+        startDir: props.projectRoot,
+        scope: "",
+        status: "pending",
+        limit: 50,
+      });
+      setPeek(candidates.filter((candidate) => candidate.source_type === "capture:llm"));
+    } catch {
+      /* the peek is best-effort; the terminal must never suffer for it */
+    }
+  };
+  useEffect(() => {
+    if (!session) {
+      return;
+    }
+    void loadPeek();
+    const timer = window.setInterval(() => void loadPeek(), 45_000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.id]);
+  const peekNew = peek.filter((candidate) => candidate.created_at >= sessionStartRef.current);
+  const peekOlder = peek.length - peekNew.length;
+
+  const reviewPeek = async (candidate: ExtractionCandidate, accept: boolean) => {
+    setPeekBusy(candidate.id);
+    try {
+      if (accept) {
+        await approveCandidate({ startDir: props.projectRoot, id: candidate.id });
+      } else {
+        await rejectCandidate({ startDir: props.projectRoot, id: candidate.id, rationale: "" });
+      }
+      await loadPeek();
+    } catch {
+      /* surfaced in Review if it matters */
+    } finally {
+      setPeekBusy(null);
+    }
+  };
 
   useEffect(() => {
     if (!session || !containerRef.current) {
@@ -1116,15 +1197,66 @@ function TerminalPane(props: { projectRoot: string; fallbackCwd: string }) {
           {capturing === false ? " · not capturing — initialize this folder in Settings" : ""}
           {ended ? " · session ended" : ""}
         </span>
-        <button style={{ marginLeft: "auto", padding: "4px 10px" }} onClick={endSession}>
+        <button
+          className="peek-toggle"
+          style={{ marginLeft: "auto", padding: "4px 10px" }}
+          onClick={() => setPeekOpen((current) => !current)}
+        >
+          Learned: {peekNew.length}
+        </button>
+        <button style={{ padding: "4px 10px" }} onClick={endSession}>
           {ended ? "New session" : "End session"}
         </button>
       </div>
-      {error ? <p style={{ color: "var(--danger, #ff6b6b)" }}>{error}</p> : null}
-      <div
-        ref={containerRef}
-        style={{ flex: 1, minHeight: 0, background: "#16181c", borderRadius: 6, overflow: "hidden", padding: 6 }}
-      />
+      {error ? <p style={{ color: "var(--danger)" }}>{error}</p> : null}
+      <div style={{ flex: 1, minHeight: 0, display: "flex", gap: 10 }}>
+        <div
+          ref={containerRef}
+          style={{ flex: 1, minHeight: 0, background: "#16181c", borderRadius: 8, overflow: "hidden", padding: 6 }}
+        />
+        {peekOpen ? (
+          <aside className="term-peek">
+            <div className="term-peek-title">Learned this session</div>
+            {peekNew.length === 0 ? (
+              <p className="subtle">
+                Nothing yet — memories appear here as you work.
+                {peekOlder > 0 ? ` ${peekOlder} older waiting in Review.` : ""}
+              </p>
+            ) : (
+              peekNew.map((candidate) => (
+                <motion.div
+                  key={candidate.id}
+                  className="peek-item"
+                  initial={{ opacity: 0, x: 10 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={transition.quick}
+                >
+                  <span className="record-type">{candidate.record_type}</span>
+                  <b>{candidateTitle(candidate)}</b>
+                  <div className="peek-actions">
+                    <button
+                      className="icon-button success"
+                      disabled={peekBusy === candidate.id}
+                      title="Approve"
+                      onClick={() => void reviewPeek(candidate, true)}
+                    >
+                      <CheckCircle2 size={14} />
+                    </button>
+                    <button
+                      className="icon-button danger"
+                      disabled={peekBusy === candidate.id}
+                      title="Reject"
+                      onClick={() => void reviewPeek(candidate, false)}
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                </motion.div>
+              ))
+            )}
+          </aside>
+        ) : null}
+      </div>
     </div>
   );
 }
