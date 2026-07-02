@@ -2433,7 +2433,15 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 
 pub fn run() {
     install_panic_logger();
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // E2E automation servers — DEBUG BUILDS ONLY, never shipped:
+    // - wdio-webdriver powers the WebdriverIO regression suite (npm run test:e2e)
+    // - webdriver-automation powers tauri-wd + the MCP agent bridge
+    #[cfg(debug_assertions)]
+    let builder = builder
+        .plugin(tauri_plugin_wdio_webdriver::init())
+        .plugin(tauri_plugin_webdriver_automation::init());
+    builder
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             if let Err(error) = setup_tray(app.handle()) {
