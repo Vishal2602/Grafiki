@@ -2356,12 +2356,14 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 
     let status_item = MenuItem::with_id(app, "status", "Not capturing", false, None::<&str>)?;
     let review_item = MenuItem::with_id(app, "review", "Review: up to date", true, None::<&str>)?;
+    let ask_item = MenuItem::with_id(app, "ask", "Ask your memory…", true, None::<&str>)?;
     let open_item = MenuItem::with_id(app, "open", "Open Grafiki", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit Grafiki", true, None::<&str>)?;
     let menu = MenuBuilder::new(app)
         .item(&status_item)
         .separator()
         .item(&review_item)
+        .item(&ask_item)
         .item(&open_item)
         .separator()
         .item(&quit_item)
@@ -2369,9 +2371,8 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 
     let tray = TrayIconBuilder::with_id("grafiki-tray")
         .icon(
-            app.default_window_icon()
-                .cloned()
-                .expect("bundled window icon"),
+            tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))
+                .expect("bundled tray glyph"),
         )
         .icon_as_template(true)
         .menu(&menu)
@@ -2389,6 +2390,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             match event.id().as_ref() {
                 "open" => show(None),
                 "review" => show(Some("candidates")),
+                "ask" => show(Some("chat")),
                 "quit" => app.exit(0),
                 _ => {}
             }

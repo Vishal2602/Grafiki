@@ -1082,6 +1082,29 @@ function agentLabel(sourceApp: string | null | undefined): string {
   return sourceApp || "session";
 }
 
+/// Serif stat numbers count up on arrival — the one Wispr-ism the stats keep.
+function useCountUp(target: number | undefined): number | undefined {
+  const [value, setValue] = useState(0);
+  useEffect(() => {
+    if (target === undefined) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setValue(target);
+      return;
+    }
+    const start = performance.now();
+    const duration = 450;
+    let frame = 0;
+    const tick = (now: number) => {
+      const progress = Math.min(1, (now - start) / duration);
+      setValue(Math.round(target * (1 - Math.pow(1 - progress, 3))));
+      if (progress < 1) frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [target]);
+  return target === undefined ? undefined : value;
+}
+
 function HomePane(props: {
   snapshot: ProjectSnapshot | null;
   projectRoot: string;
@@ -1133,15 +1156,15 @@ function HomePane(props: {
 
         <div className="stat-strip">
           <div className="stat-card">
-            <b>{ledger?.sessions_week ?? "–"}</b>
+            <b>{useCountUp(ledger?.sessions_week) ?? "–"}</b>
             <span>sessions this week</span>
           </div>
           <div className="stat-card">
-            <b>{ledger?.memories_week ?? "–"}</b>
+            <b>{useCountUp(ledger?.memories_week) ?? "–"}</b>
             <span>memories this week</span>
           </div>
           <div className="stat-card">
-            <b>{ledger?.pending_candidates ?? "–"}</b>
+            <b>{useCountUp(ledger?.pending_candidates) ?? "–"}</b>
             <span>waiting for review</span>
           </div>
         </div>
