@@ -78,6 +78,19 @@ tauri-wd --port 4444 &        # the W3C bridge (installed via cargo)
 
 (Early-stage project — treat as experimental alongside layers 1–2.)
 
+Lessons from the first real QA campaign (2026-07-02, 4 runs / 24 checks):
+
+- `type_text` keystrokes never reach xterm's hidden `.xterm-helper-textarea`
+  (embedded-driver limitation). To exercise the PTY, invoke the app's own IPC
+  from in-page JS instead — `withGlobalTauri` is on in debug builds:
+  `window.__TAURI__.core.invoke('terminal_write', {id, data: 'echo hi\r'})`.
+  The live session id is in `~/.grafiki/terminal_sessions.json` (newest
+  `updated_at`). Output streams into `.xterm-rows` in <0.5 s.
+- `execute_script` does not await promises; stash results on `window.__qa`
+  and read them with a second call.
+- The app restores its persisted pane and auto-attaches resumable sessions on
+  launch, so never assume a fresh run lands on Home or an empty launcher.
+
 ## Which layer when
 
 | Question | Layer |
