@@ -781,7 +781,27 @@ fn strip_ansi(bytes: &[u8]) -> String {
                     _ => i += 1, // other 2-byte escape
                 }
             }
-            b'\r' => i += 1, // drop CR, keep LF
+            b'\r' if bytes.get(i + 1) == Some(&b'\n') => {
+                // CRLF pair — an ordinary line ending (many programs emit
+                // this), not an in-place redraw. Drop the CR; the LF is
+                // handled normally on the next iteration.
+                i += 1;
+            }
+            b'\r' => {
+                // A BARE CR (no following LF) means "return to column 0" — a
+                // real terminal then overwrites the line in place (spinners,
+                // progress/status lines all redraw this way). Naively
+                // dropping it instead glued every redraw frame together into
+                // unreadable, word-glued text (2026-07-04: "the text is not
+                // formatted" — reproduced verbatim on the Home live-session
+                // preview). Truncate back to the start of the current line so
+                // only the FINAL redraw survives, matching what's on screen.
+                i += 1;
+                match out.rfind('\n') {
+                    Some(last_newline) => out.truncate(last_newline + 1),
+                    None => out.clear(),
+                }
+            }
             _ => {
                 let start = i;
                 while i < bytes.len() && bytes[i] != 0x1b && bytes[i] != b'\r' {
@@ -807,6 +827,27 @@ mod tests {
         assert!(out.contains("ok"));
         assert!(!out.contains('\x1b'));
         assert!(!out.contains('\r'));
+    }
+
+    #[test]
+    fn bare_cr_redraw_keeps_only_the_final_frame() {
+        // A spinner/status line redrawing itself in place via bare CR (no
+        // following LF) — e.g. Claude Code's own status footer. The OLD
+        // behavior dropped the CR and glued every frame together into
+        // unreadable text (2026-07-04 bug, reproduced verbatim on Grafiki's
+        // own Home live-session preview: "Fable5withusage|credits...").
+        let raw = b"spinner-frame-1\rspinner-frame-2\rFinal status line\n";
+        let out = strip_ansi(raw);
+        assert_eq!(out, "Final status line\n");
+    }
+
+    #[test]
+    fn bare_cr_redraw_only_erases_the_current_line() {
+        // A completed line stays intact; only the line CURRENTLY being
+        // redrawn (after the last real newline) gets truncated.
+        let raw = b"line one\nworking...\rdone\n";
+        let out = strip_ansi(raw);
+        assert_eq!(out, "line one\ndone\n");
     }
 
     #[test]

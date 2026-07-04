@@ -732,6 +732,11 @@ textarea {
 .candidate-card:hover {
   background: rgba(27, 26, 23, 0.025);
 }
+.candidate-body-collapsed {
+  color: var(--ink-2);
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
 .candidate-card.focused {
   background: var(--accent-soft);
   border-left-color: var(--accent-live);
@@ -871,7 +876,7 @@ textarea {
 }
 .capture-source-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
   gap: 6px;
 }
 .capture-toggle {
@@ -888,13 +893,46 @@ textarea {
   accent-color: var(--accent);
 }
 .capture-config-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 12px;
   color: var(--ink-2);
 }
-.capture-blocked-list {
+.capture-config-summary code {
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+  background: var(--sheet);
+  border: 1px solid var(--hairline);
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+/* A field's label sits above its control, never crushed against it — the
+   same stacked pattern the candidate edit form already uses. */
+.field-label {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
+  font-size: 12.5px;
+}
+.field-label input,
+.field-label select {
+  width: 100%;
+}
+/* A wrapping row of small, content-width chips — NOT a flex column, whose
+   default stretch was silently forcing every blocked-path entry to full
+   container width (the "identical stretched pills" look). Reuses the same
+   chip visual as .evidence-chip elsewhere for consistency. */
+.capture-blocked-list {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.capture-blocked-list .evidence-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
 }
 .daemon-status {
   display: inline-flex;

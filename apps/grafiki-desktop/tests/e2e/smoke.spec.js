@@ -107,8 +107,11 @@ async function landOnHome() {
 describe("Grafiki desktop", () => {
   it("boots to the Home ledger", async () => {
     await landOnHome();
+    // "Today" only when a real today-group of sessions exists; a fresh
+    // profile (this test's onboarding run) has none, so "Home" is correct
+    // (2026-07-04 fix — the title used to lie and always say "Today").
     const title = await q.text(".home-title");
-    if (title !== "Today") throw new Error(`home title was ${title}`);
+    if (title !== "Today" && title !== "Home") throw new Error(`home title was ${title}`);
     const cards = await q.count(".stat-card");
     if (cards !== 3) throw new Error(`expected 3 stat cards, got ${cards}`);
     if (!(await q.exists(".ask-bar-wrap input"))) {

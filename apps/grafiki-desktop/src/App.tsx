@@ -839,6 +839,37 @@ function renderLensText(text: string) {
   );
 }
 
+/// A wall of raw text (a git-log dump, a pasted file) collapses to a short
+/// preview with an expand control — the same calm-reading rule LensBubble
+/// applies to agent transcripts, here applied to review candidates so a raw
+/// import doesn't render at full, overwhelming length as if it were a
+/// finished memory (2026-07-04: "the text is not formatted").
+function CollapsibleBody({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const lines = text.split("\n");
+  const isWall = text.length > 400 || lines.length > 5;
+  const preview = lines.slice(0, 3).join("\n").slice(0, 400);
+  return (
+    <>
+      <p className={isWall && !expanded ? "candidate-body-collapsed" : undefined}>
+        {expanded || !isWall ? text : `${preview}…`}
+      </p>
+      {isWall ? (
+        <button
+          className="link-button"
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            setExpanded((current) => !current);
+          }}
+        >
+          {expanded ? "Show less" : "Show full text"}
+        </button>
+      ) : null}
+    </>
+  );
+}
+
 /// One conversation bubble. Long tool-output walls collapse to a preview with
 /// an expand control — the Granola calm rule applied to agent transcripts.
 function LensBubble(props: { role: string; text: string }) {
@@ -3005,7 +3036,7 @@ function CandidatesPane(props: {
                           </div>
                         ) : (
                           <>
-                            <p>{candidateBody(candidate)}</p>
+                            <CollapsibleBody text={candidateBody(candidate)} />
                             <div className="candidate-meta-row">
                               <span>{candidate.scope || "global"}</span>
                               <span>{candidate.source_type}</span>
@@ -3321,7 +3352,7 @@ function SettingsPane(props: {
 
       <section className="settings-grid">
         <div className="settings-editor">
-          <label>
+          <label className="field-label">
             <span>Project Folder</span>
             <input
               value={draftRoot}
@@ -3349,7 +3380,7 @@ function SettingsPane(props: {
         <div className="settings-editor">
           <div className="capture-config-summary">
             <span>{captureConfig?.config_path ?? "No capture config loaded"}</span>
-            <code>{captureConfig?.config.redaction_profile ?? "default"}</code>
+            <code title="Redaction profile">{captureConfig?.config.redaction_profile ?? "default"} redaction</code>
           </div>
           <div className="capture-source-grid">
             {captureSourceLabels.map(([source, label]) => (
@@ -3394,7 +3425,7 @@ function SettingsPane(props: {
               </select>
             </label>
           </div>
-          <label>
+          <label className="field-label">
             <span>Blocked Path</span>
             <input
               value={blockedPathDraft}
@@ -3423,6 +3454,7 @@ function SettingsPane(props: {
                 title="Remove blocked path"
               >
                 {path}
+                <X size={11} />
               </button>
             ))}
           </div>
