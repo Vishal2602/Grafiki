@@ -2,6 +2,15 @@
 
 ## Now
 
+- **GATE (do first): full end-to-end test of the current app** — user-driven pass over the
+  whole product (onboarding → sessions/terminal → capture → extraction → Review →
+  Memory/chat → Settings/theme → tray), backed by the three-layer test stack
+  (`docs/TESTING.md`); log every friction point and bug before any new feature work.
+- **Code graph + injection + honest token benchmark — scoped and PARKED behind the gate
+  above** (`docs/CODE_GRAPH_PLAN.md`): Tier 1 = `grafiki map` budgeted digests,
+  session-start injection, tree-sitter TS/Py, `grafiki benchmark` on real transcripts.
+  Four open decisions listed in the plan doc await user confirmation; do not start until
+  the E2E gate passes and the user green-lights.
 - Evidence-linked memory.
 - Agent query audit logs.
 - Init imports for existing agent memory files.
