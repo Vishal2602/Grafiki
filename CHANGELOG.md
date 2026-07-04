@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+### don-norman-design-critic UX fixes (Jul 4)
+Fixed the top-3 issues and all five first-week friction hypotheses (H1–H5) from a
+full-product UX critique, then fixed three real data-integrity bugs an adversarial
+review found in the fix itself.
+
+- **H1 — silent pipeline failures.** Home now names the first broken link in the
+  capture→extraction chain (not initialized / consent off / no local model) instead
+  of just staying quietly empty.
+- **H2 — dishonest capture copy.** The session launcher no longer unconditionally
+  claims "captured automatically" when consent is off; the Home live card shows
+  the real reason capture is off instead of a bare `false`.
+- **H3 — Review's error asymmetry.** Approve now has a 10-second Undo; a rejected
+  candidate can be reopened; single reject is instant (no modal) with an opt-in
+  "Reject with a note" for anyone who wants to record why.
+- **H4 — scope filter confusion.** The Scope filter is a dropdown of known scopes,
+  not free text; a hint appears when other-scope pendings are hidden.
+- **H5 — machine internals in the edit form.** Editing a candidate is now a Title +
+  Content form (label adapts per record type) with the raw JSON moved behind an
+  "Advanced" disclosure; the confidence number input is gone.
+- Home ledger rows show the actual memory titles a session produced instead of a
+  raw "N captured events" count; the "Today" header no longer lies when the newest
+  activity was yesterday or older.
+- Settings' Capture Consent panel only lists sources that are actually wired
+  (Git/Transcripts/Terminal/Files) — five checkboxes that wrote to config but
+  gated nothing (ide/screen/browser/audio/system) are gone.
+- The Review empty state has an "Extract now" action instead of being a dead end.
+- The chat lens surfaces a banner when the agent is waiting on a permission
+  decision — previously the last chat bubble looked like a finished turn while
+  the terminal underneath was actually stuck.
+
+**Adversarial review then found three real bugs in the undo/edit-form fixes
+above, all fixed before shipping:**
+- `revert_candidate_approval` (undo) could hard-delete an entity shared with a
+  different, already-approved candidate's observation — entities are upserted by
+  name across approvals, so undoing one candidate's entity approval cascaded away
+  unrelated trusted memory. Undo now refuses when the entity has other
+  observations/relations attached, rather than silently corrupting them.
+- The same function had no concurrency guard (unlike `approve_candidate`, which
+  was hardened for exactly this in the Jul 2 audit) and could wedge a candidate
+  permanently if its trusted record had been deleted independently (e.g. via
+  Browse). It now claims atomically before deleting, and a missing trusted
+  record is treated as already-undone rather than a fatal error.
+- The new edit form always wrote entity/state edits to a `content` key, but
+  approval reads `observe`/`details` first for those types if present — so
+  editing an entity or state candidate's body could be silently discarded at
+  approval time. The form now resolves to whichever key approval will actually
+  read, per record type — reproduced end-to-end against a real candidate and
+  confirmed fixed (edited value survives approval into trusted memory).
+- Known limitation (documented, not fixed): undoing an approval that superseded
+  an older decision/observation does not restore the older record's prior
+  status — full bitemporal restore is future work.
+
 ### Terminal & the Granola loop (Jul 1)
 - Hosted terminal sessions survive tab switches (detached PTY pool with scrollback reattach) and full app relaunches (disk descriptors + replayed tail + `claude --continue`).
 - Fixed all four auto-capture breaks: chunked HTTP decoding for Ollama responses, retry-safe extraction cursor (schema v5 `capture_cursors` — a failed model call no longer consumes the session), installed-model detection with a helpful missing-model error, and desktop-driven extraction of hosted-terminal output into Review.

@@ -568,6 +568,22 @@ pub struct RejectCandidateOptions {
     pub rationale: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RevertApprovalOptions {
+    pub project_name: Option<String>,
+    pub start_dir: PathBuf,
+    pub grafiki_home: Option<PathBuf>,
+    pub id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReopenCandidateOptions {
+    pub project_name: Option<String>,
+    pub start_dir: PathBuf,
+    pub grafiki_home: Option<PathBuf>,
+    pub id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceLink {
     pub id: String,
@@ -4044,6 +4060,197 @@ pub fn approve_candidate(options: ApproveCandidateOptions) -> Result<CandidateMu
     })
 }
 
+/// Undo a wrong approve: delete the trusted record it created and return the
+/// candidate to `pending`. Audit finding (2026-07-04, don-norman-design-critic):
+/// approve was the highest-blast-radius action in the review queue (it briefs
+/// future agent sessions) yet had no way back. This is that way back — meant to
+/// be called from a short-lived "Undo" affordance right after approval, not as
+/// a general-purpose retraction long after the fact (the trusted record may by
+/// then have been read, cited, or superseded by other memory).
+///
+/// KNOWN LIMITATION (2026-07-04 adversarial review): if the approval this
+/// undoes had `supersedes` set (a decision/observation candidate explicitly
+/// superseding an older one — not something the LLM extractor currently
+/// produces), reverting deletes the new record but does NOT restore the OLD
+/// record's prior status/`valid_to` — it stays `superseded`/invalidated. Full
+/// bitemporal restore is real future work, not done here.
+pub fn revert_candidate_approval(
+    options: RevertApprovalOptions,
+) -> Result<CandidateMutationReport> {
+    let (_project, connection) = resolve_and_open(
+        options.project_name.clone(),
+        options.start_dir.clone(),
+        options.grafiki_home.clone(),
+    )?;
+    let candidate = load_extraction_candidate(&connection, &options.id)?;
+    if candidate.status != "approved" {
+        return Err(GrafikiError::InvalidCandidate(format!(
+            "candidate {} is {}, not approved — nothing to undo",
+            candidate.id, candidate.status
+        )));
+    }
+    let (Some(trusted_record_type), Some(trusted_record_id)) = (
+        candidate.trusted_record_type.clone(),
+        candidate.trusted_record_id.clone(),
+    ) else {
+        return Err(GrafikiError::InvalidCandidate(format!(
+            "candidate {} is approved but has no trusted record to undo",
+            candidate.id
+        )));
+    };
+
+    // Entities are upserted by (name, scope) across approvals (`save_entity`),
+    // so a DIFFERENT, already-approved candidate's observation/relation can
+    // point at this SAME entity row. Deleting it would cascade away someone
+    // else's trusted memory (observations/relations are `ON DELETE CASCADE`).
+    // Refuse rather than silently corrupt shared data (2026-07-04 adversarial
+    // review finding) — the reviewer can retire the specific fact from Browse.
+    if trusted_record_type == "entity" {
+        let (observations, relations): (i64, i64) = connection.query_row(
+            "
+            SELECT
+                (SELECT COUNT(*) FROM observations WHERE entity_id = ?1),
+                (SELECT COUNT(*) FROM relations WHERE from_entity = ?1 OR to_entity = ?1)
+            ",
+            params![&trusted_record_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if observations > 0 || relations > 0 {
+            return Err(GrafikiError::InvalidCandidate(format!(
+                "candidate {} approved an entity that other memory now depends on \
+                 ({observations} observation(s), {relations} relation(s)) — undo isn't \
+                 safe here; retire the specific fact from Browse instead",
+                options.id
+            )));
+        }
+    }
+
+    // CLAIM by reverting status FIRST, guarded on still being 'approved'. SQLite
+    // serializes this UPDATE, so exactly one of two racing Undo calls succeeds
+    // (mirrors approve_candidate's claim pattern — same prior audit finding,
+    // same fix shape). Reordering this ahead of the trusted-record delete also
+    // means a record that's already gone (deleted independently via Browse)
+    // can no longer wedge the candidate forever: once this succeeds the
+    // candidate IS correctly reverted, and cleaning up the underlying record
+    // below is best-effort.
+    let claimed = connection.execute(
+        "
+        UPDATE extraction_candidates
+        SET status = 'pending',
+            trusted_record_type = NULL,
+            trusted_record_id = NULL,
+            reviewed_at = NULL
+        WHERE id = ?1 AND status = 'approved'
+        ",
+        params![&options.id],
+    )?;
+    if claimed == 0 {
+        let candidate = load_extraction_candidate(&connection, &options.id)?;
+        return Err(GrafikiError::InvalidCandidate(format!(
+            "candidate {} was reviewed concurrently; now {}",
+            options.id, candidate.status
+        )));
+    }
+    // Un-promote evidence back to candidate-only (mirrors promote_candidate_evidence).
+    connection.execute(
+        "
+        UPDATE evidence_links
+        SET trusted_record_type = NULL, trusted_record_id = NULL
+        WHERE candidate_id = ?1
+        ",
+        params![&options.id],
+    )?;
+    drop(connection);
+
+    // Best-effort delete of the underlying trusted record. The candidate is
+    // ALREADY correctly reverted above regardless of what happens here — an
+    // error deleting a record that's independently gone (or any other delete
+    // failure) must not re-wedge a candidate that just got successfully
+    // un-stuck. A stray leftover trusted record is a far smaller problem than
+    // the permanent-wedge bug this replaces.
+    let _ = match trusted_record_type.as_str() {
+        "entity" => delete_entity(DeleteEntityOptions {
+            project_name: options.project_name.clone(),
+            start_dir: options.start_dir.clone(),
+            grafiki_home: options.grafiki_home.clone(),
+            id: trusted_record_id.clone(),
+        })
+        .map(|_| ()),
+        "observation" => delete_observation(DeleteObservationOptions {
+            project_name: options.project_name.clone(),
+            start_dir: options.start_dir.clone(),
+            grafiki_home: options.grafiki_home.clone(),
+            id: trusted_record_id.clone(),
+        })
+        .map(|_| ()),
+        "decision" => delete_decision(DeleteDecisionOptions {
+            project_name: options.project_name.clone(),
+            start_dir: options.start_dir.clone(),
+            grafiki_home: options.grafiki_home.clone(),
+            id: trusted_record_id.clone(),
+        })
+        .map(|_| ()),
+        "context" => delete_context(DeleteContextOptions {
+            project_name: options.project_name.clone(),
+            start_dir: options.start_dir.clone(),
+            grafiki_home: options.grafiki_home.clone(),
+            key: trusted_record_id.clone(),
+        })
+        .map(|_| ()),
+        "state" => delete_state(DeleteStateOptions {
+            project_name: options.project_name.clone(),
+            start_dir: options.start_dir.clone(),
+            grafiki_home: options.grafiki_home.clone(),
+            key: trusted_record_id.clone(),
+        })
+        .map(|_| ()),
+        other => Err(GrafikiError::InvalidRecordType(other.to_owned())),
+    };
+
+    let (_project, connection) = resolve_and_open(
+        options.project_name,
+        options.start_dir,
+        options.grafiki_home,
+    )?;
+    let candidate = load_extraction_candidate(&connection, &options.id)?;
+    Ok(CandidateMutationReport {
+        candidate,
+        message: "Approval undone — candidate returned to review.".to_owned(),
+    })
+}
+
+/// Return a rejected candidate to `pending` so it can be reconsidered. Audit
+/// finding: reject was the only terminal, unrecoverable action in the queue
+/// (every button disables once `status != "pending"`) — a wrong reject had no
+/// way back at all.
+pub fn reopen_candidate(options: ReopenCandidateOptions) -> Result<CandidateMutationReport> {
+    let (_project, connection) = resolve_and_open(
+        options.project_name,
+        options.start_dir,
+        options.grafiki_home,
+    )?;
+    let candidate = load_extraction_candidate(&connection, &options.id)?;
+    if candidate.status != "rejected" {
+        return Err(GrafikiError::InvalidCandidate(format!(
+            "candidate {} is {}, not rejected — nothing to reopen",
+            candidate.id, candidate.status
+        )));
+    }
+    connection.execute(
+        "
+        UPDATE extraction_candidates
+        SET status = 'pending', reviewed_at = NULL
+        WHERE id = ?1 AND status = 'rejected'
+        ",
+        params![&options.id],
+    )?;
+    let candidate = load_extraction_candidate(&connection, &options.id)?;
+    Ok(CandidateMutationReport {
+        candidate,
+        message: "Candidate reopened for review.".to_owned(),
+    })
+}
+
 pub fn edit_candidate(options: EditCandidateOptions) -> Result<CandidateMutationReport> {
     let (_project, connection) = resolve_and_open(
         options.project_name,
@@ -4574,6 +4781,11 @@ pub struct LedgerSessionItem {
     pub event_count: i64,
     /// Distinct candidates whose evidence points into this session.
     pub memory_count: i64,
+    /// Up to 2 most-recent memory titles this session produced (newest first).
+    /// Lets the Home ledger say what was LEARNED, not just how many raw events
+    /// were captured (2026-07-04 don-norman-design-critic finding).
+    #[serde(default)]
+    pub recent_memory_titles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4588,6 +4800,38 @@ pub struct CaptureLedgerReport {
 
 /// The session ledger that Home renders: recent NON-EMPTY capture sessions with
 /// their extraction yield, plus review-queue and this-week counters. Read-only.
+/// Up to `limit` most-recent memory titles produced by one capture session
+/// (newest first), via the same evidence_links -> capture_events join
+/// `capture_session_detail` uses to scope memories to a session. Untitled
+/// candidates (empty '$.title') are dropped, mirroring `pending_titles` below.
+fn session_recent_memory_titles(
+    connection: &Connection,
+    capture_id: &str,
+    limit: i64,
+) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "
+        SELECT COALESCE(json_extract(payload, '$.title'), '')
+        FROM extraction_candidates
+        WHERE id IN (
+            SELECT el.candidate_id
+            FROM evidence_links el
+            JOIN capture_events ce ON ce.id = el.source_event_id
+            WHERE ce.capture_session = ?1
+        )
+        ORDER BY created_at DESC
+        LIMIT ?2
+        ",
+    )?;
+    let titles = collect_rows(
+        statement.query_map(params![capture_id, limit], |row| row.get::<_, String>(0))?,
+    )?
+    .into_iter()
+    .filter(|title| !title.trim().is_empty())
+    .collect();
+    Ok(titles)
+}
+
 pub fn capture_ledger(options: CaptureLedgerOptions) -> Result<CaptureLedgerReport> {
     let (project, connection) = resolve_and_open(
         options.project_name,
@@ -4614,17 +4858,22 @@ pub fn capture_ledger(options: CaptureLedgerOptions) -> Result<CaptureLedgerRepo
         LIMIT ?2
         ",
     )?;
-    let sessions = collect_rows(statement.query_map(params![project.project, limit], |row| {
-        Ok(LedgerSessionItem {
-            id: row.get(0)?,
-            source_app: row.get(1)?,
-            status: row.get(2)?,
-            started_at: row.get(3)?,
-            ended_at: row.get(4)?,
-            event_count: row.get(5)?,
-            memory_count: row.get(6)?,
-        })
-    })?)?;
+    let mut sessions =
+        collect_rows(statement.query_map(params![project.project, limit], |row| {
+            Ok(LedgerSessionItem {
+                id: row.get(0)?,
+                source_app: row.get(1)?,
+                status: row.get(2)?,
+                started_at: row.get(3)?,
+                ended_at: row.get(4)?,
+                event_count: row.get(5)?,
+                memory_count: row.get(6)?,
+                recent_memory_titles: Vec::new(),
+            })
+        })?)?;
+    for session in &mut sessions {
+        session.recent_memory_titles = session_recent_memory_titles(&connection, &session.id, 2)?;
+    }
 
     let pending_candidates: i64 = connection.query_row(
         "SELECT COUNT(*) FROM extraction_candidates WHERE status = 'pending'",
@@ -4730,6 +4979,9 @@ pub fn capture_session_detail(
                 ended_at: row.get(4)?,
                 event_count: row.get(5)?,
                 memory_count: row.get(6)?,
+                // The detail view returns full ExtractionCandidate rows below
+                // (with real titles) — no need to duplicate them here.
+                recent_memory_titles: Vec::new(),
             })
         },
     )?;
@@ -10229,26 +10481,27 @@ mod tests {
     use crate::session::{start_session, StartSessionOptions};
 
     use super::{
-        add_context, approve_candidate, ask_memory, bulk_review_candidates, chat, delete_context,
-        delete_decision, delete_entity, delete_observation, delete_relation, delete_state,
-        edit_candidate, end_session, export_memory, extract_capture_memory, generate_report,
-        get_context, get_embedding_status, get_graph, get_status, handoff_session,
+        add_context, approve_candidate, ask_memory, bulk_review_candidates, capture_ledger, chat,
+        delete_context, delete_decision, delete_entity, delete_observation, delete_relation,
+        delete_state, edit_candidate, end_session, export_memory, extract_capture_memory,
+        generate_report, get_context, get_embedding_status, get_graph, get_status, handoff_session,
         hybrid_search_results, import_memory, ingest_capture_event, list_candidates,
         list_capture_events, list_context, list_decisions, list_events, list_observations,
         list_relations, list_sessions, list_state, log_decision, pending_embedding_count,
-        process_embedding_jobs, propose_candidate, reject_candidate, resolve_and_open,
-        run_capture_watch, save_entity, search_memory, start_capture_session, update_context,
-        update_decision, update_entity, update_observation, update_relation, update_session,
-        upsert_state, AddContextOptions, ApproveCandidateOptions, AskMemoryOptions,
-        BulkCandidateReviewOptions, CandidateOrder, ChatOptions, ContextListOptions,
-        DecisionListOptions, DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions,
-        DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions,
-        EmbeddingStatusOptions, EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions,
-        ExtractCaptureOptions, ExtractionCandidate, GetContextOptions, GraphOptions,
-        HandoffOptions, ImportOptions, IngestCaptureEventOptions, ListCandidatesOptions,
-        ListCaptureEventsOptions, LogDecisionOptions, ObservationListOptions,
-        ProcessEmbeddingsOptions, ProjectReportOptions, ProposeCandidateOptions,
-        RejectCandidateOptions, RelationListOptions, RunCaptureWatchOptions, SaveEntityOptions,
+        process_embedding_jobs, propose_candidate, reject_candidate, reopen_candidate,
+        resolve_and_open, revert_candidate_approval, run_capture_watch, save_entity, search_memory,
+        start_capture_session, update_context, update_decision, update_entity, update_observation,
+        update_relation, update_session, upsert_state, AddContextOptions, ApproveCandidateOptions,
+        AskMemoryOptions, BulkCandidateReviewOptions, CandidateOrder, CaptureLedgerOptions,
+        ChatOptions, ContextListOptions, DecisionListOptions, DeleteContextOptions,
+        DeleteDecisionOptions, DeleteEntityOptions, DeleteObservationOptions,
+        DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions, EmbeddingStatusOptions,
+        EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions, ExtractCaptureOptions,
+        ExtractionCandidate, GetContextOptions, GraphOptions, HandoffOptions, ImportOptions,
+        IngestCaptureEventOptions, ListCandidatesOptions, ListCaptureEventsOptions,
+        LogDecisionOptions, ObservationListOptions, ProcessEmbeddingsOptions, ProjectReportOptions,
+        ProposeCandidateOptions, RejectCandidateOptions, RelationListOptions,
+        ReopenCandidateOptions, RevertApprovalOptions, RunCaptureWatchOptions, SaveEntityOptions,
         SearchMemoryOptions, SearchMode, SearchReport, SearchResult, SessionLogOptions,
         StartCaptureOptions, StateListOptions, StatusOptions, UpdateContextOptions,
         UpdateDecisionOptions, UpdateEntityOptions, UpdateObservationOptions,
@@ -11880,6 +12133,364 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|c| c.source_type == "capture:llm" && c.record_type == "decision"));
+    }
+
+    #[test]
+    fn revert_candidate_approval_refuses_when_entity_is_shared() {
+        // 2026-07-04 adversarial review finding: entities are upserted by
+        // (name, scope) across approvals — a DIFFERENT candidate's already-
+        // approved observation can point at the SAME entity row. Undoing the
+        // first candidate's entity approval must NOT cascade-delete the
+        // second candidate's unrelated, already-trusted observation.
+        let (_temp, home, project_dir) = setup_project();
+
+        let entity_candidate = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:llm".to_owned(),
+            source: None,
+            record_type: "entity".to_owned(),
+            payload: serde_json::json!({ "name": "SharedThing", "entity_type": "concept" }),
+            scope: String::new(),
+            confidence: 0.6,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+        let entity_id = approve_candidate(ApproveCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: entity_candidate.candidate.id.clone(),
+        })
+        .unwrap()
+        .candidate
+        .trusted_record_id
+        .unwrap();
+
+        let observation_candidate = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:llm".to_owned(),
+            source: None,
+            record_type: "observation".to_owned(),
+            payload: serde_json::json!({
+                "entity_name": "SharedThing",
+                "content": "an unrelated fact from a different session"
+            }),
+            scope: String::new(),
+            confidence: 0.6,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+        approve_candidate(ApproveCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: observation_candidate.candidate.id.clone(),
+        })
+        .unwrap();
+
+        let result = revert_candidate_approval(RevertApprovalOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: entity_candidate.candidate.id.clone(),
+        });
+        assert!(
+            result.is_err(),
+            "revert must refuse when the entity has other approved memory attached"
+        );
+
+        // Nothing was touched: the entity candidate is still approved, the
+        // observation candidate is still approved, and the observation itself
+        // (and its entity) still exist untouched.
+        let entity_candidate_after = list_candidates(ListCandidatesOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            status: Some("approved".to_owned()),
+            scope: String::new(),
+            limit: 50,
+            order: CandidateOrder::Recent,
+        })
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == entity_candidate.candidate.id)
+        .unwrap();
+        assert_eq!(entity_candidate_after.status, "approved");
+        let observations = list_observations(ObservationListOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            scope: String::new(),
+            category: None,
+        })
+        .unwrap();
+        assert!(observations
+            .iter()
+            .any(|o| o.entity_id == entity_id && o.entity_name == "SharedThing"));
+    }
+
+    #[test]
+    fn revert_candidate_approval_recovers_when_trusted_record_already_deleted() {
+        // 2026-07-04 adversarial review finding: if the trusted record was
+        // already deleted independently (e.g. via Browse), revert must still
+        // succeed and return the candidate to pending — not wedge it forever
+        // behind a "record not found" error.
+        let (_temp, home, project_dir) = setup_project();
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:llm".to_owned(),
+            source: None,
+            record_type: "decision".to_owned(),
+            payload: serde_json::json!({ "title": "Doomed", "reasoning": "will be deleted early" }),
+            scope: String::new(),
+            confidence: 0.6,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+        let approved = approve_candidate(ApproveCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: proposed.candidate.id.clone(),
+        })
+        .unwrap();
+        let decision_id = approved.candidate.trusted_record_id.unwrap();
+
+        // Independently delete the trusted record, as if via Browse.
+        delete_decision(DeleteDecisionOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: decision_id,
+        })
+        .unwrap();
+
+        let reverted = revert_candidate_approval(RevertApprovalOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            id: proposed.candidate.id,
+        })
+        .unwrap();
+        assert_eq!(reverted.candidate.status, "pending");
+    }
+
+    #[test]
+    fn revert_approval_undoes_a_wrong_approve() {
+        // don-norman-design-critic finding: approve had no way back even though
+        // it's the highest-blast-radius action (creates trusted memory injected
+        // into future sessions). revert_candidate_approval is that way back.
+        let (_temp, home, project_dir) = setup_project();
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:llm".to_owned(),
+            source: None,
+            record_type: "decision".to_owned(),
+            payload: serde_json::json!({ "title": "Wrong call", "reasoning": "oops" }),
+            scope: String::new(),
+            confidence: 0.6,
+            rationale: None,
+            evidence: vec![EvidenceInput {
+                source_event_id: None,
+                source_type: "transcript".to_owned(),
+                source: None,
+                title: None,
+                excerpt: "oops".to_owned(),
+                uri: None,
+                byte_start: None,
+                byte_end: None,
+                line_start: None,
+                line_end: None,
+                captured_at: None,
+            }],
+        })
+        .unwrap();
+        let id = proposed.candidate.id;
+
+        let approved = approve_candidate(ApproveCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: id.clone(),
+        })
+        .unwrap();
+        let decision_id = approved.candidate.trusted_record_id.clone().unwrap();
+        assert_eq!(approved.candidate.status, "approved");
+
+        let reverted = revert_candidate_approval(RevertApprovalOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: id.clone(),
+        })
+        .unwrap();
+        assert_eq!(reverted.candidate.status, "pending");
+        assert!(reverted.candidate.trusted_record_type.is_none());
+        assert!(reverted.candidate.trusted_record_id.is_none());
+        assert!(reverted.candidate.evidence[0].trusted_record_type.is_none());
+
+        // The trusted decision itself is gone.
+        let decisions = list_decisions(DecisionListOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            scope: String::new(),
+            status: None,
+        })
+        .unwrap();
+        assert!(!decisions.iter().any(|d| d.id == decision_id));
+
+        // Reverting an already-pending (never approved) candidate is rejected.
+        let again = revert_candidate_approval(RevertApprovalOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            id,
+        });
+        assert!(again.is_err());
+    }
+
+    #[test]
+    fn reopen_candidate_undoes_a_wrong_reject() {
+        // don-norman-design-critic finding: reject was the only terminal action
+        // in the queue — every button disables once status != "pending". A wrong
+        // reject had no way back at all.
+        let (_temp, home, project_dir) = setup_project();
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:llm".to_owned(),
+            source: None,
+            record_type: "context".to_owned(),
+            payload: serde_json::json!({
+                "key": "reopen-test", "title": "Good note", "category": "reference",
+                "content": "keep this"
+            }),
+            scope: String::new(),
+            confidence: 0.6,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+        let id = proposed.candidate.id;
+
+        reject_candidate(RejectCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: id.clone(),
+            rationale: Some("clicked the wrong one".to_owned()),
+        })
+        .unwrap();
+
+        let reopened = reopen_candidate(ReopenCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: id.clone(),
+        })
+        .unwrap();
+        assert_eq!(reopened.candidate.status, "pending");
+
+        // Reopening a pending (never rejected) candidate is rejected.
+        let again = reopen_candidate(ReopenCandidateOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            id,
+        });
+        assert!(again.is_err());
+    }
+
+    #[test]
+    fn ledger_sessions_carry_recent_memory_titles() {
+        // don-norman-design-critic finding: Home rows said "N captured events"
+        // instead of what was actually LEARNED — the whole point of the product.
+        let (_temp, home, project_dir) = setup_project();
+        let scope = "example-project/core";
+
+        let capture = start_capture_session(StartCaptureOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            scope: scope.to_owned(),
+            source_app: Some("test".to_owned()),
+            consent_profile: None,
+            redaction_profile: None,
+        })
+        .unwrap();
+        let event = ingest_capture_event(IngestCaptureEventOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            capture_id: Some(capture.capture.id.clone()),
+            scope: scope.to_owned(),
+            source_type: "terminal".to_owned(),
+            source: None,
+            title: None,
+            text: Some("decided to pin the CI timezone".to_owned()),
+            payload: None,
+            metadata: None,
+            privacy_level: None,
+            redacted: false,
+            captured_at: None,
+        })
+        .unwrap();
+        propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:llm".to_owned(),
+            source: Some(capture.capture.id.clone()),
+            record_type: "decision".to_owned(),
+            payload: serde_json::json!({ "title": "Pin CI to UTC", "reasoning": "flaky tests" }),
+            scope: scope.to_owned(),
+            confidence: 0.6,
+            rationale: None,
+            evidence: vec![EvidenceInput {
+                source_event_id: Some(event.event.id.clone()),
+                source_type: "terminal".to_owned(),
+                source: None,
+                title: None,
+                excerpt: "decided to pin the CI timezone".to_owned(),
+                uri: None,
+                byte_start: None,
+                byte_end: None,
+                line_start: None,
+                line_end: None,
+                captured_at: None,
+            }],
+        })
+        .unwrap();
+
+        let ledger = capture_ledger(CaptureLedgerOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            limit: 20,
+        })
+        .unwrap();
+        let session = ledger
+            .sessions
+            .iter()
+            .find(|s| s.id == capture.capture.id)
+            .unwrap();
+        assert_eq!(
+            session.recent_memory_titles,
+            vec!["Pin CI to UTC".to_owned()]
+        );
     }
 
     #[test]

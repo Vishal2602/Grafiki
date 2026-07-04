@@ -9,6 +9,11 @@
   **Checklist seed: the five ranked friction hypotheses (H1–H5 + chat-lens bonus) in
   `docs/UX_CRITIQUE.md`** (2026-07-04 Norman-critic review: silent pipeline failures,
   Review's inverted error asymmetry, machine internals leaking into human surfaces).
+  **✅ H1–H5 + Top-3 all fixed same day** (CHANGELOG.md "don-norman-design-critic UX
+  fixes (Jul 4)"), adversarially reviewed, and three bugs the fix itself introduced
+  (entity-cascade corruption, revert race, silent edit-form data loss) also fixed.
+  The gate itself — a full user-driven E2E pass — is still open; these were
+  critique-sourced fixes, not a completed test run.
 - **Code graph + injection + honest token benchmark — scoped and PARKED behind the gate
   above** (`docs/CODE_GRAPH_PLAN.md`): Tier 1 = `grafiki map` budgeted digests,
   session-start injection, tree-sitter TS/Py, `grafiki benchmark` on real transcripts.

@@ -179,13 +179,21 @@ export interface HomeLedgerReport {
       ended_at: string | null;
       event_count: number;
       memory_count: number;
+      recent_memory_titles: string[];
     }>;
     pending_candidates: number;
     pending_titles: string[];
     sessions_week: number;
     memories_week: number;
   };
-  live: Array<{ id: string; launch: string; cwd: string; tail: string; capturing: boolean }>;
+  live: Array<{
+    id: string;
+    launch: string;
+    cwd: string;
+    tail: string;
+    capturing: boolean;
+    capture_hint: string | null;
+  }>;
   resumable: { id: string; launch: string; cwd: string; updated_at: number } | null;
 }
 
@@ -222,6 +230,7 @@ export async function getHomeLedger(input: { startDir?: string }): Promise<HomeL
             ended_at: new Date().toISOString(),
             event_count: 12,
             memory_count: 3,
+            recent_memory_titles: ["Pin CI timezone to UTC", "Thin LTO for release builds"],
           },
         ],
         pending_candidates: 2,
@@ -710,6 +719,49 @@ export async function rejectCandidate(input: {
       id: input.id,
       rationale: input.rationale ?? "",
     },
+  });
+}
+
+// Undo a wrong approve: deletes the trusted record and returns the candidate
+// to pending. Meant for a short-lived "Undo" affordance right after approval.
+export async function revertCandidateApproval(input: {
+  startDir?: string;
+  id: string;
+}): Promise<CandidateMutationResult> {
+  if (!hasTauri()) {
+    const candidate = mockCandidates.find((item) => item.id === input.id) ?? mockCandidates[0];
+    return {
+      candidate: {
+        ...candidate,
+        status: "pending",
+        trusted_record_type: null,
+        trusted_record_id: null,
+        reviewed_at: null,
+      },
+      message: "Approval undone — candidate returned to review.",
+    };
+  }
+
+  return invoke<CandidateMutationResult>("revert_memory_candidate_approval", {
+    request: { startDir: input.startDir ?? "", id: input.id },
+  });
+}
+
+// Return a rejected candidate to pending so it can be reconsidered.
+export async function reopenCandidate(input: {
+  startDir?: string;
+  id: string;
+}): Promise<CandidateMutationResult> {
+  if (!hasTauri()) {
+    const candidate = mockCandidates.find((item) => item.id === input.id) ?? mockCandidates[0];
+    return {
+      candidate: { ...candidate, status: "pending", reviewed_at: null },
+      message: "Candidate reopened for review.",
+    };
+  }
+
+  return invoke<CandidateMutationResult>("reopen_memory_candidate", {
+    request: { startDir: input.startDir ?? "", id: input.id },
   });
 }
 

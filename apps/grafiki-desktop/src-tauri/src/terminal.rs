@@ -111,6 +111,10 @@ pub struct LiveTerminalInfo {
     /// Last few non-empty output lines, ANSI-stripped (the Home card preview).
     pub tail: String,
     pub capturing: bool,
+    /// User-facing reason capture is off (`None` while capturing). Surfaced on
+    /// the Home live card so the off state isn't a bare, unexplained label
+    /// (2026-07-04 don-norman-design-critic finding).
+    pub capture_hint: Option<String>,
 }
 
 /// Snapshot every live session (for Home's live-session card).
@@ -137,6 +141,7 @@ pub fn live_sessions(registry: &TerminalRegistry) -> Vec<LiveTerminalInfo> {
                 cwd: session.project_root.clone(),
                 tail: keep.join("\n"),
                 capturing: session.capture_id.is_some(),
+                capture_hint: session.capture_hint.clone(),
             })
         })
         .collect()

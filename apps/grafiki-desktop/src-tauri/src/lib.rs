@@ -18,30 +18,31 @@ use grafiki_core::{
     list_agent_queries, list_candidates, list_capture_events, list_context, list_decisions,
     list_events, list_relations, list_sessions, list_state, load_capture_config, log_decision,
     process_embedding_jobs, propose_candidate, propose_capture_candidates, reject_candidate,
-    resolve_project, save_entity, search_memory, start_capture_session, start_session,
-    stop_capture_session, update_capture_config, update_context, update_decision, update_entity,
-    update_observation, update_relation, update_session, upsert_state, AddContextOptions,
-    AgentQueryLogItem, AgentTranscriptImportReport, ApproveCandidateOptions,
-    BulkCandidateReviewOptions, BulkCandidateReviewReport, CandidateMutationReport, CandidateOrder,
-    CaptureCandidateReport, CaptureConfigOptions, CaptureConfigReport, CaptureEvent,
-    CaptureEventReport, CaptureExtractReport, CaptureSessionReport, CaptureSourceUpdates,
-    CaptureStatusOptions, CaptureStatusReport, ChatOptions, ChatReply, ContextListOptions,
-    ContextSummary, DecisionItem, DecisionListOptions, DeleteContextOptions, DeleteDecisionOptions,
-    DeleteEntityOptions, DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions,
-    EditCandidateOptions, EmbeddingStatusOptions, EmbeddingStatusReport, EndSessionOptions,
-    EndSessionReport, EventListOptions, EvidenceInput, ExportBundle, ExportOptions,
-    ExtractCaptureOptions, ExtractionCandidate, GetContextOptions, GraphOptions, GraphRelation,
-    GraphReport, HandoffOptions, HandoffReport, ImportAgentTranscriptsOptions, ImportOptions,
-    ImportReport, IngestCaptureEventOptions, InitOptions, InitReport, ListAgentQueriesOptions,
+    reopen_candidate, resolve_project, revert_candidate_approval, save_entity, search_memory,
+    start_capture_session, start_session, stop_capture_session, update_capture_config,
+    update_context, update_decision, update_entity, update_observation, update_relation,
+    update_session, upsert_state, AddContextOptions, AgentQueryLogItem,
+    AgentTranscriptImportReport, ApproveCandidateOptions, BulkCandidateReviewOptions,
+    BulkCandidateReviewReport, CandidateMutationReport, CandidateOrder, CaptureCandidateReport,
+    CaptureConfigOptions, CaptureConfigReport, CaptureEvent, CaptureEventReport,
+    CaptureExtractReport, CaptureSessionReport, CaptureSourceUpdates, CaptureStatusOptions,
+    CaptureStatusReport, ChatOptions, ChatReply, ContextListOptions, ContextSummary, DecisionItem,
+    DecisionListOptions, DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions,
+    DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions,
+    EmbeddingStatusOptions, EmbeddingStatusReport, EndSessionOptions, EndSessionReport,
+    EventListOptions, EvidenceInput, ExportBundle, ExportOptions, ExtractCaptureOptions,
+    ExtractionCandidate, GetContextOptions, GraphOptions, GraphRelation, GraphReport,
+    HandoffOptions, HandoffReport, ImportAgentTranscriptsOptions, ImportOptions, ImportReport,
+    IngestCaptureEventOptions, InitOptions, InitReport, ListAgentQueriesOptions,
     ListCandidatesOptions, ListCaptureEventsOptions, LogDecisionOptions, OllamaProvider,
     ProcessEmbeddingsOptions, ProcessEmbeddingsReport, ProjectReport, ProjectReportOptions,
     ProjectResolveOptions, ProposeCandidateOptions, ProposeCaptureCandidatesOptions,
-    RejectCandidateOptions, RelationListOptions, SaveEntityOptions, SearchMemoryOptions,
-    SearchMode, SearchReport, SessionLogItem, SessionLogOptions, StartCaptureOptions,
-    StartSessionOptions, StartSessionReport, StateItem, StateListOptions, StatusOptions,
-    StatusReport, StopCaptureOptions, UpdateCaptureConfigOptions, UpdateDecisionOptions,
-    UpdateEntityOptions, UpdateObservationOptions, UpdateRelationOptions, UpdateSessionOptions,
-    UpsertStateOptions,
+    RejectCandidateOptions, RelationListOptions, ReopenCandidateOptions, RevertApprovalOptions,
+    SaveEntityOptions, SearchMemoryOptions, SearchMode, SearchReport, SessionLogItem,
+    SessionLogOptions, StartCaptureOptions, StartSessionOptions, StartSessionReport, StateItem,
+    StateListOptions, StatusOptions, StatusReport, StopCaptureOptions, UpdateCaptureConfigOptions,
+    UpdateDecisionOptions, UpdateEntityOptions, UpdateObservationOptions, UpdateRelationOptions,
+    UpdateSessionOptions, UpsertStateOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1372,6 +1373,37 @@ fn reject_memory_candidate(
     .map_err(|error| error.to_string())
 }
 
+/// Undo a wrong approve: deletes the trusted record it created and returns the
+/// candidate to review. Meant for a short-lived "Undo" affordance right after
+/// approval (2026-07-04 don-norman-design-critic: approve had no way back).
+#[tauri::command]
+fn revert_memory_candidate_approval(
+    request: CandidateReviewRequest,
+) -> Result<CandidateMutationReport, String> {
+    revert_candidate_approval(RevertApprovalOptions {
+        project_name: None,
+        start_dir: resolve_start_dir(request.start_dir),
+        grafiki_home: None,
+        id: required("Candidate id", &request.id)?,
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// Return a rejected candidate to pending so it can be reconsidered (reject was
+/// otherwise the only terminal, unrecoverable action in the review queue).
+#[tauri::command]
+fn reopen_memory_candidate(
+    request: CandidateReviewRequest,
+) -> Result<CandidateMutationReport, String> {
+    reopen_candidate(ReopenCandidateOptions {
+        project_name: None,
+        start_dir: resolve_start_dir(request.start_dir),
+        grafiki_home: None,
+        id: required("Candidate id", &request.id)?,
+    })
+    .map_err(|error| error.to_string())
+}
+
 #[tauri::command(async)]
 fn auto_capture_memory(request: AutoCaptureRequest) -> Result<AutoCaptureResponse, String> {
     let start_dir = resolve_start_dir(request.start_dir);
@@ -2504,6 +2536,8 @@ pub fn run() {
             edit_memory_candidate,
             bulk_review_memory_candidates,
             reject_memory_candidate,
+            revert_memory_candidate_approval,
+            reopen_memory_candidate,
             auto_capture_memory,
             start_automatic_capture,
             stop_automatic_capture,

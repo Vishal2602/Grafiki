@@ -62,6 +62,8 @@ import {
   startDaemon,
   stopDaemon,
   rejectCandidate,
+  reopenCandidate,
+  revertCandidateApproval,
   updateMemoryRecord,
   updateCaptureConfig,
   isPreviewMode,
@@ -137,6 +139,18 @@ const stateStatuses = ["planned", "in-progress", "blocked", "needs-review", "don
 const statePriorities = ["medium", "high", "critical", "low"];
 const decisionStatuses = ["active", "revisit", "superseded", "revoked"];
 const candidateStatuses = ["pending", "approved", "rejected", "all"];
+
+// Heuristic markers for "the agent is waiting on a permission/trust decision"
+// in raw terminal output — the JSONL transcript the chat lens tails never
+// records these TUI-only prompts, so without this the lens shows the last
+// normal bubble while the session is actually stuck (lowercase, substring).
+const PERMISSION_PROMPT_MARKERS = [
+  "do you want to proceed",
+  "do you trust the files",
+  "1. yes",
+  "2. no",
+  "enter to confirm",
+];
 const relationTypes = [
   "works_with",
   "depends_on",
@@ -771,6 +785,7 @@ function MemoryPane(props: {
             onSelectResult={props.onSelectResult}
             onOpenResult={props.onOpenResult}
             onMemoryChanged={props.onMemoryChanged}
+            totalPendingCount={props.ledger?.ledger.pending_candidates ?? 0}
           />
         ) : null}
         {pane.kind === "settings" ? (
@@ -1123,6 +1138,41 @@ function HomePane(props: {
   const projectLabel =
     props.projectRoot || props.snapshot?.start_dir || "no project folder set";
 
+  // The truthful capture→extraction chain, first broken link named. Three
+  // independent gates (init, consent, local model) previously failed silently
+  // with the identical symptom — an empty Home — leaving a working user
+  // convinced the app was broken (2026-07-04 don-norman-design-critic, H1).
+  const [pipelineIssue, setPipelineIssue] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    if (!props.snapshot?.memory_available) {
+      setPipelineIssue("This folder isn't initialized — set it up in Settings to start remembering.");
+      return;
+    }
+    getCaptureConfig({ startDir: props.projectRoot })
+      .then((config) => {
+        if (cancelled) return;
+        if (!config.config.sources.terminal || config.config.terminal_output === "off") {
+          setPipelineIssue("Terminal capture is off — turn it on in Settings → Capture Consent.");
+          return;
+        }
+        return listLocalModels().then((models) => {
+          if (cancelled) return;
+          setPipelineIssue(
+            models.length === 0
+              ? "No local model installed — run `ollama pull gemma3:1b` to turn sessions into memory."
+              : null,
+          );
+        });
+      })
+      .catch(() => {
+        if (!cancelled) setPipelineIssue(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [props.projectRoot, props.snapshot?.memory_available]);
+
   const submitAsk = () => {
     const question = ask.trim();
     if (!question) return;
@@ -1148,15 +1198,19 @@ function HomePane(props: {
     if (group && group.day === day) group.items.push(session);
     else groups.push({ day, items: [session] });
   }
+  // "Today" only when a real today-group exists — otherwise it's a mapping
+  // falsehood on the hero element (2026-07-04 don-norman-design-critic).
+  const hasToday = groups.some((group) => group.day === "Today");
 
   return (
     <>
       <div className="home-view">
-        <h1 className="home-title">Today</h1>
+        <h1 className="home-title">{hasToday ? "Today" : "Home"}</h1>
         <p className="home-meta">
           {projectLabel}
           {props.snapshot?.memory_available ? " · memory online" : " · initialize in Settings"}
         </p>
+        {pipelineIssue ? <p className="home-pipeline-hint">{pipelineIssue}</p> : null}
 
         <div className="stat-strip">
           <div className="stat-card">
@@ -1183,7 +1237,8 @@ function HomePane(props: {
             <div className="term-preview">{live.tail || "…"}</div>
             <div className="live-bar">
               <span className="pulse-dot" />
-              {live.launch || "shell"} · {live.capturing ? "capturing" : "not capturing"} ·{" "}
+              {live.launch || "shell"} ·{" "}
+              {live.capturing ? "capturing" : `not capturing — ${live.capture_hint ?? "check Settings"}`} ·{" "}
               {live.cwd}
               <button
                 className="link-button open-link"
@@ -1238,6 +1293,11 @@ function HomePane(props: {
               Start a session below — work normally, and everything worth keeping comes back
               here as memory.
             </p>
+            {pipelineIssue ? (
+              <p className="home-pipeline-hint" style={{ maxWidth: 420 }}>
+                {pipelineIssue}
+              </p>
+            ) : null}
             <div className="agent-buttons">
               <button className="button primary" onClick={() => props.onNavigate("terminal")}>
                 Start a session
@@ -1265,7 +1325,18 @@ function HomePane(props: {
                       {agentLabel(session.source_app)}
                       {session.status === "active" ? " · in progress" : ""}
                     </b>
-                    <span>{session.event_count} captured events</span>
+                    {session.recent_memory_titles.length > 0 ? (
+                      <span>
+                        {session.recent_memory_titles.map((title, index) => (
+                          <span key={title}>
+                            {index > 0 ? " · " : ""}
+                            &ldquo;{title}&rdquo;
+                          </span>
+                        ))}
+                      </span>
+                    ) : (
+                      <span>{session.event_count} captured events</span>
+                    )}
                   </div>
                   {session.memory_count > 0 ? (
                     <span className="ledger-mem">
@@ -1339,6 +1410,13 @@ function TerminalPane(props: {
   // isn't an initialized Grafiki project, so nothing is being recorded).
   const [capturing, setCapturing] = useState<boolean | null>(null);
   const [captureHint, setCaptureHint] = useState<string | null>(null);
+  // Pre-launch consent check, so the launcher screen can tell the truth about
+  // whether this session will be captured instead of asserting it always is
+  // (2026-07-04 don-norman-design-critic: this copy was unconditionally false
+  // whenever consent was off or the folder wasn't initialized).
+  const [launcherCaptureConfig, setLauncherCaptureConfig] = useState<CaptureConfigReport | null>(
+    null,
+  );
   const containerRef = useRef<HTMLDivElement | null>(null);
   // Set when the launcher just created `session`, so the effect spawns instead
   // of attaching. A ref (not state): StrictMode remounts must attach, not respawn.
@@ -1348,7 +1426,10 @@ function TerminalPane(props: {
     setSession(loadTerminalSession(props.projectRoot));
     setError(null);
     setEnded(false);
-  }, [props.projectRoot]);
+    getCaptureConfig({ startDir: props.projectRoot || props.fallbackCwd })
+      .then(setLauncherCaptureConfig)
+      .catch(() => setLauncherCaptureConfig(null));
+  }, [props.projectRoot, props.fallbackCwd]);
 
   // Onboarding (or Home) can hand us an agent to launch immediately.
   useEffect(() => {
@@ -1396,8 +1477,16 @@ function TerminalPane(props: {
   const [composer, setComposer] = useState("");
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const chatCapable = session?.launch === "claude";
+  // Raw terminal tail (decoded, unbounded ANSI-included) so the chat lens can
+  // detect a permission prompt the JSONL transcript never records — otherwise
+  // the last rendered bubble looks like a normal finished turn while the agent
+  // is actually stuck waiting on a decision (2026-07-04 don-norman-design-critic
+  // bonus finding: the session "appears hung").
+  const termTailRef = useRef("");
+  const [pendingPrompt, setPendingPrompt] = useState(false);
   useEffect(() => {
     if (!session || lens !== "chat") {
+      setPendingPrompt(false);
       return;
     }
     let cancelled = false;
@@ -1408,7 +1497,11 @@ function TerminalPane(props: {
         })
         .catch(() => undefined);
     void load();
-    const timer = window.setInterval(() => void load(), 3000);
+    const timer = window.setInterval(() => {
+      void load();
+      const tail = termTailRef.current.toLowerCase();
+      setPendingPrompt(PERMISSION_PROMPT_MARKERS.some((marker) => tail.includes(marker)));
+    }, 3000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -1471,7 +1564,14 @@ function TerminalPane(props: {
     fit.fit();
 
     const channel = new Channel<number[]>();
-    channel.onmessage = (bytes) => term.write(new Uint8Array(bytes));
+    const tailDecoder = new TextDecoder("utf-8", { fatal: false });
+    channel.onmessage = (bytes) => {
+      const chunk = new Uint8Array(bytes);
+      term.write(chunk);
+      termTailRef.current = (termTailRef.current + tailDecoder.decode(chunk, { stream: true })).slice(
+        -4000,
+      );
+    };
 
     const resize = () => {
       try {
@@ -1658,6 +1758,10 @@ function TerminalPane(props: {
       { label: "Gemini", cmd: "gemini" },
       { label: "Shell", cmd: "" },
     ];
+    const willCapture =
+      launcherCaptureConfig !== null &&
+      launcherCaptureConfig.config.sources.terminal &&
+      launcherCaptureConfig.config.terminal_output !== "off";
     return (
       <div
         className="view-stack"
@@ -1666,8 +1770,10 @@ function TerminalPane(props: {
         <div>
           <h2 style={{ margin: 0 }}>Start a session</h2>
           <p className="muted" style={{ marginTop: 6, maxWidth: 460 }}>
-            It runs inside Grafiki, in <code>{props.projectRoot || props.fallbackCwd || "this project"}</code>. Work
-            normally — everything in this session is captured automatically, no setup.
+            It runs inside Grafiki, in <code>{props.projectRoot || props.fallbackCwd || "this project"}</code>.{" "}
+            {willCapture
+              ? "Work normally — this session is captured automatically, no setup."
+              : "Capture is off for this folder — nothing will be remembered. Turn it on in Settings → Capture Consent."}
           </p>
         </div>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
@@ -1734,6 +1840,15 @@ function TerminalPane(props: {
         />
         {lens === "chat" ? (
           <div className="chat-lens">
+            {pendingPrompt ? (
+              <div className="notice compact chat-lens-prompt-banner">
+                <AlertTriangle size={15} />
+                <span>Agent is waiting on a permission decision</span>
+                <button className="button" type="button" onClick={() => setLens("terminal")}>
+                  Switch to Terminal
+                </button>
+              </div>
+            ) : null}
             <div className="chat-lens-scroll" ref={chatScrollRef}>
               {turns.length === 0 ? (
                 <p className="muted" style={{ margin: "auto", textAlign: "center" }}>
@@ -2163,24 +2278,54 @@ function CandidatesPane(props: {
   onSelectResult: (result: SearchResult) => void;
   onOpenResult: (result: SearchResult) => void;
   onMemoryChanged: () => Promise<ProjectSnapshot>;
+  totalPendingCount: number;
 }) {
   const [candidates, setCandidates] = useState<ExtractionCandidate[]>([]);
   const [status, setStatus] = useState("pending");
   const [scope, setScope] = useState(props.snapshot?.scope ?? "");
   const [loading, setLoading] = useState(false);
+  const [extracting, setExtracting] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [focusedCandidateId, setFocusedCandidateId] = useState<string | null>(null);
   const [minConfidence, setMinConfidence] = useState("0");
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState("");
+  const [editContent, setEditContent] = useState("");
   const [editPayload, setEditPayload] = useState("");
   const [promptModal, setPromptModal] = useState<PromptConfig | null>(null);
   const [editScope, setEditScope] = useState("");
-  const [editConfidence, setEditConfidence] = useState("0.5");
   const [editRationale, setEditRationale] = useState("");
   const [evidencePreview, setEvidencePreview] = useState<EvidenceLink | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Undo affordance for approve — the highest-blast-radius action in the queue
+  // (it briefs future agent sessions) previously had no way back at all
+  // (2026-07-04 don-norman-design-critic, H3). Cleared after a short window.
+  const [undo, setUndo] = useState<{ ids: string[]; label: string } | null>(null);
+  const undoTimerRef = useRef<number | undefined>(undefined);
+  // Known scopes for the Scope filter + edit-form dropdowns, derived from a
+  // status:"all" / scope:"" fetch decoupled from the review-queue's own
+  // (narrower) fetch — free-text scope was a source of silent empty queues.
+  const [knownScopes, setKnownScopes] = useState<string[]>([]);
+  useEffect(() => {
+    listCandidates({ startDir: props.startDir, scope: "", status: "all", limit: 200 })
+      .then((all) => setKnownScopes(Array.from(new Set(all.map((c) => c.scope))).sort()))
+      .catch(() => undefined);
+  }, [props.startDir]);
+
+  function armUndo(ids: string[], label: string) {
+    window.clearTimeout(undoTimerRef.current);
+    setUndo({ ids, label });
+    undoTimerRef.current = window.setTimeout(() => setUndo(null), 10_000);
+  }
+  // Any action that isn't itself arming a NEW undo must retire a stale one —
+  // otherwise the Undo button lingers next to an unrelated later message.
+  function clearUndo() {
+    window.clearTimeout(undoTimerRef.current);
+    setUndo(null);
+  }
+  useEffect(() => () => window.clearTimeout(undoTimerRef.current), []);
 
   const parsedConfidence = Number.parseFloat(minConfidence);
   // Confidence is 0..1; clamp so a stray "9" can't silently hide everything.
@@ -2277,7 +2422,8 @@ function CandidatesPane(props: {
         if (!candidate) return;
         event.preventDefault();
         if (event.key === "a" && candidate.status === "pending") void approve(candidate);
-        if (event.key === "r" && candidate.status === "pending") void reject(candidate);
+        if (event.key === "r" && candidate.status === "pending") void performReject(candidate, "");
+        if (event.key === "r" && candidate.status === "rejected") void reopen(candidate);
         if (event.key === "e" && candidate.status === "pending") beginEdit(candidate);
         if (event.key === "o") openTrusted(candidate);
         if (event.key === "v") openEvidencePreview(candidate.evidence?.[0] ?? null);
@@ -2295,7 +2441,8 @@ function CandidatesPane(props: {
     setError(null);
     try {
       const result = await approveCandidate({ startDir: props.startDir, id: candidate.id });
-      setMessage(result.message);
+      setMessage(`Approved “${candidateTitle(candidate)}” — now briefs your agent.`);
+      armUndo([candidate.id], candidateTitle(candidate));
       const trustedResult = candidateToSearchResult(result.candidate);
       if (trustedResult) props.onSelectResult(trustedResult);
       await load();
@@ -2307,7 +2454,11 @@ function CandidatesPane(props: {
     }
   }
 
-  function reject(candidate: ExtractionCandidate) {
+  // Single reject is now INSTANT (no modal) — it was the far more expensive of
+  // the two review actions even though approve was the more dangerous one
+  // (2026-07-04 don-norman-design-critic, H3). "Reject with note" below is the
+  // opt-in slower path for anyone who wants to record why.
+  function rejectWithNote(candidate: ExtractionCandidate) {
     setPromptModal({
       title: "Reject candidate",
       submitLabel: "Reject",
@@ -2328,6 +2479,7 @@ function CandidatesPane(props: {
   }
 
   async function performReject(candidate: ExtractionCandidate, rationale: string) {
+    clearUndo();
     setBusyId(candidate.id);
     setMessage(null);
     setError(null);
@@ -2338,6 +2490,46 @@ function CandidatesPane(props: {
       await props.onMemoryChanged();
     } catch (rejectError) {
       setError(String(rejectError));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  // Reject was otherwise the only terminal, unrecoverable action in the queue
+  // (every button disables once status != "pending") — this is the way back.
+  async function reopen(candidate: ExtractionCandidate) {
+    clearUndo();
+    setBusyId(candidate.id);
+    setMessage(null);
+    setError(null);
+    try {
+      const result = await reopenCandidate({ startDir: props.startDir, id: candidate.id });
+      setMessage(result.message);
+      await load();
+    } catch (reopenError) {
+      setError(String(reopenError));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function performUndo() {
+    if (!undo) return;
+    window.clearTimeout(undoTimerRef.current);
+    const ids = undo.ids;
+    setUndo(null);
+    setBusyId("bulk");
+    setMessage(null);
+    setError(null);
+    try {
+      for (const id of ids) {
+        await revertCandidateApproval({ startDir: props.startDir, id });
+      }
+      setMessage(ids.length === 1 ? "Approval undone." : `${ids.length} approvals undone.`);
+      await load();
+      await props.onMemoryChanged();
+    } catch (undoError) {
+      setError(String(undoError));
     } finally {
       setBusyId(null);
     }
@@ -2363,14 +2555,62 @@ function CandidatesPane(props: {
     setSelectedIds(candidates.filter((candidate) => candidate.status === "pending").map((candidate) => candidate.id));
   }
 
+  // Which payload key holds the free-text body, per record type — mirrors
+  // `approve_candidate_payload`'s per-type field-PREFERENCE ORDER in
+  // crates/grafiki-core/src/memory.rs exactly. This must match precisely: an
+  // earlier version always wrote to "content", but approve reads
+  // ["observe","content"] for entity and ["details","content"] for state — so
+  // editing an entity/state candidate's body silently lost the edit at
+  // approval time, because the untouched, still-present preferred key won
+  // (2026-07-04 adversarial review finding — a real, reproduced data-loss bug
+  // this same audit fix introduced). Always resolve to whichever key already
+  // has a value so the edit lands on the key approval will actually read.
+  const CONTENT_KEY_PREFERENCE: Record<string, string[]> = {
+    decision: ["reasoning", "content"],
+    context: ["content", "body"],
+    entity: ["observe", "content"],
+    observation: ["content", "observe"],
+    state: ["details", "content"],
+  };
+  const CONTENT_KEY_LABELS: Record<string, string> = {
+    reasoning: "Reasoning",
+    details: "Details",
+    observe: "Observation",
+  };
+  function contentFieldKeyFor(candidate: ExtractionCandidate): string {
+    const keys = CONTENT_KEY_PREFERENCE[candidate.record_type] ?? ["content"];
+    return keys.find((key) => candidatePayloadString(candidate, [key])) ?? keys[0];
+  }
+  const [editContentKey, setEditContentKeyState] = useState("content");
+
   function beginEdit(candidate: ExtractionCandidate) {
+    const contentKey = contentFieldKeyFor(candidate);
     setEditingId(candidate.id);
+    setEditContentKeyState(contentKey);
+    setEditTitle(candidatePayloadString(candidate, ["title", "name", "entity_name"]) ?? "");
+    setEditContent(candidatePayloadString(candidate, [contentKey]) ?? "");
     setEditPayload(JSON.stringify(candidate.payload, null, 2));
     setEditScope(candidate.scope);
-    setEditConfidence(String(candidate.confidence));
     setEditRationale(candidate.rationale ?? "");
     setMessage(null);
     setError(null);
+  }
+
+  // The Title/Content fields and the Advanced JSON textarea share ONE source
+  // of truth (editPayload) — typing in a friendly field patches that key into
+  // the parsed JSON immediately, so Save always just parses editPayload. If
+  // the Advanced JSON is currently invalid, the friendly fields quietly stop
+  // syncing (the JSON error surfaces at Save, same as before this rewrite).
+  function syncEditPayload(key: string, value: string) {
+    try {
+      const parsed = JSON.parse(editPayload);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        parsed[key] = value;
+        setEditPayload(JSON.stringify(parsed, null, 2));
+      }
+    } catch {
+      /* Advanced JSON is invalid right now — leave it for the user to fix there. */
+    }
   }
 
   async function saveEdit(candidate: ExtractionCandidate) {
@@ -2386,22 +2626,19 @@ function CandidatesPane(props: {
       return;
     }
 
-    const confidence = Number(editConfidence);
-    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
-      setError("Confidence must be a number from 0 to 1.");
-      return;
-    }
-
     setBusyId(candidate.id);
     setMessage(null);
     setError(null);
     try {
+      clearUndo();
+      // Confidence is intentionally not sent: a human edit doesn't need the
+      // reviewer to also pick a decimal — omitting it keeps the existing
+      // value (2026-07-04 don-norman-design-critic).
       const result = await editCandidate({
         startDir: props.startDir,
         id: candidate.id,
         payload,
         scope: editScope,
-        confidence,
         rationale: editRationale,
       });
       setMessage(result.message);
@@ -2455,6 +2692,14 @@ function CandidatesPane(props: {
       setMessage(`${result.action} complete: ${result.succeeded}/${result.requested} candidates reviewed.`);
       if (result.failed) {
         setError(result.errors.map((item) => `${item.id}: ${item.error}`).join("\n"));
+      }
+      if (action === "approve" && result.succeeded > 0) {
+        const approvedIds = result.results
+          .filter((item) => item.candidate.status === "approved")
+          .map((item) => item.candidate.id);
+        armUndo(approvedIds, `${approvedIds.length} candidates`);
+      } else {
+        clearUndo();
       }
       setSelectedIds([]);
       await load();
@@ -2519,7 +2764,7 @@ function CandidatesPane(props: {
           <kbd>a</kbd> approve
         </span>
         <span>
-          <kbd>r</kbd> reject
+          <kbd>r</kbd> reject / reopen
         </span>
         <span>
           <kbd>e</kbd> edit
@@ -2542,9 +2787,16 @@ function CandidatesPane(props: {
             ))}
           </select>
         </label>
-        <label className="compact-input">
+        <label className="compact-select">
           <span>Scope</span>
-          <input value={scope} onChange={(event) => setScope(event.target.value)} placeholder="global or project/module" />
+          <select value={scope} onChange={(event) => setScope(event.target.value)}>
+            <option value="">All scopes</option>
+            {knownScopes.map((option) => (
+              <option key={option || "global"} value={option}>
+                {option || "global"}
+              </option>
+            ))}
+          </select>
         </label>
         <label className="compact-input confidence-filter">
           <span>Min Confidence</span>
@@ -2563,6 +2815,15 @@ function CandidatesPane(props: {
         {candidates.length > 0 && visibleCandidates.length === 0 && minConfidenceValue > 0 ? (
           <span className="subtle">
             All hidden below {minConfidenceValue.toFixed(2)} — lower Min Confidence to see them.
+          </span>
+        ) : null}
+        {scope !== "" && status === "pending" && props.totalPendingCount > candidates.length ? (
+          <span className="subtle">
+            {props.totalPendingCount - candidates.length} more pending in other scopes —{" "}
+            <button className="link-button" type="button" onClick={() => setScope("")}>
+              clear the scope filter
+            </button>{" "}
+            to see them.
           </span>
         ) : null}
       </div>
@@ -2585,7 +2846,16 @@ function CandidatesPane(props: {
           Reject Selected
         </button>
       </div>
-      {message ? <section className="notice compact good">{message}</section> : null}
+      {message ? (
+        <section className="notice compact good">
+          <span>{message}</span>
+          {undo ? (
+            <button className="link-button" type="button" onClick={() => void performUndo()}>
+              Undo
+            </button>
+          ) : null}
+        </section>
+      ) : null}
       {evidencePreview ? (
         <section className="notice compact evidence-preview">
           <FileText size={16} />
@@ -2664,9 +2934,17 @@ function CandidatesPane(props: {
                             <button className="icon-button success" type="button" onClick={() => approve(candidate)} disabled={candidate.status !== "pending" || isBusy} title="Approve candidate">
                               <CheckCircle2 size={15} />
                             </button>
-                            <button className="icon-button danger" type="button" onClick={() => reject(candidate)} disabled={candidate.status !== "pending" || isBusy} title="Reject candidate">
+                            <button className="icon-button danger" type="button" onClick={() => performReject(candidate, "")} disabled={candidate.status !== "pending" || isBusy} title="Reject candidate">
                               <Trash2 size={15} />
                             </button>
+                            <button className="icon-button" type="button" onClick={() => rejectWithNote(candidate)} disabled={candidate.status !== "pending" || isBusy} title="Reject with a note">
+                              <MessageSquare size={15} />
+                            </button>
+                            {candidate.status === "rejected" ? (
+                              <button className="icon-button" type="button" onClick={() => reopen(candidate)} disabled={isBusy} title="Reopen for review">
+                                <RefreshCcw size={15} />
+                              </button>
+                            ) : null}
                             <button className="icon-button" type="button" onClick={() => openTrusted(candidate)} disabled={!trustedResult} title="Open trusted memory">
                               <FileText size={15} />
                             </button>
@@ -2674,22 +2952,48 @@ function CandidatesPane(props: {
                         </header>
                         {isEditing ? (
                           <div className="candidate-edit-grid">
-                            <label>
-                              <span>Scope</span>
-                              <input value={editScope} onChange={(event) => setEditScope(event.target.value)} />
+                            <label className="candidate-edit-wide">
+                              <span>Title</span>
+                              <input
+                                value={editTitle}
+                                onChange={(event) => {
+                                  setEditTitle(event.target.value);
+                                  syncEditPayload("title", event.target.value);
+                                }}
+                              />
                             </label>
                             <label>
-                              <span>Confidence</span>
-                              <input value={editConfidence} onChange={(event) => setEditConfidence(event.target.value)} inputMode="decimal" />
+                              <span>Scope</span>
+                              <select value={editScope} onChange={(event) => setEditScope(event.target.value)}>
+                                <option value="">global</option>
+                                {Array.from(new Set([...knownScopes, editScope]))
+                                  .filter(Boolean)
+                                  .sort()
+                                  .map((option) => (
+                                    <option key={option} value={option}>
+                                      {option}
+                                    </option>
+                                  ))}
+                              </select>
+                            </label>
+                            <label className="candidate-edit-wide">
+                              <span>{CONTENT_KEY_LABELS[editContentKey] ?? "Content"}</span>
+                              <textarea
+                                value={editContent}
+                                onChange={(event) => {
+                                  setEditContent(event.target.value);
+                                  syncEditPayload(editContentKey, event.target.value);
+                                }}
+                              />
                             </label>
                             <label className="candidate-edit-wide">
                               <span>Rationale</span>
                               <input value={editRationale} onChange={(event) => setEditRationale(event.target.value)} />
                             </label>
-                            <label className="candidate-edit-wide">
-                              <span>Payload</span>
+                            <details className="candidate-edit-advanced candidate-edit-wide">
+                              <summary>Advanced — raw payload JSON</summary>
                               <textarea value={editPayload} onChange={(event) => setEditPayload(event.target.value)} spellCheck={false} />
-                            </label>
+                            </details>
                             <div className="candidate-edit-actions candidate-edit-wide">
                               <button className="button primary" type="button" onClick={() => saveEdit(candidate)} disabled={isBusy}>
                                 Save
@@ -2736,7 +3040,24 @@ function CandidatesPane(props: {
             );
           })
         ) : (
-          <EmptyRecordList text="No candidates in this view." />
+          <EmptyRecordList
+            text="No candidates in this view."
+            action={
+              <button
+                className="button primary"
+                type="button"
+                disabled={extracting}
+                onClick={() => {
+                  setExtracting(true);
+                  void extractSessionMemory({ startDir: props.startDir })
+                    .then(() => load())
+                    .finally(() => setExtracting(false));
+                }}
+              >
+                {extracting ? "Extracting…" : "Extract now"}
+              </button>
+            }
+          />
         )}
       </section>
     </div>
@@ -2772,16 +3093,15 @@ function SettingsPane(props: {
   const [blockedPathDraft, setBlockedPathDraft] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Only sources an actual capture path checks (2026-07-04 don-norman-design-critic:
+  // ide/system/screen/browser/audio rendered as live-looking checkboxes that wrote
+  // to the config file but gated nothing — false affordances in a consent surface
+  // are worse than clutter). Re-add here the day each one gets a real producer.
   const captureSourceLabels: Array<[keyof CaptureSourceConfig, string]> = [
     ["git", "Git"],
     ["transcripts", "Transcripts"],
     ["terminal", "Terminal"],
     ["files", "Files"],
-    ["ide", "IDE"],
-    ["system", "System"],
-    ["screen", "Screen"],
-    ["browser", "Browser"],
-    ["audio", "Audio"],
   ];
 
   useEffect(() => {
@@ -3871,11 +4191,12 @@ function MemoryListHeader(props: {
   );
 }
 
-function EmptyRecordList({ text }: { text: string }) {
+function EmptyRecordList({ text, action }: { text: string; action?: React.ReactNode }) {
   return (
     <div className="empty-record-list">
       <CircleDot size={13} />
       <span>{text}</span>
+      {action}
     </div>
   );
 }

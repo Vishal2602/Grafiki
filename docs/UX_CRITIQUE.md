@@ -4,6 +4,16 @@
 checklist. Full agent output preserved verbatim below. Companion to docs/UX_REDESIGN.md
 (what we built) and docs/DESIGN.md (the visual system).*
 
+**✅ STATUS (2026-07-04, same day): all of Top-3 and H1–H5 fixed, live-verified, and
+adversarially reviewed** — see CHANGELOG.md "don-norman-design-critic UX fixes (Jul 4)".
+The adversarial review pass then found and fixed three real data-integrity bugs the
+undo/edit-form fixes themselves introduced (entity-cascade corruption, no concurrency
+guard, a silent-data-loss edit-field mismatch) — those are documented in the CHANGELOG
+too, not repeated here. One item is an explicit known limitation, not fixed: undoing an
+approval that superseded an older record doesn't restore the older record's prior
+status. The critique text below is the original, unedited finding — kept for the
+reasoning, not as a live status.
+
 # Grafiki UX Critique — through Norman's lenses
 
 Read: `docs/UX_REDESIGN.md`, `docs/DESIGN.md`, `apps/grafiki-desktop/src/Onboarding.tsx`, `apps/grafiki-desktop/src/App.tsx` (HomePane ~1112–1303, TerminalPane ~1324–1770, Review pane ~2250–2744, SettingsPane), `screenshots/mcp-e2e-proof.png` (the Settings/Capture Consent screen), and `src-tauri/src/terminal.rs` capture-hint plumbing.
