@@ -238,7 +238,15 @@ fn capture_consent(cwd: &str) -> Result<(), String> {
 
 /// A live hosted terminal session.
 struct TerminalSession {
-    writer: Box<dyn Write + Send>,
+    /// Own mutex, SEPARATE from the registry's — writing to a PTY is a
+    /// blocking syscall (a slow-to-start shell/agent, or a burst of typed
+    /// input, can stall it for real time). Holding the registry lock during
+    /// that write would freeze every other terminal command AND the
+    /// `live_sessions()` background poll for as long as the write blocks —
+    /// this is exactly what happened in the first real fresh-install test
+    /// (2026-07-04): the whole app went unresponsive. Look up this Arc under
+    /// the registry lock, then drop that lock before writing.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Grafiki capture session id (`None` when the folder isn't a Grafiki project).
@@ -570,7 +578,7 @@ fn spawn_session(
     registry.0.lock().unwrap().insert(
         id.clone(),
         TerminalSession {
-            writer,
+            writer: Arc::new(Mutex::new(writer)),
             master,
             child,
             capture_id,
@@ -648,13 +656,20 @@ pub fn terminal_write(
     id: String,
     data: String,
 ) -> Result<(), String> {
-    let mut sessions = registry.0.lock().unwrap();
-    if let Some(session) = sessions.get_mut(&id) {
-        session
-            .writer
+    // Only the lookup happens under the registry lock; the Arc clone is cheap.
+    // The actual write (a blocking syscall) happens on the session's OWN
+    // writer mutex, so a slow child process can only ever stall writes to
+    // ITS OWN session, never the registry or any other session.
+    let writer = {
+        let sessions = registry.0.lock().unwrap();
+        sessions.get(&id).map(|session| session.writer.clone())
+    };
+    if let Some(writer) = writer {
+        let mut writer = writer.lock().unwrap();
+        writer
             .write_all(data.as_bytes())
             .map_err(|error| error.to_string())?;
-        session.writer.flush().map_err(|error| error.to_string())?;
+        writer.flush().map_err(|error| error.to_string())?;
     }
     Ok(())
 }
