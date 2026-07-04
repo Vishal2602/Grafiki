@@ -1,10 +1,11 @@
 // WebdriverIO e2e suite for the Grafiki desktop app (Tauri 2, macOS-native via
 // the embedded driver provider — no external driver, no cloud dependency).
 //
-// Prereqs (npm run test:e2e does all three):
-//   1. npm run build            → dist/ the debug binary embeds
-//   2. cargo build -p grafiki-desktop
-//   3. wdio run wdio.conf.js
+// Prereqs:
+//   1. npm run dev              → serves tauri.conf.json build.devUrl
+//   2. npm run build            → dist/ for packaged/debug builds
+//   3. cargo build -p grafiki-desktop
+//   4. wdio run wdio.conf.js
 //
 // The debug binary hosts the automation server (tauri-plugin-wdio-webdriver,
 // debug builds only), so tests drive the REAL app: real Rust backend, real DB

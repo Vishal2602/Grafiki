@@ -12,8 +12,9 @@
     "tauri": "tauri",
     "tauri:build:debug": "npm run prepare-sidecar:debug && tauri build --debug",
     "tauri:build:release": "npm run prepare-sidecar:release && tauri build",
-    "test:e2e": "npm run build && cargo build -p grafiki-desktop && wdio run wdio.conf.js",
-    "test:e2e:only": "wdio run wdio.conf.js"
+    "test:e2e:preflight": "node scripts/check-vite-dev-server.mjs",
+    "test:e2e": "npm run test:e2e:preflight && npm run build && cargo build -p grafiki-desktop && wdio run wdio.conf.js",
+    "test:e2e:only": "npm run test:e2e:preflight && wdio run wdio.conf.js"
   },
   "dependencies": {
     "@fontsource-variable/inter": "^5.2.8",
@@ -40,10 +41,11 @@
     "@wdio/spec-reporter": "^9.29.1",
     "@wdio/tauri-service": "^1.2.0",
     "typescript": "6.0.3",
-    "vite": "8.0.13",
+    "vite": "8.1.3",
     "@wdio/native-utils": "2.5.0"
   },
   "overrides": {
-    "@wdio/native-utils": "2.5.0"
+    "@wdio/native-utils": "2.5.0",
+    "serialize-javascript": "7.0.7"
   }
 }

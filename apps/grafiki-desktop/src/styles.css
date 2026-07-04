@@ -62,7 +62,7 @@
   --banner-tint: #12241b;
   --ink: #e9efe9;
   --ink-2: #a5b3a9;
-  --ink-3: #77857c;
+  --ink-3: #8a978d;
   --hairline: rgba(255, 255, 255, 0.08);
   --hairline-2: rgba(255, 255, 255, 0.15);
   --accent: #58b98a;
@@ -100,10 +100,13 @@
   outline-offset: 1px;
 }
 .rail-item:focus,
-.rail-item:focus-visible,
-.brand:focus,
-.brand:focus-visible {
+.brand:focus {
   outline: none;
+}
+.rail-item:focus-visible,
+.brand:focus-visible {
+  outline: 2px solid var(--accent-live);
+  outline-offset: -2px;
 }
 
 /* ---------------------------------------------------------------- reset */
@@ -1568,4 +1571,21 @@ button:active:not(:disabled) {
 /* xterm container inherits the well */
 .xterm .xterm-viewport {
   background-color: transparent !important;
+}
+
+/* Onboarding: the explicit capture-consent moment (terminal output is off by default). */
+.onboarding-consent {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  max-width: 440px;
+  margin: 4px 0 12px;
+  font-size: 13px;
+  color: var(--ink-2);
+  text-align: left;
+  cursor: pointer;
+}
+.onboarding-consent input {
+  margin-top: 3px;
+  accent-color: var(--accent);
 }

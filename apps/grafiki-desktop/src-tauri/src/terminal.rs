@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use grafiki_core::{
-    ingest_capture_event, start_capture_session, stop_capture_session, IngestCaptureEventOptions,
-    StartCaptureOptions, StopCaptureOptions,
+    ingest_capture_event, load_capture_config, start_capture_session, stop_capture_session,
+    CaptureConfigOptions, IngestCaptureEventOptions, StartCaptureOptions, StopCaptureOptions,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tauri::ipc::Channel;
@@ -213,6 +213,24 @@ impl TermShared {
     }
 }
 
+/// Consent gate for hosted-terminal output capture (Settings → Capture Consent).
+/// `Ok(())` = the user consented (the `terminal` source is on AND `terminal_output`
+/// is not `"off"`); `Err(hint)` = capture must not run, with the user-facing reason.
+/// The default config ships `terminal_output: "off"`, so capture is opt-in.
+fn capture_consent(cwd: &str) -> Result<(), String> {
+    match load_capture_config(CaptureConfigOptions {
+        project_name: None,
+        start_dir: PathBuf::from(cwd),
+        grafiki_home: None,
+    }) {
+        Ok(report) if !report.config.sources.terminal || report.config.terminal_output == "off" => {
+            Err("terminal capture is off in Settings".to_owned())
+        }
+        Ok(_) => Ok(()),
+        Err(_) => Err("initialize this folder in Settings".to_owned()),
+    }
+}
+
 /// A live hosted terminal session.
 struct TerminalSession {
     writer: Box<dyn Write + Send>,
@@ -220,6 +238,8 @@ struct TerminalSession {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Grafiki capture session id (`None` when the folder isn't a Grafiki project).
     capture_id: Option<String>,
+    /// User-facing reason capture is off (`None` while capturing).
+    capture_hint: Option<String>,
     project_root: String,
     /// The agent command this session was started for ("" = plain shell).
     launch: String,
@@ -238,6 +258,8 @@ pub struct AttachReply {
     pub cwd: String,
     /// A Grafiki capture session is recording this terminal.
     pub capturing: bool,
+    /// User-facing reason capture is off (`None` while capturing).
+    pub capture_hint: Option<String>,
 }
 
 /// What `terminal_open` (and a revive's spawn) tells the UI.
@@ -245,8 +267,10 @@ pub struct AttachReply {
 pub struct OpenReply {
     pub id: String,
     /// A Grafiki capture session is recording this terminal (`false` when the
-    /// folder isn't an initialized Grafiki project).
+    /// folder isn't an initialized Grafiki project or capture consent is off).
     pub capturing: bool,
+    /// User-facing reason capture is off (`None` while capturing).
+    pub capture_hint: Option<String>,
 }
 
 /// What `terminal_revive` tells the UI about a disk-restored session.
@@ -256,6 +280,7 @@ pub struct ReviveReply {
     pub launch: String,
     pub cwd: String,
     pub capturing: bool,
+    pub capture_hint: Option<String>,
 }
 
 fn pty_size(rows: u16, cols: u16) -> PtySize {
@@ -320,6 +345,7 @@ pub fn terminal_revive(
             launch: String::new(),
             cwd: String::new(),
             capturing: false,
+            capture_hint: None,
         });
     };
     let mut preamble = Vec::new();
@@ -346,6 +372,7 @@ pub fn terminal_revive(
         launch: descriptor.launch,
         cwd: descriptor.cwd,
         capturing: opened.capturing,
+        capture_hint: opened.capture_hint,
     })
 }
 
@@ -368,7 +395,12 @@ fn spawn_session(
             if !existing.shared.lock().unwrap().exited {
                 attach_channel(&existing.shared, on_output);
                 let capturing = existing.capture_id.is_some();
-                return Ok(OpenReply { id, capturing });
+                let capture_hint = existing.capture_hint.clone();
+                return Ok(OpenReply {
+                    id,
+                    capturing,
+                    capture_hint,
+                });
             }
             // Exited leftover under this id: drop it and spawn fresh below.
             let stale = sessions.remove(&id);
@@ -418,19 +450,27 @@ fn spawn_session(
     drop(pair.slave);
     let master = pair.master;
 
-    // Best-effort capture session for this folder; skipped if it isn't a Grafiki
-    // project (the terminal still works — capture is additive, never blocking).
-    let capture_id = start_capture_session(StartCaptureOptions {
-        project_name: None,
-        start_dir: PathBuf::from(&cwd),
-        grafiki_home: None,
-        scope: String::new(),
-        source_app: Some("grafiki-terminal".to_owned()),
-        consent_profile: None,
-        redaction_profile: None,
-    })
-    .ok()
-    .map(|report| report.capture.id);
+    // Best-effort capture session for this folder — but ONLY with the user's
+    // consent (Settings → Capture Consent; the default config says off). Skipped
+    // when it isn't a Grafiki project. The terminal itself always works —
+    // capture is additive, never blocking.
+    let (capture_id, capture_hint) = match capture_consent(&cwd) {
+        Ok(()) => (
+            start_capture_session(StartCaptureOptions {
+                project_name: None,
+                start_dir: PathBuf::from(&cwd),
+                grafiki_home: None,
+                scope: String::new(),
+                source_app: Some("grafiki-terminal".to_owned()),
+                consent_profile: None,
+                redaction_profile: None,
+            })
+            .ok()
+            .map(|report| report.capture.id),
+            None,
+        ),
+        Err(hint) => (None, Some(hint)),
+    };
 
     let preamble = preamble.unwrap_or_default();
     let shared = Arc::new(Mutex::new(TermShared {
@@ -529,12 +569,17 @@ fn spawn_session(
             master,
             child,
             capture_id,
+            capture_hint: capture_hint.clone(),
             project_root: cwd,
             launch,
             shared,
         },
     );
-    Ok(OpenReply { id, capturing })
+    Ok(OpenReply {
+        id,
+        capturing,
+        capture_hint,
+    })
 }
 
 /// Reattach the UI to an existing session: replay its scrollback through
@@ -555,6 +600,7 @@ pub fn terminal_attach(
                 exited: !alive,
                 cwd: session.project_root.clone(),
                 capturing: session.capture_id.is_some(),
+                capture_hint: session.capture_hint.clone(),
             })
         }
         None => Ok(AttachReply {
@@ -562,6 +608,7 @@ pub fn terminal_attach(
             exited: false,
             cwd: String::new(),
             capturing: false,
+            capture_hint: None,
         }),
     }
 }

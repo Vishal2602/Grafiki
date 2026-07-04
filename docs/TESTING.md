@@ -26,7 +26,8 @@ server).
 
 ```bash
 cd apps/grafiki-desktop
-npm run test:e2e        # builds dist + debug binary, then runs the specs
+npm run dev             # keep this running; debug builds load tauri.conf.json build.devUrl
+npm run test:e2e        # in another shell: builds dist + debug binary, then runs the specs
 npm run test:e2e:only   # specs only (binary already built)
 ```
 
@@ -38,6 +39,9 @@ legend, and the theme switch (asserts `html[data-theme]` flips and restores).
 Status: **5/5 passing, ~0.5s** (deterministic across runs).
 
 Notes:
+- `npm run test:e2e:preflight` checks `http://127.0.0.1:1420/` so a missing Vite
+  server fails with a one-line setup error instead of WebDriver/Tauri
+  `core.invoke` timeout noise.
 - `package.json` pins `@wdio/native-utils` via `overrides` — the tauri-service
   ships a stale nested copy that otherwise shadows the fixed one.
 - Three Rust-side pieces make the service fully functional: the embedded

@@ -1444,7 +1444,7 @@ pub fn log_decision(options: LogDecisionOptions) -> Result<DecisionReport> {
 
 pub fn list_decisions(options: DecisionListOptions) -> Result<Vec<DecisionItem>> {
     let scope = Scope::new(options.scope)?;
-    let scope_chain = scope.chain().into_vec();
+    let scope_chain = browse_scope_chain(&scope);
     let (_project, connection) = resolve_and_open(
         options.project_name,
         options.start_dir,
@@ -1853,7 +1853,7 @@ pub fn save_entity(options: SaveEntityOptions) -> Result<SaveEntityReport> {
 
 pub fn list_entities(options: EntityListOptions) -> Result<Vec<GraphEntity>> {
     let scope = Scope::new(options.scope)?;
-    let scope_chain = scope.chain().into_vec();
+    let scope_chain = browse_scope_chain(&scope);
     let (_project, connection) = resolve_and_open(
         options.project_name,
         options.start_dir,
@@ -1968,7 +1968,7 @@ pub fn delete_entity(options: DeleteEntityOptions) -> Result<GraphEntity> {
 
 pub fn list_observations(options: ObservationListOptions) -> Result<Vec<ObservationItem>> {
     let scope = Scope::new(options.scope)?;
-    let scope_chain = scope.chain().into_vec();
+    let scope_chain = browse_scope_chain(&scope);
     let (_project, connection) = resolve_and_open(
         options.project_name,
         options.start_dir,
@@ -2779,7 +2779,7 @@ fn record_agent_query(
 
 pub fn list_agent_queries(options: ListAgentQueriesOptions) -> Result<Vec<AgentQueryLogItem>> {
     let scope = Scope::new(options.scope)?;
-    let scope_chain = scope.chain().into_vec();
+    let scope_chain = browse_scope_chain(&scope);
     let (_project, connection) = resolve_and_open(
         options.project_name,
         options.start_dir,
@@ -3915,9 +3915,8 @@ pub fn list_candidates(options: ListCandidatesOptions) -> Result<Vec<ExtractionC
         sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT ?");
         params.push(&limit);
         let mut statement = connection.prepare(&sql)?;
-        let candidates = collect_rows(
-            statement.query_map(params.as_slice(), extraction_candidate_from_row)?,
-        )?;
+        let candidates =
+            collect_rows(statement.query_map(params.as_slice(), extraction_candidate_from_row)?)?;
         candidates
     };
 
@@ -3947,21 +3946,63 @@ pub fn approve_candidate(options: ApproveCandidateOptions) -> Result<CandidateMu
         options.start_dir.clone(),
         options.grafiki_home.clone(),
     )?;
-    let candidate = load_extraction_candidate(&connection, &options.id)?;
-    if candidate.status != "pending" {
+    // CLAIM before creating the trusted record. The old check-then-act pattern
+    // let two concurrent approvals (double-click, bulk + single) both pass the
+    // pending check and each create a trusted record. `reviewed_at` doubles as
+    // the claim marker (status stays 'pending' — the schema CHECK only allows
+    // pending/approved/rejected): SQLite serializes this UPDATE, so exactly one
+    // caller matches `reviewed_at IS NULL`. A claim older than 15 minutes is
+    // abandoned (crash mid-approval) and may be retaken.
+    let claimed = connection.execute(
+        "
+        UPDATE extraction_candidates
+        SET reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        WHERE id = ?1
+          AND status = 'pending'
+          AND (reviewed_at IS NULL
+               OR reviewed_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-15 minutes'))
+        ",
+        params![&options.id],
+    )?;
+    if claimed == 0 {
+        let candidate = load_extraction_candidate(&connection, &options.id)?;
+        let state = if candidate.status == "pending" {
+            "being approved".to_owned()
+        } else {
+            format!("already {}", candidate.status)
+        };
         return Err(GrafikiError::InvalidCandidate(format!(
-            "candidate {} is already {}",
-            candidate.id, candidate.status
+            "candidate {} is {state}",
+            candidate.id
         )));
     }
+    let candidate = load_extraction_candidate(&connection, &options.id)?;
     drop(connection);
 
-    let (trusted_record_type, trusted_record_id) = approve_candidate_payload(
+    let payload_outcome = approve_candidate_payload(
         &candidate,
         options.project_name.clone(),
         options.start_dir.clone(),
         options.grafiki_home.clone(),
-    )?;
+    );
+    let (trusted_record_type, trusted_record_id) = match payload_outcome {
+        Ok(created) => created,
+        Err(error) => {
+            // Release the claim so the candidate returns to the review queue.
+            if let Ok((_project, connection)) = resolve_and_open(
+                options.project_name.clone(),
+                options.start_dir.clone(),
+                options.grafiki_home.clone(),
+            ) {
+                let _ = connection.execute(
+                    "UPDATE extraction_candidates SET reviewed_at = NULL \
+                     WHERE id = ?1 AND status = 'pending'",
+                    params![&options.id],
+                );
+            }
+            return Err(error);
+        }
+    };
 
     let (_project, mut connection) = resolve_and_open(
         options.project_name,
@@ -3973,17 +4014,27 @@ pub fn approve_candidate(options: ApproveCandidateOptions) -> Result<CandidateMu
     // candidate. (The trusted record was created above; the pending-status guard
     // makes re-approval a no-op, preventing duplicates on the common retry path.)
     let tx = connection.transaction()?;
-    tx.execute(
+    let approved = tx.execute(
         "
         UPDATE extraction_candidates
         SET status = 'approved',
             trusted_record_type = ?1,
             trusted_record_id = ?2,
             reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-        WHERE id = ?3
+        WHERE id = ?3 AND status = 'pending'
         ",
         params![&trusted_record_type, &trusted_record_id, &options.id],
     )?;
+    if approved == 0 {
+        // The candidate was reviewed by someone else while the trusted record
+        // was being created (e.g. rejected mid-flight). Do not overwrite their
+        // decision — surface what happened instead.
+        return Err(GrafikiError::InvalidCandidate(format!(
+            "candidate {} was reviewed concurrently during approval; created {} {} — \
+             review it manually",
+            options.id, trusted_record_type, trusted_record_id
+        )));
+    }
     promote_candidate_evidence(&tx, &options.id, &trusted_record_type, &trusted_record_id)?;
     tx.commit()?;
     let candidate = load_extraction_candidate(&connection, &options.id)?;
@@ -4015,12 +4066,15 @@ pub fn edit_candidate(options: EditCandidateOptions) -> Result<CandidateMutation
         .map(validate_candidate_record_type)
         .transpose()?
         .unwrap_or(candidate.record_type);
-    let payload = options.payload.unwrap_or(candidate.payload);
+    let mut payload = options.payload.unwrap_or(candidate.payload);
     if !payload.is_object() {
         return Err(GrafikiError::InvalidCandidate(
             "candidate payload must be a JSON object".to_owned(),
         ));
     }
+    // Same redaction as the propose path — an edited candidate must not be able
+    // to persist a secret the original proposal would have scrubbed.
+    redact_json_value(&mut payload);
     let scope = match options.scope {
         Some(scope) => Scope::new(scope)?.as_str().to_owned(),
         None => candidate.scope,
@@ -4030,7 +4084,13 @@ pub fn edit_candidate(options: EditCandidateOptions) -> Result<CandidateMutation
         .map(validate_candidate_confidence)
         .transpose()?
         .unwrap_or(candidate.confidence);
-    let rationale = options.rationale.or(candidate.rationale);
+    let rationale = options
+        .rationale
+        .map(|mut value| {
+            redact_sensitive_text(&mut value);
+            value
+        })
+        .or(candidate.rationale);
 
     connection.execute(
         "
@@ -4442,7 +4502,7 @@ fn find_duplicate_capture_event(
 
 pub fn list_capture_events(options: ListCaptureEventsOptions) -> Result<Vec<CaptureEvent>> {
     let scope = Scope::new(options.scope)?;
-    let scope_chain = scope.chain().into_vec();
+    let scope_chain = browse_scope_chain(&scope);
     let source_type = options
         .source_type
         .as_deref()
@@ -4456,7 +4516,11 @@ pub fn list_capture_events(options: ListCaptureEventsOptions) -> Result<Vec<Capt
     )?;
     let limit = options.limit.clamp(1, 500) as i64;
 
-    let mut clauses = vec![format!("scope IN ({})", placeholders(scope_chain.len()))];
+    let mut clauses = vec![if scope_chain.is_empty() {
+        "scope LIKE '%'".to_owned()
+    } else {
+        format!("scope IN ({})", placeholders(scope_chain.len()))
+    }];
     if options.capture_id.is_some() {
         clauses.push("capture_session = ?".to_owned());
     }
@@ -4901,7 +4965,11 @@ pub fn extract_capture_memory(options: ExtractCaptureOptions) -> Result<CaptureE
         .filter_map(|event| {
             let title = event.title.as_deref().unwrap_or("");
             let text = crate::extract::scrub_agent_chrome(event.text.as_deref().unwrap_or(""));
-            if text.is_empty() && event.text.as_deref().is_some_and(|raw| !raw.trim().is_empty())
+            if text.is_empty()
+                && event
+                    .text
+                    .as_deref()
+                    .is_some_and(|raw| !raw.trim().is_empty())
             {
                 return None;
             }
@@ -5008,7 +5076,7 @@ fn list_unextracted_session_events(
     limit: usize,
 ) -> Result<Vec<CaptureEvent>> {
     let scope = Scope::new(scope)?;
-    let scope_chain = scope.chain().into_vec();
+    let scope_chain = browse_scope_chain(&scope);
     let (_project, connection) = resolve_and_open(project_name, start_dir, grafiki_home)?;
     let limit = limit.clamp(1, 500) as i64;
     let cursor: String = connection
@@ -5239,7 +5307,7 @@ pub fn upsert_state(options: UpsertStateOptions) -> Result<StateReport> {
 
 pub fn list_state(options: StateListOptions) -> Result<Vec<StateItem>> {
     let scope = Scope::new(options.scope)?;
-    let scope_chain = scope.chain().into_vec();
+    let scope_chain = browse_scope_chain(&scope);
     let (_project, connection) = resolve_and_open(
         options.project_name,
         options.start_dir,
@@ -5313,7 +5381,7 @@ pub fn delete_state(options: DeleteStateOptions) -> Result<StateReport> {
 
 pub fn list_events(options: EventListOptions) -> Result<EventListReport> {
     let scope = Scope::new(options.scope)?;
-    let scope_chain = scope.chain().into_vec();
+    let scope_chain = browse_scope_chain(&scope);
     let (project, connection) = resolve_and_open(
         options.project_name,
         options.start_dir,
@@ -5374,7 +5442,7 @@ pub fn list_events(options: EventListOptions) -> Result<EventListReport> {
 
 pub fn list_sessions(options: SessionLogOptions) -> Result<SessionLogReport> {
     let scope = Scope::new(options.scope)?;
-    let scope_chain = scope.chain().into_vec();
+    let scope_chain = browse_scope_chain(&scope);
     let (project, connection) = resolve_and_open(
         options.project_name,
         options.start_dir,
@@ -5800,7 +5868,7 @@ pub fn get_memory_record_detail(options: GetMemoryRecordOptions) -> Result<Memor
 
 pub fn list_context(options: ContextListOptions) -> Result<Vec<ContextSummary>> {
     let scope = Scope::new(options.scope)?;
-    let scope_chain = scope.chain().into_vec();
+    let scope_chain = browse_scope_chain(&scope);
     let (_project, connection) = resolve_and_open(
         options.project_name,
         options.start_dir,
@@ -8205,7 +8273,27 @@ pub(crate) fn slugify(name: &str) -> String {
 }
 
 fn scoped_query(template: &str, scope_count: usize) -> String {
+    if scope_count == 0 {
+        // Browse semantics: an empty scope chain means "no scope filter".
+        // `<col> LIKE '%'` is true for every (NOT NULL) scope value and keeps
+        // the template's surrounding WHERE/AND structure intact.
+        return template.replace("IN ({scopes})", "LIKE '%'");
+    }
     template.replace("{scopes}", &placeholders(scope_count))
+}
+
+/// Scope chain for BROWSE surfaces (lists, detail views, extraction reads): an
+/// empty scope means "everything", not "root only" — a record parked in a
+/// sub-scope must never be invisible by default (2026-07-04 audit; same family
+/// as the review-queue fix). A non-empty scope still narrows to its chain.
+/// Retrieval/search/status keep ordinary chain semantics — there scope is a
+/// relevance mechanism, not a browse filter.
+fn browse_scope_chain(scope: &Scope) -> Vec<String> {
+    if scope.as_str().is_empty() {
+        Vec::new()
+    } else {
+        scope.chain().into_vec()
+    }
 }
 
 fn placeholders(count: usize) -> String {
@@ -10145,19 +10233,20 @@ mod tests {
         delete_decision, delete_entity, delete_observation, delete_relation, delete_state,
         edit_candidate, end_session, export_memory, extract_capture_memory, generate_report,
         get_context, get_embedding_status, get_graph, get_status, handoff_session,
-        hybrid_search_results, import_memory, ingest_capture_event, list_candidates, list_context,
-        list_decisions, list_events, list_observations, list_relations, list_sessions, list_state,
-        log_decision, pending_embedding_count, process_embedding_jobs, propose_candidate,
-        reject_candidate, resolve_and_open, run_capture_watch, save_entity, search_memory,
-        start_capture_session, update_context, update_decision, update_entity, update_observation,
-        update_relation, update_session, upsert_state, AddContextOptions, ApproveCandidateOptions,
-        AskMemoryOptions, BulkCandidateReviewOptions, CandidateOrder, ChatOptions,
-        ContextListOptions, DecisionListOptions, DeleteContextOptions, DeleteDecisionOptions,
-        DeleteEntityOptions, DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions,
-        EditCandidateOptions, EmbeddingStatusOptions, EndSessionOptions, EventListOptions,
-        EvidenceInput, ExportOptions, ExtractCaptureOptions, ExtractionCandidate,
-        GetContextOptions, GraphOptions, HandoffOptions, ImportOptions, IngestCaptureEventOptions,
-        ListCandidatesOptions, LogDecisionOptions, ObservationListOptions,
+        hybrid_search_results, import_memory, ingest_capture_event, list_candidates,
+        list_capture_events, list_context, list_decisions, list_events, list_observations,
+        list_relations, list_sessions, list_state, log_decision, pending_embedding_count,
+        process_embedding_jobs, propose_candidate, reject_candidate, resolve_and_open,
+        run_capture_watch, save_entity, search_memory, start_capture_session, update_context,
+        update_decision, update_entity, update_observation, update_relation, update_session,
+        upsert_state, AddContextOptions, ApproveCandidateOptions, AskMemoryOptions,
+        BulkCandidateReviewOptions, CandidateOrder, ChatOptions, ContextListOptions,
+        DecisionListOptions, DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions,
+        DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions,
+        EmbeddingStatusOptions, EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions,
+        ExtractCaptureOptions, ExtractionCandidate, GetContextOptions, GraphOptions,
+        HandoffOptions, ImportOptions, IngestCaptureEventOptions, ListCandidatesOptions,
+        ListCaptureEventsOptions, LogDecisionOptions, ObservationListOptions,
         ProcessEmbeddingsOptions, ProjectReportOptions, ProposeCandidateOptions,
         RejectCandidateOptions, RelationListOptions, RunCaptureWatchOptions, SaveEntityOptions,
         SearchMemoryOptions, SearchMode, SearchReport, SearchResult, SessionLogOptions,
@@ -11791,6 +11880,203 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|c| c.source_type == "capture:llm" && c.record_type == "decision"));
+    }
+
+    #[test]
+    fn approval_claim_blocks_concurrent_and_allows_stale_takeover() {
+        // Audit: check-then-act approval let two concurrent calls both create a
+        // trusted record. The claim (reviewed_at while still pending) must make
+        // the second caller fail fast — and a stale claim (crash mid-approval,
+        // >15 min old) must be retakeable.
+        let (_temp, home, project_dir) = setup_project();
+
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:llm".to_owned(),
+            source: None,
+            record_type: "decision".to_owned(),
+            payload: serde_json::json!({ "title": "Claimed", "reasoning": "race test" }),
+            scope: String::new(),
+            confidence: 0.6,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+        let id = proposed.candidate.id;
+
+        // Another caller holds a FRESH claim → approval must refuse.
+        let (_p, connection) =
+            resolve_and_open(None, project_dir.clone(), Some(home.clone())).unwrap();
+        connection
+            .execute(
+                "UPDATE extraction_candidates \
+                 SET reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?1",
+                rusqlite::params![&id],
+            )
+            .unwrap();
+        drop(connection);
+        let blocked = approve_candidate(ApproveCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: id.clone(),
+        });
+        assert!(
+            blocked.is_err() && blocked.unwrap_err().to_string().contains("being approved"),
+            "a fresh claim must block a second approval"
+        );
+
+        // A STALE claim (crashed approval) is retakeable.
+        let (_p, connection) =
+            resolve_and_open(None, project_dir.clone(), Some(home.clone())).unwrap();
+        connection
+            .execute(
+                "UPDATE extraction_candidates \
+                 SET reviewed_at = '2020-01-01T00:00:00Z' WHERE id = ?1",
+                rusqlite::params![&id],
+            )
+            .unwrap();
+        drop(connection);
+        let approved = approve_candidate(ApproveCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: id.clone(),
+        })
+        .unwrap();
+        assert_eq!(approved.candidate.status, "approved");
+
+        // And an approved candidate stays terminal.
+        let again = approve_candidate(ApproveCandidateOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            id,
+        });
+        assert!(again.is_err());
+    }
+
+    #[test]
+    fn empty_scope_browses_every_scope() {
+        // Audit 2026-07-04: browse surfaces with the default "" scope hid
+        // sub-scoped rows (chain of "" is just [""]) — capture-session detail,
+        // Memory lists, and the auto-extraction read all missed scoped data.
+        let (_temp, home, project_dir) = setup_project();
+
+        ingest_capture_event(IngestCaptureEventOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            capture_id: None,
+            scope: "example-project/core".to_owned(),
+            source_type: "terminal".to_owned(),
+            source: None,
+            title: Some("Scoped terminal chunk".to_owned()),
+            text: Some("cargo test passed".to_owned()),
+            payload: None,
+            metadata: None,
+            privacy_level: None,
+            redacted: false,
+            captured_at: None,
+        })
+        .unwrap();
+        log_decision(LogDecisionOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            title: "Scoped decision".to_owned(),
+            reasoning: Some("because".to_owned()),
+            alternatives: Vec::new(),
+            tags: Vec::new(),
+            scope: "example-project/core".to_owned(),
+            supersedes: None,
+        })
+        .unwrap();
+
+        let events = list_capture_events(ListCaptureEventsOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            capture_id: None,
+            source_type: None,
+            scope: String::new(),
+            limit: 50,
+        })
+        .unwrap();
+        assert!(
+            events.iter().any(|e| e.scope == "example-project/core"),
+            "empty-scope event browse must include sub-scoped events"
+        );
+
+        let decisions = list_decisions(DecisionListOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            scope: String::new(),
+            status: None,
+        })
+        .unwrap();
+        assert!(
+            decisions.iter().any(|d| d.scope == "example-project/core"),
+            "empty-scope decision browse must include sub-scoped decisions"
+        );
+    }
+
+    #[test]
+    fn edit_candidate_redacts_like_the_propose_path() {
+        // Audit finding: the edit path wrote payload/rationale verbatim, so a
+        // reviewer's edit could persist a secret the original proposal would
+        // have scrubbed. Editing must run the same redaction pass.
+        let (_temp, home, project_dir) = setup_project();
+
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:llm".to_owned(),
+            source: None,
+            record_type: "decision".to_owned(),
+            payload: serde_json::json!({ "title": "Clean", "reasoning": "no secrets" }),
+            scope: String::new(),
+            confidence: 0.6,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+
+        let edited = edit_candidate(EditCandidateOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            id: proposed.candidate.id,
+            record_type: None,
+            payload: Some(serde_json::json!({
+                "title": "Use the staging key",
+                "reasoning": "no real change",
+                "client_secret": "abcdef1234567890clientsecretvalue"
+            })),
+            scope: None,
+            confidence: None,
+            rationale: Some("api_key=sk-live-abcdef1234567890".to_owned()),
+        })
+        .unwrap();
+
+        let blob = serde_json::to_string(&edited.candidate.payload).unwrap();
+        assert!(
+            !blob.contains("abcdef1234567890clientsecretvalue"),
+            "edited payload must be redacted: {blob}"
+        );
+        assert_eq!(
+            edited.candidate.payload["client_secret"],
+            "[REDACTED_SECRET]"
+        );
+        let rationale = edited.candidate.rationale.unwrap_or_default();
+        assert!(
+            !rationale.contains("sk-live-abcdef1234567890"),
+            "edited rationale must be redacted: {rationale}"
+        );
     }
 
     #[test]

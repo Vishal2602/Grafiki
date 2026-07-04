@@ -1764,6 +1764,19 @@ fn update_memory_record(request: UpdateRecordRequest) -> Result<UpdateRecordResp
         }
         "state" => {
             let title = required("Title", &request.title.unwrap_or_default())?;
+            // The desktop edit form has no owner/blockers/dependencies fields, and
+            // upsert_state overwrites every column — so carry the existing
+            // structured fields forward instead of silently erasing them.
+            let existing = list_state(StateListOptions {
+                project_name: None,
+                start_dir: start_dir.clone(),
+                grafiki_home: None,
+                status: None,
+                scope: String::new(),
+            })
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|item| item.key == id);
             let report = upsert_state(UpsertStateOptions {
                 project_name: None,
                 start_dir,
@@ -1771,10 +1784,16 @@ fn update_memory_record(request: UpdateRecordRequest) -> Result<UpdateRecordResp
                 key: id,
                 title,
                 status: clean_optional(request.status).unwrap_or_else(|| "in-progress".to_owned()),
-                owner: None,
+                owner: existing.as_ref().and_then(|item| item.owner.clone()),
                 details: clean_optional(request.content),
-                blockers: Vec::new(),
-                depends_on: Vec::new(),
+                blockers: existing
+                    .as_ref()
+                    .map(|item| item.blockers.clone())
+                    .unwrap_or_default(),
+                depends_on: existing
+                    .as_ref()
+                    .map(|item| item.depends_on.clone())
+                    .unwrap_or_default(),
                 scope: clean_optional(request.scope).unwrap_or_default(),
                 priority: clean_optional(request.priority).unwrap_or_else(|| "medium".to_owned()),
             })

@@ -23,7 +23,7 @@
   ],
   "blocked_apps": [],
   "redaction_profile": "default",
-  "terminal_output": "off",
+  "terminal_output": "full",
   "screen_policy": "manual",
   "browser_policy": "off"
 }

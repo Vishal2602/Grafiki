@@ -1,6 +1,6 @@
 import { motion } from "framer-motion";
 import { useEffect, useState } from "react";
-import { initializeProject, listLocalModels, pickProjectFolder } from "./api";
+import { initializeProject, listLocalModels, pickProjectFolder, updateCaptureConfig } from "./api";
 
 /// First-run onboarding (UX_REDESIGN.md §5.0): four steps, under 90 seconds,
 /// honest at every fork. Full-sheet, no rail — nothing else exists until the
@@ -12,6 +12,7 @@ export default function Onboarding(props: {
   const [step, setStep] = useState(0);
   const [folder, setFolder] = useState("");
   const [initializing, setInitializing] = useState(false);
+  const [captureConsent, setCaptureConsent] = useState(true);
   const [initError, setInitError] = useState<string | null>(null);
   const [models, setModels] = useState<string[] | null>(null);
 
@@ -35,6 +36,11 @@ export default function Onboarding(props: {
     setInitError(null);
     try {
       await initializeProject({ projectDir: dir });
+      if (captureConsent) {
+        // The default capture config ships terminal output OFF; this is the
+        // explicit consent moment that turns it on for this workspace.
+        await updateCaptureConfig({ startDir: dir, terminal: true, terminalOutput: "full" });
+      }
       props.onProjectReady(dir);
       setStep(2);
     } catch (error) {
@@ -97,6 +103,17 @@ export default function Onboarding(props: {
               </button>
             </div>
             {initError ? <p style={{ color: "var(--danger)" }}>{initError}</p> : null}
+            <label className="onboarding-consent">
+              <input
+                type="checkbox"
+                checked={captureConsent}
+                onChange={(event) => setCaptureConsent(event.currentTarget.checked)}
+              />
+              <span>
+                Capture terminal output in this workspace so sessions become memory.
+                Stays on this Mac; change anytime in Settings &rarr; Capture Consent.
+              </span>
+            </label>
             <button
               className="button primary"
               disabled={!folder.trim() || initializing}

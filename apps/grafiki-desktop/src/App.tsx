@@ -250,6 +250,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (isPreviewMode()) {
+      return; // no Tauri event bridge in browser preview
+    }
     // Tray menu deep-links (e.g. "Review: n pending" in the menubar).
     const unlisten = listen<string>("grafiki://navigate", (event) => {
       switchPrimaryPane(event.payload as PaneKind);
@@ -892,6 +895,7 @@ function CommandPalette(props: {
       >
         <input
           autoFocus
+          aria-label="Command or question"
           value={query}
           placeholder="Type a command, or ask your memory…"
           onChange={(event) => {
@@ -1280,6 +1284,7 @@ function HomePane(props: {
         <div className="search-box">
           <Sparkles size={15} />
           <input
+            aria-label="Ask your memory"
             value={ask}
             onChange={(event) => setAsk(event.target.value)}
             onKeyDown={(event) => {
@@ -1333,6 +1338,7 @@ function TerminalPane(props: {
   // null = connecting; then the backend's honest answer (false = the folder
   // isn't an initialized Grafiki project, so nothing is being recorded).
   const [capturing, setCapturing] = useState<boolean | null>(null);
+  const [captureHint, setCaptureHint] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   // Set when the launcher just created `session`, so the effect spawns instead
   // of attaching. A ref (not state): StrictMode remounts must attach, not respawn.
@@ -1444,6 +1450,12 @@ function TerminalPane(props: {
     if (!session || !containerRef.current) {
       return;
     }
+    if (isPreviewMode()) {
+      // No PTY bridge in browser preview — `new Channel()` (and every
+      // terminal_* invoke) needs Tauri. Show a notice instead of a blank crash.
+      setError("The hosted terminal needs the desktop app — this is a browser preview.");
+      return;
+    }
     const id = session.id;
     const launch = session.launch;
     const term = new XTerm({
@@ -1510,7 +1522,7 @@ function TerminalPane(props: {
         if (spawnRef.current) {
           spawnRef.current = false;
           // Spawn the login shell (full PATH); the agent is typed in after.
-          const opened = await invoke<{ id: string; capturing: boolean }>("terminal_open", {
+          const opened = await invoke<{ id: string; capturing: boolean; capture_hint: string | null }>("terminal_open", {
             id,
             cwd: props.projectRoot || props.fallbackCwd,
             command: "",
@@ -1521,6 +1533,7 @@ function TerminalPane(props: {
           });
           if (!cancelled) {
             setCapturing(opened.capturing);
+            setCaptureHint(opened.capture_hint);
             window.setTimeout(resize, 350); // refit after the pane settles
             scheduleType(launch);
             scheduleHandoff();
@@ -1532,6 +1545,7 @@ function TerminalPane(props: {
           exited: boolean;
           cwd: string;
           capturing: boolean;
+          capture_hint: string | null;
         }>("terminal_attach", { id, onOutput: channel });
         if (cancelled) {
           return;
@@ -1544,6 +1558,7 @@ function TerminalPane(props: {
             launch: string;
             cwd: string;
             capturing: boolean;
+            capture_hint: string | null;
           }>("terminal_revive", { id, rows: term.rows, cols: term.cols, onOutput: channel });
           if (cancelled) {
             return;
@@ -1556,11 +1571,13 @@ function TerminalPane(props: {
             return;
           }
           setCapturing(revive.capturing);
+          setCaptureHint(revive.capture_hint);
           // Resume the agent's own session where supported; otherwise relaunch it.
           scheduleType(revive.launch === "claude" ? "claude --continue" : revive.launch);
           return;
         }
         setCapturing(reply.capturing);
+        setCaptureHint(reply.capture_hint);
         if (reply.exited) {
           setEnded(true);
           return;
@@ -1671,7 +1688,7 @@ function TerminalPane(props: {
           {session.launch ? `Running: ${session.launch}` : "Shell"} ·{" "}
           {props.projectRoot || props.fallbackCwd || "this project"}
           {capturing === true ? " · capturing" : ""}
-          {capturing === false ? " · not capturing — initialize this folder in Settings" : ""}
+          {capturing === false ? ` · not capturing — ${captureHint ?? "initialize this folder in Settings"}` : ""}
           {ended ? " · session ended" : ""}
         </span>
         {chatCapable ? (
@@ -2970,6 +2987,7 @@ function SettingsPane(props: {
           <div className="setting-row">
             <span>Appearance</span>
             <select
+              aria-label="Appearance"
               value={themePref}
               onChange={(event) => changeTheme(event.target.value as ThemePref)}
             >

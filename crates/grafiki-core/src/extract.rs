@@ -240,7 +240,11 @@ mod tests {
             },
         ];
         for item in &junk {
-            assert!(is_agent_chrome_memory(item), "should reject: {}", item.title);
+            assert!(
+                is_agent_chrome_memory(item),
+                "should reject: {}",
+                item.title
+            );
         }
 
         let real = ExtractedMemory {
