@@ -42,18 +42,32 @@ one, and here's the session where we decided why."
   given the same graph.
 
 ### T1.2 Session-start injection (hosted terminal)
-- On spawning/reviving a claude session, Grafiki types a one-page brief: project map
-  headline (top communities/god-nodes), top pending/approved decisions for this scope, and
-  the instruction "query grafiki (MCP `grafiki_map`/search) before reading files".
-- Once-guarded like the existing handoff-prompt injection (sessionStorage + single-line).
+*(Revised per the 2026-07-04 karpathy-ai-advisor review: **push memory, pull structure**
+— structure injection fights how agents explore; memory injection fills the amnesia gap.)*
+- On spawning/reviving a claude session, Grafiki delivers a **~300–500-token** brief:
+  top **APPROVED** decisions for this scope (deduped, recency-ranked, titles + evidence
+  links — terse so a dropped qualifier can't overclaim), a pending-review COUNT (never
+  pending content — unreviewed extractor output must not enter an agent's context; that's
+  the propose-never-trust gate), and one line noting `grafiki_map` exists for
+  architecture/history questions.
+- Nudge wording: "query grafiki before re-deriving rationale or re-exploring
+  architecture; read files for code truth" — NOT "before reading files".
+- **Scrub sentinel (day one):** the brief is wrapped in a stable marker line and scrubbed
+  by the capture pipeline (sibling of `scrub_agent_chrome`) so our own extractor never
+  re-extracts injected decisions as fresh candidates (memory-echo loop).
+- Prefer the skill/CLAUDE.md delivery over PTY typing where possible (typed briefs land
+  as user turns and pollute the transcript); once-guarded like the handoff prompt.
 - Configurable: Settings toggle (default ON for claude sessions, OFF for bare shells);
-  never inject when not capturing.
-- Skill/CLAUDE.md snippet generator: `grafiki install-skill` writes the "query before you
-  read" guidance for non-hosted agents (mirrors graphify's nudge layer).
-- Acceptance: live session visibly consults grafiki before file exploration on a seeded
-  question; injection adds ≤1.5k tokens.
+  never inject when not capturing; staleness rule for revive vs fresh spawn.
+- Skill/CLAUDE.md snippet generator: `grafiki install-skill` for non-hosted agents.
+- Acceptance: live session consults grafiki on a seeded rationale question; injection
+  adds ≤500 tokens; injected brief provably absent from extraction candidates.
 
 ### T1.3 Multi-language extraction — tree-sitter, TypeScript + Python first
+*(Re-sequenced per the karpathy-ai-advisor review: **T1.3 moves BEHIND a
+benchmark-informed gate** — ship T1.1/T1.2/T1.4 on the existing Rust-only graph first
+(~787 symbols from our own core), then let benchmark data decide whether structure
+depth is the bottleneck before spending half the week and the pure-Rust build posture.)*
 - **Posture decision to confirm:** M-E4 chose `syn` to stay pure-Rust. tree-sitter crates
   compile C grammars via `cc` — accepted here as the cost of multi-language (graphify's 36
   grammars prove the approach; still a single static binary, just a slower build).
@@ -69,14 +83,24 @@ one, and here's the session where we decided why."
 
 ### T1.4 `grafiki benchmark` — the honest number
 - Methodology (documented in the output itself):
-  - (A) **with memory**: replay N real questions against `grafiki map`/ask; count actual
-    prompt+response tokens of the digest an agent would consume.
-  - (B) **without memory**: measure what the cold agent actually did — from OUR captured
-    transcripts, sum the tool-result tokens of the exploration (greps + file reads) that
-    answered the same question the first time. Real usage, not a strawman.
+  - **(0) LIVE-AGENT LEG (the headline number, per the karpathy-ai-advisor review —
+    artifact-size ratios are still graphify's category error):** for N≈10–20 questions,
+    run a real agent in our own hosted terminal BOTH ways — grafiki MCP on vs. off, same
+    question, same pinned repo state — counting total tokens to a **verified-correct**
+    answer (correctness judged and the judging method disclosed; digest-insufficient runs
+    count as digest + exploration cost, not digest alone).
+  - (A) **with memory** (cheap always-on secondary, clearly labeled): replay N real
+    questions against `grafiki map`/ask; count digest tokens.
+  - (B) **without memory**: from OUR captured transcripts, sum the tool-result tokens of
+    the exploration that answered the same question the first time. Publish the
+    span-cutting rule (exploration vs editing/testing), the question-sampling rule
+    (mined questions are survivor-biased), and pin repo state per question.
   - Report per-question tokens, median/mean reduction, AND the caveat table (small repos
-    ≈ 1×, like graphify honestly admits) AND the non-derivable class: questions whose
-    answer exists only in session memory (reduction = ∞ / "not re-derivable").
+    ≈ 1×, like graphify honestly admits) AND — **lead with this** — the non-derivable
+    class: questions whose answer exists only in session memory (reduction = ∞; no
+    amount of file reading recovers a dead session's reasoning).
+  - T1.1 gains a committed eval set (question → expected symbols/decisions) so digest
+    quality regressions are visible.
 - Print a one-line summary after every extraction run (graphify's trick; it converts).
 - Output: `grafiki benchmark` (plain/md/json) + a committed `worked/` example with real
   inputs and outputs so anyone can reproduce.
