@@ -6,6 +6,9 @@
   whole product (onboarding → sessions/terminal → capture → extraction → Review →
   Memory/chat → Settings/theme → tray), backed by the three-layer test stack
   (`docs/TESTING.md`); log every friction point and bug before any new feature work.
+  **Checklist seed: the five ranked friction hypotheses (H1–H5 + chat-lens bonus) in
+  `docs/UX_CRITIQUE.md`** (2026-07-04 Norman-critic review: silent pipeline failures,
+  Review's inverted error asymmetry, machine internals leaking into human surfaces).
 - **Code graph + injection + honest token benchmark — scoped and PARKED behind the gate
   above** (`docs/CODE_GRAPH_PLAN.md`): Tier 1 = `grafiki map` budgeted digests,
   session-start injection, tree-sitter TS/Py, `grafiki benchmark` on real transcripts.
