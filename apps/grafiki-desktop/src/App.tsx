@@ -7,6 +7,7 @@ import {
 import {
   Activity,
   AlertTriangle,
+  ArrowLeft,
   CheckCircle2,
   CircleDot,
   Database,
@@ -118,6 +119,26 @@ const navItems: Array<{ kind: PaneKind; label: string; icon: typeof LayoutDashbo
   { kind: "candidates", label: "Review", icon: ShieldQuestion },
   { kind: "settings", label: "Settings", icon: Settings },
 ];
+
+// Rail destinations are PAGES — the rail is the only way in/out, so they render
+// no close ✕ (it was a no-op there anyway: closePane early-returns when there's
+// one pane). Only stacked drill-ins get a Back affordance.
+const DRILL_IN_PANE_KINDS = new Set<PaneKind>(["session", "detail"]);
+
+// One-line purpose statement under a page title — replaces the incoherent
+// eyebrow and makes the capture→review→ask lifecycle legible. "" = no line.
+function paneSubtitle(kind: PaneKind): string {
+  switch (kind) {
+    case "candidates":
+      return "Review captured candidates before they become memory.";
+    case "chat":
+      return "Ask your approved memories and project context.";
+    case "settings":
+      return "Capture, local AI, and project configuration.";
+    default:
+      return "";
+  }
+}
 
 const entityTypeOptions = ["concept", "module", "service", "file", "api", "tool", "library", "config", "person", "endpoint"];
 const observationCategories = [
@@ -649,6 +670,10 @@ function Rail(props: {
   );
 }
 
+function tidyPath(path: string): string {
+  return path.replace(/^\/Users\/[^/]+\//, "~/").replace(/^\/home\/[^/]+\//, "~/");
+}
+
 function TopStatus(props: {
   snapshot: ProjectSnapshot | null;
   inspectorOpen: boolean;
@@ -665,7 +690,9 @@ function TopStatus(props: {
         <Database size={16} />
         <div>
           <strong>{project}</strong>
-          <span>{snapshot?.project?.db_path ?? snapshot?.start_dir ?? "Waiting for memory"}</span>
+          <span title={snapshot?.project?.db_path ?? snapshot?.start_dir ?? ""}>
+            {tidyPath(snapshot?.project?.db_path ?? snapshot?.start_dir ?? "Waiting for memory")}
+          </span>
         </div>
       </div>
 
@@ -673,9 +700,17 @@ function TopStatus(props: {
         <StatusPill tone={memoryAvailable ? "good" : "warn"} icon={memoryAvailable ? CheckCircle2 : AlertTriangle}>
           {memoryAvailable ? "Memory online" : "Initialize needed"}
         </StatusPill>
-        <StatusPill tone="accent" icon={Sparkles}>
-          {embedding ? `${embedding.fresh_records}/${embedding.embeddable_records} fresh` : "Embeddings"}
-        </StatusPill>
+        {embedding && embedding.embeddable_records > 0 ? (
+          <StatusPill
+            tone="accent"
+            icon={Sparkles}
+            title={`${embedding.fresh_records}/${embedding.embeddable_records} records embedded`}
+          >
+            {embedding.fresh_records >= embedding.embeddable_records
+              ? "Memory up to date"
+              : `${embedding.embeddable_records - embedding.fresh_records} to embed`}
+          </StatusPill>
+        ) : null}
         <button
           className={`icon-button inspector-toggle ${props.inspectorOpen ? "active" : ""}`}
           type="button"
@@ -692,11 +727,12 @@ function TopStatus(props: {
 function StatusPill(props: {
   tone: "good" | "warn" | "neutral" | "accent";
   icon: typeof CheckCircle2;
+  title?: string;
   children: React.ReactNode;
 }) {
   const Icon = props.icon;
   return (
-    <span className={`status-pill ${props.tone}`}>
+    <span className={`status-pill ${props.tone}`} title={props.title}>
       <Icon size={14} />
       {props.children}
     </span>
@@ -738,14 +774,18 @@ function MemoryPane(props: {
     >
       {pane.kind !== "home" ? (
         <header className="pane-header">
-          <div>
-            <span className="pane-kind">{pane.kind === "candidates" ? "review" : pane.kind}</span>
-            <h2>{pane.title}</h2>
-          </div>
-          <div className="pane-actions">
-            <button onClick={props.onClose} title="Close pane">
-              <X size={15} />
+          {DRILL_IN_PANE_KINDS.has(pane.kind) ? (
+            <button
+              className="pane-back"
+              onClick={() => (pane.kind === "detail" ? props.onClose() : props.onNavigate("home"))}
+              title="Back"
+            >
+              <ArrowLeft size={15} /> Back
             </button>
+          ) : null}
+          <div className="pane-heading">
+            <h2>{pane.title}</h2>
+            {paneSubtitle(pane.kind) ? <p className="pane-purpose">{paneSubtitle(pane.kind)}</p> : null}
           </div>
         </header>
       ) : null}
@@ -1176,6 +1216,15 @@ function HomePane(props: {
   const sessions = ledger?.sessions ?? [];
   const projectLabel =
     props.projectRoot || props.snapshot?.start_dir || "no project folder set";
+  // True first-run = no live/resumable session, no sessions this week, no
+  // memories, nothing pending. The marketing hero is reserved for THAT only —
+  // a returning user with real state should see activity, not the pitch.
+  const hasAnyState =
+    !!live ||
+    !!resumable ||
+    sessions.length > 0 ||
+    (ledger?.memories_week ?? 0) > 0 ||
+    (ledger?.pending_candidates ?? 0) > 0;
 
   // The truthful capture→extraction chain, first broken link named. Three
   // independent gates (init, consent, local model) previously failed silently
@@ -1242,27 +1291,38 @@ function HomePane(props: {
   const hasToday = groups.some((group) => group.day === "Today");
 
   return (
-    <>
-      <div className="home-view">
-        <h1 className="home-title">{hasToday ? "Today" : "Home"}</h1>
-        <p className="home-meta">
-          {projectLabel}
-          {props.snapshot?.memory_available ? " · memory online" : " · initialize in Settings"}
+    <div className="home-view">
+      <h1 className="home-title">{hasToday ? "Today" : "Home"}</h1>
+        <p className="home-meta" title={projectLabel}>
+          {tidyPath(projectLabel)}
+          {props.snapshot?.memory_available ? "" : " · initialize in Settings"}
         </p>
         {pipelineIssue ? <p className="home-pipeline-hint">{pipelineIssue}</p> : null}
 
         <div className="stat-strip">
-          <div className="stat-card">
+          <div className={`stat-card ${(ledger?.sessions_week ?? 0) === 0 ? "stat-card--muted" : ""}`}>
             <b>{useCountUp(ledger?.sessions_week) ?? "–"}</b>
             <span>sessions this week</span>
           </div>
-          <div className="stat-card">
+          <div className={`stat-card ${(ledger?.memories_week ?? 0) === 0 ? "stat-card--muted" : ""}`}>
             <b>{useCountUp(ledger?.memories_week) ?? "–"}</b>
             <span>memories this week</span>
           </div>
-          <div className="stat-card">
+          <div
+            className={`stat-card ${(ledger?.pending_candidates ?? 0) > 0 ? "stat-card--action" : "stat-card--muted"}`}
+            role={(ledger?.pending_candidates ?? 0) > 0 ? "button" : undefined}
+            tabIndex={(ledger?.pending_candidates ?? 0) > 0 ? 0 : undefined}
+            onClick={(ledger?.pending_candidates ?? 0) > 0 ? () => props.onNavigate("candidates") : undefined}
+            onKeyDown={(event) => {
+              if ((ledger?.pending_candidates ?? 0) > 0 && (event.key === "Enter" || event.key === " ")) {
+                event.preventDefault();
+                props.onNavigate("candidates");
+              }
+            }}
+          >
             <b>{useCountUp(ledger?.pending_candidates) ?? "–"}</b>
             <span>waiting for review</span>
+            {(ledger?.pending_candidates ?? 0) > 0 ? <span className="stat-go">Review →</span> : null}
           </div>
         </div>
 
@@ -1273,7 +1333,7 @@ function HomePane(props: {
             animate={{ opacity: 1, y: 0 }}
             transition={transition.quick}
           >
-            <div className="term-preview">{live.tail || "…"}</div>
+            {live.tail?.trim() ? <div className="term-preview">{live.tail}</div> : null}
             <div className="live-bar">
               <span className="pulse-dot" />
               {live.launch || "shell"} ·{" "}
@@ -1323,13 +1383,13 @@ function HomePane(props: {
           </motion.div>
         ) : null}
 
-        {sessions.length === 0 && !live ? (
+        {!hasAnyState ? (
           <div className="home-empty">
             <h3>
               Your agent forgets every session. Grafiki <em>remembers</em>.
             </h3>
             <p className="muted" style={{ maxWidth: 420 }}>
-              Start a session below — work normally, and everything worth keeping comes back
+              Start your first session — work normally, and everything worth keeping comes back
               here as memory.
             </p>
             {pipelineIssue ? (
@@ -1343,7 +1403,7 @@ function HomePane(props: {
               </button>
             </div>
           </div>
-        ) : (
+        ) : sessions.length > 0 ? (
           groups.map((group) => (
             <div key={group.day}>
               <div className="ledger-day">{group.day}</div>
@@ -1387,10 +1447,16 @@ function HomePane(props: {
               ))}
             </div>
           ))
+        ) : (
+          <div className="home-quiet">
+            <p>No sessions yet this week — your recent activity will show up here.</p>
+            <button className="button primary" onClick={() => props.onNavigate("terminal")}>
+              Start a session
+            </button>
+          </div>
         )}
-      </div>
 
-      <div className="ask-bar-wrap">
+        <div className="ask-bar-wrap">
         <div className="search-box">
           <Sparkles size={15} />
           <input
@@ -1408,7 +1474,7 @@ function HomePane(props: {
           <button onClick={submitAsk}>Ask</button>
         </div>
       </div>
-    </>
+    </div>
   );
 }
 

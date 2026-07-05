@@ -28,30 +28,69 @@
   --hairline: rgba(27, 26, 23, 0.08);
   --hairline-2: rgba(27, 26, 23, 0.16);
 
-  /* Accent, two tiers */
-  --accent: #0b4a32;
-  --accent-live: #2e9e6b;
-  --accent-soft: #e7f0ea;
-  --accent-ink: #0b4a32;
+  /* Accent — GREEN HAS ONE JOB: brand + active nav + the single primary action.
+     Everything that used to be green for other reasons now uses a role below. */
+  --accent: #0b4a32;        /* brand / primary fill / active nav */
+  --accent-hover: #0d5a3d;  /* primary :hover */
+  --accent-live: #2e9e6b;   /* LIVE / running ONLY — the pulse, "capturing" */
+  --accent-soft: #e7f0ea;   /* pale wash behind banners / active cards */
+  --accent-ink: #0b4a32;    /* accent-tinted text (ledger counts) */
+  --on-accent: #f4faf6;     /* text / icon on an accent fill */
 
-  /* Semantics — chips/dots only, never backgrounds */
-  --ok: #2e9e6b;
+  /* Semantic status — chips / dots / icons / labels only, never large fills.
+     Distinct hues so the states stop colliding on green:
+       selected/active = accent · approved/online = success · neutral = info */
+  --success: #2e9e6b;       /* success / approved / online */
+  --success-soft: #e4f2ea;
+  --info: #3d6e8e;          /* slate: neutral status, tag-chip borders */
+  --info-soft: #e8eef3;
+  --ok: #2e9e6b;            /* legacy alias of --success (kept for existing refs) */
   --warn: #c7912b;
   --danger: #c4483c;
   --danger-soft: #faeae8;
+  --danger-border: rgba(196, 72, 60, 0.35);
+
+  /* Neutral interaction tints — so "selected"/"hover" are NOT green. */
+  --hover-tint: rgba(27, 26, 23, 0.05);
+  --selected-bg: rgba(27, 26, 23, 0.05);
 
   /* Type */
   --serif: "Newsreader Variable", Georgia, serif;
   --sans: "Inter Variable", -apple-system, system-ui, sans-serif;
   --mono: "JetBrains Mono Variable", ui-monospace, Menlo, monospace;
 
+  /* Type scale */
+  --fs-hero: 26px;    /* Home brand title (serif) */
+  --fs-title: 20px;   /* operational page titles (sans) */
+  --fs-section: 15px;
+  --fs-card: 14px;
+  --fs-body: 13.5px;
+  --fs-meta: 12px;
+  --fs-tiny: 11px;
+
+  /* Spacing scale (8px base) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-8: 48px;
+
   /* Geometry */
-  --r-sheet: 14px;
+  --r-sheet: 10px;   /* was 14px — tighter, less toy-like inside the dark frame */
   --r-card: 10px;
   --r-btn: 8px;
   --r-pill: 999px;
   --frame-margin: 10px;
   --titlebar: 40px; /* traffic-light overlay clearance */
+
+  /* One page scaffold: shared left gutter + intentional per-screen max-widths.
+     Every screen left-aligns to the .pane-body gutter and caps its RIGHT edge
+     with one of these, so left edges line up as you navigate. */
+  --page-max-dashboard: 1040px;
+  --page-max-form: 880px;
+  --page-max-reading: 900px;
 }
 
 /* ------------------------------------------------- dark theme (Snowy night)
@@ -70,15 +109,15 @@
   --accent-soft: rgba(46, 158, 107, 0.14);
   --accent-ink: #7fd3ac;
   --danger-soft: rgba(196, 72, 60, 0.15);
-}
-[data-theme="dark"] .button.primary,
-[data-theme="dark"] .pane-body button.primary,
-[data-theme="dark"] .search-box button {
-  color: #04150c;
-}
-[data-theme="dark"] .button.primary:hover,
-[data-theme="dark"] .pane-body button.primary:hover {
-  background: #6cc79c;
+  --danger-border: rgba(196, 72, 60, 0.45);
+  --success: #4fc38c;
+  --success-soft: rgba(46, 158, 107, 0.16);
+  --info: #6fa2c2;
+  --info-soft: rgba(61, 110, 142, 0.16);
+  --on-accent: #04150c; /* dark theme: dark text on the lighter accent */
+  --accent-hover: #6cc79c;
+  --hover-tint: rgba(255, 255, 255, 0.06);
+  --selected-bg: rgba(255, 255, 255, 0.06);
 }
 [data-theme="dark"] .lens-inline-code {
   background: rgba(255, 255, 255, 0.09);
@@ -339,27 +378,55 @@ textarea,
 .pane-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 14px 20px 10px;
+  gap: 12px;
+  padding: 16px 20px 10px;
+}
+.pane-heading {
+  min-width: 0;
+}
+/* Operational page titles are sans (serif is reserved for the Home brand hero,
+   which was reading as oddly editorial on admin screens like Settings/Review). */
+.pane-header h2 {
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: var(--fs-title);
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+}
+/* Replaces the incoherent eyebrow ("SETTINGS / Settings", "CHAT / Memory") with
+   a real one-line statement of what the page is for. */
+.pane-purpose {
+  margin-top: 3px;
+  font-size: var(--fs-meta);
+  color: var(--ink-2);
+  line-height: 1.45;
 }
 .pane-kind {
-  display: block;
-  font-size: 10px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--accent-ink);
-  font-weight: 600;
+  display: none; /* legacy eyebrow retired */
 }
-.pane-header h2 {
-  font-family: var(--serif);
-  font-weight: 500;
-  font-size: 22px;
-  line-height: 1.15;
+/* Back affordance for DRILL-IN panes only (session, stacked detail). Rail
+   destinations are pages — you leave them via the rail, not a close button. */
+.pane-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px 4px 4px;
+  border: 0;
+  background: none;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  border-radius: var(--r-btn);
+  flex-shrink: 0;
+}
+.pane-back:hover {
+  background: var(--hover-tint);
   color: var(--ink);
 }
 .pane-actions {
   display: flex;
   gap: 6px;
+  flex-shrink: 0;
 }
 .pane-body {
   flex: 1;
@@ -388,8 +455,13 @@ textarea,
 button {
   cursor: pointer;
 }
+/* The exclusions here USED to give this base rule specificity (0,5,1), which
+   silently out-specified .pane-body button.primary (0,2,1) and .search-box
+   button (0,1,1) — so every primary CTA and the Ask button painted white
+   instead of accent green. :where() zeroes the exclusion specificity, dropping
+   the base to (0,1,1) so the tier rules below actually win. */
 .button,
-.pane-body button:not(.link-button):not(.icon-button):not(.evidence-chip):not(.seg-tab),
+.pane-body button:where(:not(.link-button):not(.icon-button):not(.evidence-chip):not(.seg-tab)),
 .prompt-actions button,
 .inspector button {
   background: var(--card);
@@ -405,23 +477,51 @@ button {
 .pane-body button:hover:not(:disabled) {
   border-color: var(--ink-3);
 }
+/* Tiers: primary (green fill, one per screen) · secondary (default outline) ·
+   ghost (bare, low-priority) · danger (destructive: End session / Reject / Stop). */
 .button.primary,
 .pane-body button.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #f2f8f4;
+  color: var(--on-accent);
+  font-weight: 600;
 }
-.button.primary:hover,
-.pane-body button.primary:hover {
-  background: #0d5a3d;
+.button.primary:hover:not(:disabled),
+.pane-body button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
 }
 .button.secondary {
-  background: transparent;
+  background: var(--card);
+}
+.button.ghost,
+.pane-body button.ghost {
+  background: none;
+  border-color: transparent;
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.button.ghost:hover:not(:disabled),
+.pane-body button.ghost:hover:not(:disabled) {
+  background: var(--hover-tint);
+  color: var(--ink);
+}
+.button.danger,
+.pane-body button.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+  font-weight: 600;
+}
+.button.danger:hover:not(:disabled),
+.pane-body button.danger:hover:not(:disabled) {
+  background: #b23d32;
+  border-color: #b23d32;
 }
 .danger-button,
 .button.danger-button {
   color: var(--danger);
-  border-color: rgba(196, 72, 60, 0.35);
+  border-color: var(--danger-border);
 }
 button:disabled {
   opacity: 0.45;
@@ -557,7 +657,7 @@ textarea {
 }
 .search-box button {
   background: var(--accent);
-  color: #f2f8f4;
+  color: var(--on-accent);
   border: 0;
   border-radius: var(--r-pill);
   padding: 5px 14px;
@@ -716,6 +816,21 @@ textarea {
   align-items: center;
   gap: 8px;
 }
+/* Title and meta are separate inline elements; without a gap they render glued
+   together ("GIT LOGTODAY"). Space them, and let the title carry the weight. */
+.candidate-group-header > div:first-child {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.candidate-group-header > div:first-child > strong {
+  color: var(--ink-2);
+}
+.candidate-group-header > div:first-child > span {
+  font-weight: 500;
+  color: var(--ink-3);
+}
 .candidate-group-list {
   display: flex;
   flex-direction: column;
@@ -767,6 +882,21 @@ textarea {
 }
 .candidate-select {
   accent-color: var(--accent);
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+/* The title (<strong>) and the meta line (<small>) are adjacent inline elements;
+   without stacking they glue together ("...imported at init" + "context" =
+   "initcontext"). Stack them so the title reads clean and the meta sits under it. */
+.candidate-select > span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.candidate-select > span > small {
+  color: var(--ink-3);
 }
 .candidate-actions {
   display: flex;
@@ -1064,24 +1194,23 @@ textarea {
 
 /* ============================================================ HOME LEDGER */
 .home-view {
-  max-width: 860px;
+  max-width: var(--page-max-dashboard);
   width: 100%;
-  margin: 0 auto;
+  margin: 0; /* left-aligned so Home lines up with every other page */
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding-bottom: 70px; /* room for the ask bar */
+  gap: var(--space-4);
 }
 .home-title {
   font-family: var(--serif);
   font-weight: 500;
-  font-size: 30px;
+  font-size: var(--fs-hero);
   margin-top: 8px;
 }
 .home-meta {
-  color: var(--ink-3);
-  font-size: 12px;
-  margin-top: -8px;
+  color: var(--ink-2); /* was --ink-3 — too faint for the one orienting line */
+  font-size: var(--fs-meta);
+  margin-top: -4px;
 }
 .home-pipeline-hint {
   color: var(--accent-ink);
@@ -1114,10 +1243,58 @@ textarea {
   color: var(--ink-3);
   font-weight: 600;
 }
+/* The one actionable metric ("waiting for review") is a real button and looks
+   it; the passive metrics recede, and a big grey "0" is never the loudest thing. */
+.stat-card--action {
+  cursor: pointer;
+  border-color: var(--hairline-2);
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.stat-card--action:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.stat-card--action:focus-visible {
+  outline: 2px solid var(--accent-live);
+  outline-offset: 1px;
+}
+.stat-card--action b {
+  color: var(--accent-ink);
+}
+.stat-card span {
+  display: block;
+}
+.stat-card--action .stat-go {
+  display: block;
+  margin-top: 4px;
+  font-size: var(--fs-tiny);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent-ink);
+  font-weight: 650;
+}
+.stat-card--muted b {
+  color: var(--ink-3);
+  font-weight: 400;
+}
+
+/* Populated-but-no-sessions-this-week middle state — keeps low-data Home useful. */
+.home-quiet {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-6) 0;
+}
+.home-quiet p {
+  font-size: var(--fs-body);
+  color: var(--ink-2);
+}
 
 /* live session card */
 .live-card {
   border: 1px solid var(--hairline-2);
+  border-left: 3px solid var(--accent-live); /* reads as "active" even with no terminal strip */
   border-radius: var(--r-card);
   overflow: hidden;
   box-shadow: 0 1px 2px rgba(3, 33, 19, 0.05);
@@ -1245,21 +1422,16 @@ textarea {
 }
 
 /* floating ask bar */
+/* Ask lives IN the flow now (a labeled band at the end of the ledger), not
+   floating absolutely at the bottom where it felt disconnected and left the
+   middle of the page dead. */
 .ask-bar-wrap {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 14px;
-  display: flex;
-  justify-content: center;
-  pointer-events: none;
-  padding: 0 20px;
-  z-index: 10;
+  margin-top: var(--space-2);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--hairline);
 }
 .ask-bar-wrap .search-box {
-  pointer-events: auto;
-  width: min(560px, 100%);
-  box-shadow: 0 6px 24px rgba(3, 33, 19, 0.14);
+  width: min(640px, 100%);
 }
 
 /* home empty state */

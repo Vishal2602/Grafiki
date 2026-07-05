@@ -121,8 +121,10 @@ describe("Grafiki desktop", () => {
 
   it("navigates every rail destination", async () => {
     await landOnHome();
+    // The eyebrow (.pane-kind) was retired in the modal→page overhaul; every
+    // non-home destination now renders a .pane-header with its title.
     const destinations = [
-      ["Sessions", ".pane-kind"],
+      ["Sessions", ".pane-header"],
       ["Memory", ".seg-tabs"],
       ["Review", ".candidate-toolbar"],
       ["Settings", ".settings-grid"],
