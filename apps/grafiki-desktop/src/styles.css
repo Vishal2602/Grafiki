@@ -818,31 +818,36 @@ textarea {
   margin-bottom: 14px;
 }
 .candidate-group-header {
-  font-size: 10.5px;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--ink-3);
-  font-weight: 650;
-  padding: 6px 2px;
-  border-bottom: 1px solid var(--hairline-2);
+  font-size: 12px;
+  color: var(--ink-2);
+  font-weight: 600;
+  padding: 10px 2px 6px;
+  border-bottom: 1px solid var(--hairline);
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
 }
-/* Title and meta are separate inline elements; without a gap they render glued
-   together ("GIT LOGTODAY"). Space them, and let the title carry the weight. */
+/* Title and meta are separate flex children; the gap keeps them from gluing
+   together ("GIT LOGTODAY"). Sentence case now — the title carries the weight. */
 .candidate-group-header > div:first-child {
   display: flex;
   align-items: baseline;
   gap: 8px;
   min-width: 0;
+  flex-wrap: wrap;
 }
 .candidate-group-header > div:first-child > strong {
-  color: var(--ink-2);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: capitalize;
 }
 .candidate-group-header > div:first-child > span {
-  font-weight: 500;
+  font-weight: 400;
   color: var(--ink-3);
+  font-size: 11.5px;
 }
 .candidate-group-list {
   display: flex;
@@ -877,8 +882,9 @@ textarea {
 }
 .candidate-card-header {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
   flex-wrap: wrap;
 }
 .candidate-card-header strong {
@@ -2180,4 +2186,149 @@ button:active:not(:disabled) {
 }
 .mem-scope input {
   width: 200px;
+}
+
+/* ===== Review: labeled actions, confidence, chips, contextual bulk ===== */
+/* Small button (icon + label) for per-card + per-group actions. */
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.candidate-primary-actions,
+.candidate-group-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+/* Card submeta: a chip row under the title (replaces the glued "/"-joined string). */
+.candidate-submeta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.candidate-submeta-time {
+  color: var(--ink-3);
+  font-size: 11px;
+}
+.select-shortcut {
+  font-size: 11.5px;
+}
+/* Contextual selection bar — only rendered when >0 selected. */
+.bulk-action-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--hairline-2);
+  border-radius: var(--r-card);
+  background: var(--card);
+  flex-wrap: wrap;
+}
+.bulk-count {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  margin-right: auto;
+}
+/* Collapsed keyboard-shortcut helper (was the second-loudest element). */
+.kbd-help > summary {
+  cursor: pointer;
+  color: var(--ink-3);
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  list-style: none;
+  width: max-content;
+}
+.kbd-help > summary::-webkit-details-marker {
+  display: none;
+}
+.kbd-help > summary::before {
+  content: "⌘ ";
+  opacity: 0.7;
+}
+.kbd-help-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding-top: 6px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+/* Chip variants (base .chip defined with the Session status chips above). */
+.chip-type {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-3);
+  background: transparent;
+}
+.chip-status {
+  text-transform: capitalize;
+}
+.chip-status.chip-rejected {
+  color: var(--danger);
+  border-color: var(--danger-soft);
+}
+.chip-status.chip-approved {
+  color: var(--ok);
+  border-color: rgba(46, 158, 107, 0.3);
+}
+/* Confidence: scannable tier + mini threshold bar. Low = red so it pops. */
+.confidence-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+.confidence-bar {
+  display: inline-block;
+  width: 26px;
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: var(--hairline-2);
+  overflow: hidden;
+}
+.confidence-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-pill);
+}
+.conf-low {
+  color: var(--danger);
+}
+.conf-low .confidence-bar > span {
+  background: var(--danger);
+}
+.conf-med {
+  color: var(--warn);
+}
+.conf-med .confidence-bar > span {
+  background: var(--warn);
+}
+.conf-high {
+  color: var(--ink-2);
+}
+.conf-high .confidence-bar > span {
+  background: var(--ok);
+}
+/* MemoryListHeader subtitle (purpose line). */
+.memory-list-header-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.memory-list-header-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.memory-list-header-text > p {
+  font-size: 12.5px;
+  color: var(--ink-2);
+  line-height: 1.5;
 }

@@ -2950,31 +2950,35 @@ function CandidatesPane(props: {
         ) : null}
       </AnimatePresence>
       <MemoryListHeader
-        title="Memory Review"
+        title="Review queue"
+        subtitle="Approve what Grafiki captured before it becomes memory your agents can recall."
         icon={ShieldQuestion}
         loading={loading}
         onRefresh={load}
       />
-      <p className="subtle" style={{ display: "flex", gap: 10, alignItems: "center" }}>
-        <span>
-          <kbd>j</kbd>/<kbd>k</kbd> move
-        </span>
-        <span>
-          <kbd>a</kbd> approve
-        </span>
-        <span>
-          <kbd>r</kbd> reject / reopen
-        </span>
-        <span>
-          <kbd>e</kbd> edit
-        </span>
-        <span>
-          <kbd>v</kbd> evidence
-        </span>
-        <span>
-          <kbd>space</kbd> select
-        </span>
-      </p>
+      <details className="kbd-help">
+        <summary>Keyboard shortcuts</summary>
+        <div className="kbd-help-row">
+          <span>
+            <kbd>j</kbd>/<kbd>k</kbd> move
+          </span>
+          <span>
+            <kbd>a</kbd> approve
+          </span>
+          <span>
+            <kbd>r</kbd> reject / reopen
+          </span>
+          <span>
+            <kbd>e</kbd> edit
+          </span>
+          <span>
+            <kbd>v</kbd> evidence
+          </span>
+          <span>
+            <kbd>space</kbd> select
+          </span>
+        </div>
+      </details>
       <div className="toolbar-row candidate-toolbar">
         <label className="compact-select">
           <span>Status</span>
@@ -3011,6 +3015,22 @@ function CandidatesPane(props: {
           />
         </label>
         <span className="subtle">{visibleCandidates.length}/{candidates.length} candidates</span>
+        <button
+          className="link-button select-shortcut"
+          type="button"
+          onClick={selectAllPending}
+          disabled={!candidates.some((candidate) => candidate.status === "pending")}
+        >
+          Select all pending
+        </button>
+        <button
+          className="link-button select-shortcut"
+          type="button"
+          onClick={selectLowConfidence}
+          disabled={!candidates.some((candidate) => candidate.status === "pending" && candidateIsNoisy(candidate))}
+        >
+          Select low-signal
+        </button>
         {candidates.length > 0 && visibleCandidates.length === 0 && minConfidenceValue > 0 ? (
           <span className="subtle">
             All hidden below {minConfidenceValue.toFixed(2)} — lower Min Confidence to see them.
@@ -3026,25 +3046,22 @@ function CandidatesPane(props: {
           </span>
         ) : null}
       </div>
-      <div className="toolbar-row candidate-toolbar">
-        <span className="subtle">{selectedIds.length} selected</span>
-        <button className="button" type="button" onClick={selectAllPending} disabled={!candidates.some((candidate) => candidate.status === "pending")}>
-          <CheckCircle2 size={15} />
-          Select Pending
-        </button>
-        <button className="button" type="button" onClick={selectLowConfidence} disabled={!candidates.some((candidate) => candidate.status === "pending" && candidateIsNoisy(candidate))}>
-          <ShieldQuestion size={15} />
-          Select Noisy
-        </button>
-        <button className="button primary" type="button" onClick={() => bulkReview("approve")} disabled={!selectedIds.length || Boolean(busyId)}>
-          <CheckCircle2 size={15} />
-          Approve Selected
-        </button>
-        <button className="button danger-button" type="button" onClick={() => bulkReview("reject")} disabled={!selectedIds.length || Boolean(busyId)}>
-          <Trash2 size={15} />
-          Reject Selected
-        </button>
-      </div>
+      {selectedIds.length > 0 ? (
+        <div className="bulk-action-bar">
+          <span className="bulk-count">{selectedIds.length} selected</span>
+          <button className="button primary btn-sm" type="button" onClick={() => bulkReview("approve")} disabled={Boolean(busyId)}>
+            <CheckCircle2 size={14} />
+            Approve selected
+          </button>
+          <button className="button danger-button btn-sm" type="button" onClick={() => bulkReview("reject")} disabled={Boolean(busyId)}>
+            <Trash2 size={14} />
+            Reject selected
+          </button>
+          <button className="link-button" type="button" onClick={() => setSelectedIds([])}>
+            Clear
+          </button>
+        </div>
+      ) : null}
       {message ? (
         <section className="notice compact good">
           <span>{message}</span>
@@ -3085,15 +3102,15 @@ function CandidatesPane(props: {
                     <strong>{group.title}</strong>
                     <span>{group.meta}</span>
                   </div>
-                  <div className="candidate-actions">
-                    <button className="button" type="button" onClick={() => setSelectedIds((ids) => mergeIds(ids, pendingIds))} disabled={!pendingIds.length || Boolean(busyId)}>
-                      Select Group
+                  <div className="candidate-actions candidate-group-actions">
+                    <button className="button btn-sm" type="button" onClick={() => setSelectedIds((ids) => mergeIds(ids, pendingIds))} disabled={!pendingIds.length || Boolean(busyId)}>
+                      Select group
                     </button>
-                    <button className="button primary" type="button" onClick={() => bulkReview("approve", pendingIds)} disabled={!pendingIds.length || Boolean(busyId)}>
-                      Approve Group
+                    <button className="button btn-sm" type="button" onClick={() => bulkReview("approve", pendingIds)} disabled={!pendingIds.length || Boolean(busyId)}>
+                      Approve group
                     </button>
-                    <button className="button danger-button" type="button" onClick={() => bulkReview("reject", noisyIds)} disabled={!noisyIds.length || Boolean(busyId)}>
-                      Reject Noisy
+                    <button className="button btn-sm danger-button" type="button" onClick={() => bulkReview("reject", noisyIds)} disabled={!noisyIds.length || Boolean(busyId)}>
+                      Reject low-signal
                     </button>
                   </div>
                 </header>
@@ -3123,18 +3140,28 @@ function CandidatesPane(props: {
                             />
                             <span>
                               <strong>{candidateTitle(candidate)}</strong>
-                              <small>{candidate.record_type} / {candidate.status} / {Math.round(candidate.confidence * 100)}% / {candidateCreatedDateLabel(candidate)}</small>
+                              <small className="candidate-submeta">
+                                <span className="chip chip-type">{candidate.record_type}</span>
+                                {candidate.status !== "pending" ? (
+                                  <span className={`chip chip-status chip-${candidate.status}`}>{candidate.status}</span>
+                                ) : null}
+                                <ConfidenceChip confidence={candidate.confidence} />
+                                <span className="candidate-submeta-time">{candidateCreatedDateLabel(candidate)}</span>
+                              </small>
                             </span>
                           </label>
-                          <div className="candidate-actions">
-                            <button className="icon-button" type="button" onClick={() => beginEdit(candidate)} disabled={candidate.status !== "pending" || isBusy} title="Edit candidate">
-                              <Pencil size={15} />
+                          <div className="candidate-actions candidate-primary-actions">
+                            <button className="button primary btn-sm" type="button" onClick={() => approve(candidate)} disabled={candidate.status !== "pending" || isBusy}>
+                              <CheckCircle2 size={14} />
+                              Approve
                             </button>
-                            <button className="icon-button success" type="button" onClick={() => approve(candidate)} disabled={candidate.status !== "pending" || isBusy} title="Approve candidate">
-                              <CheckCircle2 size={15} />
+                            <button className="button btn-sm" type="button" onClick={() => beginEdit(candidate)} disabled={candidate.status !== "pending" || isBusy}>
+                              <Pencil size={14} />
+                              Edit
                             </button>
-                            <button className="icon-button danger" type="button" onClick={() => performReject(candidate, "")} disabled={candidate.status !== "pending" || isBusy} title="Reject candidate">
-                              <Trash2 size={15} />
+                            <button className="button danger-button btn-sm" type="button" onClick={() => performReject(candidate, "")} disabled={candidate.status !== "pending" || isBusy}>
+                              <Trash2 size={14} />
+                              Reject
                             </button>
                             <button className="icon-button" type="button" onClick={() => rejectWithNote(candidate)} disabled={candidate.status !== "pending" || isBusy} title="Reject with a note">
                               <MessageSquare size={15} />
@@ -3207,9 +3234,7 @@ function CandidatesPane(props: {
                             <CollapsibleBody text={candidateBody(candidate)} />
                             <div className="candidate-meta-row">
                               <span>{candidate.scope || "global"}</span>
-                              <span>{candidate.source_type}</span>
                               {candidate.source ? <span>{candidate.source}</span> : null}
-                              {candidateIsNoisy(candidate) ? <span>low confidence</span> : null}
                             </div>
                             {candidate.evidence?.length ? (
                               <div className="evidence-chip-row">
@@ -3224,7 +3249,7 @@ function CandidatesPane(props: {
                                       openEvidencePreview(evidence);
                                     }}
                                   >
-                                    {evidence.source_type}: {evidence.title ?? evidence.source ?? "source"}
+                                    {evidence.source ? `${evidence.source_type} · ${evidence.source}` : evidence.source_type}
                                   </button>
                                 ))}
                               </div>
@@ -4521,6 +4546,7 @@ function PromptModal(props: { config: PromptConfig; reduceMotion: boolean; onClo
 
 function MemoryListHeader(props: {
   title: string;
+  subtitle?: string;
   icon: typeof Activity;
   loading: boolean;
   onRefresh: () => void;
@@ -4528,9 +4554,12 @@ function MemoryListHeader(props: {
   const Icon = props.icon;
   return (
     <section className="memory-list-header">
-      <div>
-        <Icon size={16} />
-        <strong>{props.title}</strong>
+      <div className="memory-list-header-text">
+        <div className="memory-list-header-title">
+          <Icon size={16} />
+          <strong>{props.title}</strong>
+        </div>
+        {props.subtitle ? <p>{props.subtitle}</p> : null}
       </div>
       <button className="icon-button" onClick={props.onRefresh} title="Refresh records">
         <RefreshCcw size={15} className={props.loading ? "spin" : ""} />
@@ -4578,13 +4607,14 @@ function groupCandidates(candidates: ExtractionCandidate[]): CandidateGroup[] {
     const first = group.candidates[0];
     const dayLabel = first ? candidateCreatedDateLabel(first) : "unknown";
     const meta = [
+      pending
+        ? `${pending} pending ${pending === 1 ? "memory" : "memories"}`
+        : `${group.candidates.length} ${group.candidates.length === 1 ? "memory" : "memories"}`,
       dayLabel,
-      `${group.candidates.length} item${group.candidates.length === 1 ? "" : "s"}`,
-      `${pending} pending`,
-      noisy ? `${noisy} noisy` : null,
+      noisy ? `${noisy} low-signal` : null,
     ]
       .filter(Boolean)
-      .join(" / ");
+      .join(" · ");
     return { ...group, meta };
   });
 }
@@ -4611,6 +4641,27 @@ function candidateIsNoisy(candidate: ExtractionCandidate): boolean {
   const hasEvidence = Boolean(candidate.evidence?.length);
   const payloadText = compactPayload(candidate.payload).trim();
   return candidate.confidence < 0.45 || (!hasEvidence && candidate.confidence < 0.65) || payloadText.length < 16;
+}
+
+function confidenceTier(confidence: number): { label: string; tone: "low" | "med" | "high" } {
+  if (confidence >= 0.75) return { label: "High", tone: "high" };
+  if (confidence >= 0.5) return { label: "Medium", tone: "med" };
+  return { label: "Low", tone: "low" };
+}
+
+// Confidence with visual weight: a Low/Medium/High label + a mini threshold bar
+// (Low painted red) so a reviewer can scan the queue for weak items at a glance.
+function ConfidenceChip({ confidence }: { confidence: number }) {
+  const tier = confidenceTier(confidence);
+  const pct = Math.round(confidence * 100);
+  return (
+    <span className={`confidence-chip conf-${tier.tone}`} title={`${tier.label} confidence · ${pct}%`}>
+      <span className="confidence-bar">
+        <span style={{ width: `${pct}%` }} />
+      </span>
+      {tier.label} · {pct}%
+    </span>
+  );
 }
 
 function mergeIds(ids: string[], additions: string[]): string[] {
