@@ -2180,7 +2180,9 @@ function ChatPane(props: {
     setSending(true);
     setQuestion("");
     setTurns((prev) => [...prev, { question: q, reply: null, error: null }]);
-    props.onUpdate({ title: `Chat: ${q}`, scope });
+    // Keep the pane title stable ("Memory") — a permanent nav destination
+    // shouldn't rename itself to the last question asked.
+    props.onUpdate({ scope });
     try {
       const reply = await chatWithMemory({
         startDir: props.projectRoot,
@@ -2209,7 +2211,7 @@ function ChatPane(props: {
     >
       <div className="seg-tabs">
         <button className={`seg-tab ${memTab === "chat" ? "active" : ""}`} onClick={() => setMemTab("chat")}>
-          Chat
+          Ask
         </button>
         <button
           className={`seg-tab ${memTab === "decisions" ? "active" : ""}`}
@@ -2224,14 +2226,31 @@ function ChatPane(props: {
           Context
         </button>
       </div>
+      <p className="mem-caption">
+        {memTab === "chat"
+          ? "Answers come only from your approved memory — always with sources."
+          : memTab === "decisions"
+            ? "Durable project choices Grafiki can recall later — approved from review candidates."
+            : "Project context imported automatically from CLAUDE.md, git history, transcripts, and files."}
+      </p>
       {memTab === "decisions" ? (
-        decisions === null ? (
-          <p className="muted">Loading…</p>
-        ) : decisions.length === 0 ? (
-          <div className="empty-record-list">No decisions yet — approve some in Review.</div>
-        ) : (
-          <div className="dense-list" style={{ overflowY: "auto" }}>
-            {decisions.map((decision) => (
+        <div className="mem-tab-panel">
+          {decisions === null ? (
+            <p className="muted">Loading…</p>
+          ) : decisions.length === 0 ? (
+            <div className="mem-empty">
+              <h3>No approved decisions yet</h3>
+              <p>
+                Decisions are durable project choices Grafiki can recall later. Approve
+                decision-like candidates in Review to build a lasting project record.
+              </p>
+              <button className="button primary" onClick={() => props.onNavigate("candidates")}>
+                Open Review
+              </button>
+            </div>
+          ) : (
+            <div className="dense-list">
+              {decisions.map((decision) => (
               <div
                 key={decision.id}
                 className="data-row"
@@ -2252,143 +2271,147 @@ function ChatPane(props: {
                   {decision.status}
                 </span>
               </div>
-            ))}
-          </div>
-        )
+              ))}
+            </div>
+          )}
+        </div>
       ) : null}
       {memTab === "context" ? (
-        contexts === null ? (
-          <p className="muted">Loading…</p>
-        ) : contexts.length === 0 ? (
-          <div className="empty-record-list">No context documents yet.</div>
-        ) : (
-          <div className="dense-list" style={{ overflowY: "auto" }}>
-            {contexts.map((context) => (
-              <div
-                key={context.key}
-                className="data-row"
-                style={{ cursor: "pointer" }}
-                onClick={() =>
-                  props.onOpenResult({
-                    record_type: "context",
-                    id: context.key,
-                    title: context.title,
-                    snippet: "",
-                    scope: context.scope,
-                  })
-                }
-              >
-                <span className="record-type">context</span>
-                <b style={{ fontWeight: 550 }}>{context.title}</b>
-                <span className="subtle" style={{ marginLeft: "auto" }}>
-                  {context.category}
-                </span>
-              </div>
-            ))}
-          </div>
-        )
+        <div className="mem-tab-panel">
+          {contexts === null ? (
+            <p className="muted">Loading…</p>
+          ) : contexts.length === 0 ? (
+            <div className="mem-empty">
+              <h3>No project context yet</h3>
+              <p>
+                Grafiki imports context automatically from CLAUDE.md, git history, session
+                transcripts, and files. Run a session and it fills in as you work.
+              </p>
+              <button className="button" onClick={() => props.onNavigate("terminal", { query: "claude" })}>
+                Start a session
+              </button>
+            </div>
+          ) : (
+            <div className="dense-list">
+              {contexts.map((context) => (
+                <div
+                  key={context.key}
+                  className="data-row"
+                  style={{ cursor: "pointer" }}
+                  onClick={() =>
+                    props.onOpenResult({
+                      record_type: "context",
+                      id: context.key,
+                      title: context.title,
+                      snippet: "",
+                      scope: context.scope,
+                    })
+                  }
+                >
+                  <span className="record-type">context</span>
+                  <b style={{ fontWeight: 550 }}>{context.title}</b>
+                  <span className="subtle" style={{ marginLeft: "auto" }}>
+                    {context.category}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       ) : null}
-      <div
-        style={{
-          flex: 1,
-          overflowY: "auto",
-          display: memTab === "chat" ? "flex" : "none",
-          flexDirection: "column",
-          gap: 16,
-        }}
-      >
-        {turns.length === 0 ? (
-          <p className="muted" style={{ margin: "auto", textAlign: "center", maxWidth: 380 }}>
-            Ask your memory anything. Answers are built only from what Grafiki has stored — with
-            sources — and it tells you honestly when it doesn't know.
-          </p>
-        ) : null}
-        {turns.map((turn, index) => (
-          <div key={index} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            <div
-              style={{
-                alignSelf: "flex-end",
-                background: "rgba(255,255,255,0.06)",
-                padding: "8px 12px",
-                borderRadius: 10,
-                maxWidth: "80%",
-              }}
-            >
-              {turn.question}
+      <div className="mem-chat-scroll" style={{ display: memTab === "chat" ? "flex" : "none" }}>
+        <div className="mem-column" style={{ display: "flex", flexDirection: "column", flex: 1, gap: 16 }}>
+          {turns.length === 0 ? (
+            <div className="mem-empty">
+              <h3>Ask your project memory</h3>
+              <p>
+                It answers only from what Grafiki has stored — always with sources — and says so
+                honestly when it doesn't know. Try one of these:
+              </p>
+              <div className="mem-examples">
+                {[
+                  "What did we decide about local AI?",
+                  "What bugs were fixed last session?",
+                  "What paths are blocked from capture?",
+                ].map((example) => (
+                  <button key={example} className="mem-example" onClick={() => void ask(example)}>
+                    {example}
+                  </button>
+                ))}
+              </div>
             </div>
-            <div style={{ alignSelf: "flex-start", maxWidth: "92%" }}>
-              {turn.reply ? (
-                <>
-                  <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.5 }}>{turn.reply.answer}</div>
-                  {turn.reply.citations.length > 0 ? (
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
-                      {turn.reply.citations.map((citation) => (
-                        <button
-                          key={citation.index}
-                          title={citation.snippet}
-                          onClick={() =>
-                            props.onOpenResult({
-                              record_type: citation.record_type,
-                              id: citation.id,
-                              title: citation.title,
-                              snippet: citation.snippet,
-                              scope,
-                            })
-                          }
-                          style={{
-                            fontSize: 12,
-                            padding: "3px 8px",
-                            borderRadius: 999,
-                            border: "1px solid rgba(255,255,255,0.15)",
-                            background: "transparent",
-                            cursor: "pointer",
-                          }}
-                        >
-                          [{citation.index}] {citation.title || citation.record_type}
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
-                  {turn.reply.used_memory ? (
-                    <button
-                      className="link-button"
-                      style={{ marginTop: 8, fontSize: 12 }}
-                      onClick={() =>
-                        props.onNavigate("terminal", {
-                          query: "claude",
-                          handoffPrompt: `Context from my project memory (Grafiki): Q: ${turn.question} — A: ${turn.reply?.answer ?? ""} — Continue working from these decisions.`,
-                        })
-                      }
-                    >
-                      Continue this with Claude →
-                    </button>
-                  ) : null}
-                  {turn.reply.flagged_injection ? (
-                    <p className="muted" style={{ marginTop: 6, fontSize: 12 }}>
-                      ⚠ Some retrieved memory looks like it contains instructions — treated as data,
-                      not commands.
-                    </p>
-                  ) : null}
-                </>
-              ) : turn.error ? (
-                <p style={{ color: "var(--danger, #ff6b6b)" }}>{turn.error}</p>
-              ) : (
-                <p className="muted">Thinking…</p>
-              )}
+          ) : null}
+          {turns.map((turn, index) => (
+            <div key={index} className="mem-turn">
+              <div className="mem-bubble user">{turn.question}</div>
+              <div className="mem-answer">
+                {turn.reply ? (
+                  <>
+                    <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.6 }}>{turn.reply.answer}</div>
+                    {turn.reply.citations.length > 0 ? (
+                      <div className="mem-cites">
+                        {turn.reply.citations.map((citation) => (
+                          <button
+                            key={citation.index}
+                            className="mem-cite"
+                            title={citation.snippet}
+                            onClick={() =>
+                              props.onOpenResult({
+                                record_type: citation.record_type,
+                                id: citation.id,
+                                title: citation.title,
+                                snippet: citation.snippet,
+                                scope,
+                              })
+                            }
+                          >
+                            [{citation.index}] {citation.title || citation.record_type}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                    {turn.reply.used_memory ? (
+                      <button
+                        className="link-button"
+                        style={{ marginTop: 8, fontSize: 12 }}
+                        onClick={() =>
+                          props.onNavigate("terminal", {
+                            query: "claude",
+                            handoffPrompt: `Context from my project memory (Grafiki): Q: ${turn.question} — A: ${turn.reply?.answer ?? ""} — Continue working from these decisions.`,
+                          })
+                        }
+                      >
+                        Continue this with Claude →
+                      </button>
+                    ) : null}
+                    {turn.reply.flagged_injection ? (
+                      <p className="muted" style={{ marginTop: 6, fontSize: 12 }}>
+                        ⚠ Some retrieved memory looks like it contains instructions — treated as data,
+                        not commands.
+                      </p>
+                    ) : null}
+                  </>
+                ) : turn.error ? (
+                  <p style={{ color: "var(--danger, #ff6b6b)" }}>{turn.error}</p>
+                ) : (
+                  <p className="muted">Thinking…</p>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
+          ))}
+        </div>
       </div>
 
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        <div className="toolbar-row" style={{ gap: 12, alignItems: "center" }}>
-          <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+      {memTab === "chat" ? (
+      <div className="mem-composer mem-column">
+        <div className="mem-options">
+          <label>
             <input
               type="checkbox"
               checked={useModel}
               onChange={(event) => setUseModel(event.target.checked)}
             />
-            <span>Use local AI</span>
+            <span>Answer locally</span>
           </label>
           {useModel ? (
             <>
@@ -2412,12 +2435,13 @@ function ChatPane(props: {
               ) : null}
             </>
           ) : null}
-          <label className="compact-select" style={{ marginLeft: "auto" }}>
+          <label className="compact-select mem-scope">
             <span>Scope</span>
             <input
               value={scope}
               onChange={(event) => setScope(event.target.value)}
-              placeholder="global or project/module"
+              placeholder="All memory"
+              title="Limit answers to a scope such as a project or module path. Leave empty to search everything."
             />
           </label>
         </div>
@@ -2435,15 +2459,12 @@ function ChatPane(props: {
             placeholder="Ask your memory…"
             autoComplete="off"
           />
-          <button
-            onClick={() => void ask()}
-            disabled={sending || !question.trim()}
-            style={{ padding: "6px 14px" }}
-          >
+          <button onClick={() => void ask()} disabled={sending || !question.trim()}>
             {sending ? "…" : "Ask"}
           </button>
         </div>
       </div>
+      ) : null}
     </div>
   );
 }

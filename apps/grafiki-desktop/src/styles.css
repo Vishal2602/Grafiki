@@ -1973,3 +1973,140 @@ button:active:not(:disabled) {
   margin-top: 3px;
   accent-color: var(--accent);
 }
+
+/* ========================================= Memory: Ask / Decisions / Context
+   The middle always fills, controls never move between tabs, empty states say
+   what/why/next, and the user bubble/citation chips are actually visible on
+   cream (they were leaked dark-mode white-on-white inline styles). */
+.mem-caption {
+  color: var(--ink-2);
+  font-size: 12.5px;
+  line-height: 1.5;
+  margin: -2px 2px 2px;
+}
+.mem-tab-panel {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.mem-chat-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+/* Conversation AND composer share ONE centered reading column. */
+.mem-column {
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+}
+.mem-empty {
+  margin: auto;
+  max-width: 480px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 24px 16px;
+}
+.mem-empty h3 {
+  font-family: var(--serif);
+  font-weight: 500;
+  font-size: 20px;
+  color: var(--ink);
+}
+.mem-empty p {
+  color: var(--ink-2);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.mem-examples {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  margin-top: 4px;
+}
+.pane-body .mem-example {
+  text-align: left;
+  width: 100%;
+  background: var(--card);
+  border: 1px solid var(--hairline-2);
+  border-radius: var(--r-btn);
+  padding: 9px 12px;
+  font-size: 12.5px;
+  font-weight: 450;
+  color: var(--ink);
+}
+.pane-body .mem-example:hover {
+  border-color: var(--ink-3);
+}
+.mem-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mem-bubble.user {
+  align-self: flex-end;
+  max-width: 560px;
+  background: var(--banner-tint); /* a real surface — was invisible white-on-cream */
+  border: 1px solid var(--hairline);
+  padding: 8px 12px;
+  border-radius: 12px 12px 4px 12px;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+.mem-answer {
+  align-self: flex-start;
+  max-width: 100%;
+  font-size: 13.5px;
+}
+.mem-cites {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.pane-body .mem-cite {
+  font-size: 11.5px;
+  padding: 3px 9px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--hairline-2); /* visible hairline — was invisible white */
+  background: var(--card);
+  color: var(--ink-2);
+  font-weight: 450;
+}
+.pane-body .mem-cite:hover {
+  border-color: var(--ink-3);
+  color: var(--ink);
+}
+.mem-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 4px;
+}
+.mem-options {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+.mem-options > label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.mem-scope {
+  margin-left: auto;
+}
+.mem-scope input {
+  width: 200px;
+}
