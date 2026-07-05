@@ -807,7 +807,7 @@ function MemoryPane(props: {
           />
         ) : null}
         {pane.kind === "terminal" ? (
-          <TerminalPane
+          <SessionsHost
             projectRoot={props.projectRoot}
             fallbackCwd={props.snapshot?.start_dir ?? ""}
             initialLaunch={pane.query}
@@ -1525,17 +1525,179 @@ function loadTerminalSession(projectRoot: string): TerminalSessionRef | null {
   }
 }
 
-function TerminalPane(props: {
+// Per-project LIST of sessions (the tab strip). The backend PTY pool already
+// holds many concurrent detached sessions; this is the UI's record of which
+// ones belong to this project and their launch command.
+function sessionListKey(projectRoot: string) {
+  return `grafiki-terminal-list:${projectRoot}`;
+}
+
+function loadSessionList(projectRoot: string): TerminalSessionRef[] {
+  try {
+    const raw = localStorage.getItem(sessionListKey(projectRoot));
+    if (raw) {
+      const parsed = JSON.parse(raw) as TerminalSessionRef[];
+      if (Array.isArray(parsed)) {
+        return parsed.filter((ref) => typeof ref?.id === "string");
+      }
+    }
+  } catch {
+    /* no valid list yet */
+  }
+  return [];
+}
+
+function saveSessionList(projectRoot: string, list: TerminalSessionRef[]) {
+  try {
+    localStorage.setItem(sessionListKey(projectRoot), JSON.stringify(list));
+  } catch {
+    /* best-effort persistence */
+  }
+}
+
+// Tab label from the launch command.
+function sessionTabTitle(launch: string): string {
+  const name = (launch || "").toLowerCase();
+  if (name.includes("claude")) return "Claude";
+  if (name.includes("codex")) return "Codex";
+  if (name.includes("gemini")) return "Gemini";
+  return "Shell";
+}
+
+// The Sessions screen: a per-project tab strip over the detached-PTY pool.
+// The pool already keeps every session's agent alive when you switch away
+// (detach, not kill) and replays scrollback on return — so this is a thin
+// list/switcher on top: it owns which sessions belong to the project and which
+// tab is active, and mounts ONE controlled TerminalPane for the active one.
+function SessionsHost(props: {
   projectRoot: string;
   fallbackCwd: string;
   initialLaunch?: string;
   handoffPrompt?: string;
 }) {
+  const [list, setList] = useState<TerminalSessionRef[]>(() => loadSessionList(props.projectRoot));
+  const [activeId, setActiveId] = useState<string | null>(() => {
+    const l = loadSessionList(props.projectRoot);
+    return l.length ? l[l.length - 1].id : null;
+  });
+
+  // On mount / project change: load the list and adopt any session handed in
+  // via the legacy single-session key (a pre-tab-strip session, or Home's
+  // "Resume"/"Open" which writes that key), then clear it so it's adopted once.
+  useEffect(() => {
+    let next = loadSessionList(props.projectRoot);
+    const legacy = loadTerminalSession(props.projectRoot);
+    let active: string | null = next.length ? next[next.length - 1].id : null;
+    if (legacy) {
+      localStorage.removeItem(terminalStorageKey(props.projectRoot));
+      if (!next.some((s) => s.id === legacy.id)) next = [...next, legacy];
+      active = legacy.id;
+    }
+    setList(next);
+    setActiveId(active ?? (props.initialLaunch !== undefined ? null : active));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.projectRoot]);
+
+  // Persist the list whenever it changes.
+  useEffect(() => {
+    saveSessionList(props.projectRoot, list);
+  }, [props.projectRoot, list]);
+
+  const active = list.find((s) => s.id === activeId) ?? null;
+
+  const handleStarted = (ref: TerminalSessionRef) => {
+    setList((prev) => (prev.some((s) => s.id === ref.id) ? prev : [...prev, ref]));
+    setActiveId(ref.id);
+  };
+  const dropSession = (id: string) => {
+    setList((prev) => {
+      const next = prev.filter((s) => s.id !== id);
+      setActiveId((cur) => (cur === id ? (next.length ? next[next.length - 1].id : null) : cur));
+      return next;
+    });
+  };
+  // Closing a tab ends that session's process (only "End session"/close kills;
+  // a plain tab switch keeps it running).
+  const closeTab = (id: string) => {
+    void invoke("terminal_close", { id });
+    sessionStorage.removeItem(`grafiki-terminal-launched:${id}`);
+    dropSession(id);
+  };
+
+  return (
+    <div className="sessions-host">
+      {list.length > 0 || active !== null ? (
+        <div className="session-tabs" role="tablist">
+          {list.map((s) => (
+            <div
+              key={s.id}
+              role="tab"
+              tabIndex={0}
+              aria-selected={s.id === activeId}
+              className={`session-tab ${s.id === activeId ? "active" : ""}`}
+              onClick={() => setActiveId(s.id)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  setActiveId(s.id);
+                }
+              }}
+            >
+              <span className="session-tab-glyph">{agentGlyph(s.launch)}</span>
+              <span className="session-tab-label">{sessionTabTitle(s.launch)}</span>
+              <span
+                className="session-tab-close"
+                role="button"
+                aria-label="Close session"
+                title="End this session"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  closeTab(s.id);
+                }}
+              >
+                <X size={12} />
+              </span>
+            </div>
+          ))}
+          <button className="session-tab-new" onClick={() => setActiveId(null)} title="New session">
+            <Plus size={15} />
+          </button>
+        </div>
+      ) : null}
+      <div className="sessions-host-body">
+        <TerminalPane
+          projectRoot={props.projectRoot}
+          fallbackCwd={props.fallbackCwd}
+          initialLaunch={active === null ? props.initialLaunch : undefined}
+          handoffPrompt={props.handoffPrompt}
+          sessionRef={active}
+          onStarted={handleStarted}
+          onEnded={dropSession}
+        />
+      </div>
+    </div>
+  );
+}
+
+function TerminalPane(props: {
+  projectRoot: string;
+  fallbackCwd: string;
+  initialLaunch?: string;
+  handoffPrompt?: string;
+  // When SessionsHost drives the tab strip it passes the active session here
+  // (`controlled` mode) and owns the per-project list; startSession/endSession
+  // report up via onStarted/onEnded instead of writing the single-session key.
+  // Omit these props entirely for the standalone (uncontrolled) behavior.
+  sessionRef?: TerminalSessionRef | null;
+  onStarted?: (ref: TerminalSessionRef) => void;
+  onEnded?: (id: string) => void;
+}) {
+  const controlled = props.sessionRef !== undefined;
   // The session id is STABLE and persisted per project: switching tabs detaches
   // the UI but the PTY (and the agent inside it) keeps running; coming back
   // reattaches and replays scrollback. Only "End session" kills the process.
   const [session, setSession] = useState<TerminalSessionRef | null>(() =>
-    loadTerminalSession(props.projectRoot),
+    controlled ? props.sessionRef ?? null : loadTerminalSession(props.projectRoot),
   );
   const [error, setError] = useState<string | null>(null);
   const [ended, setEnded] = useState(false);
@@ -1555,7 +1717,26 @@ function TerminalPane(props: {
   // of attaching. A ref (not state): StrictMode remounts must attach, not respawn.
   const spawnRef = useRef(false);
 
+  // Controlled mode: when the host switches the active tab, adopt that session.
+  // The big attach/detach effect below then detaches the old PTY (keeping it
+  // alive in the pool) and attaches the new one — exactly like tab-away/back.
   useEffect(() => {
+    if (!controlled) return;
+    const nextId = props.sessionRef?.id ?? null;
+    if (nextId !== (session?.id ?? null)) {
+      spawnRef.current = false;
+      setSession(props.sessionRef ?? null);
+      setEnded(false);
+      setError(null);
+      setCapturing(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.sessionRef?.id]);
+
+  useEffect(() => {
+    // Uncontrolled only — in controlled mode the host owns which session is
+    // active and re-passes sessionRef on project change.
+    if (controlled) return;
     setSession(loadTerminalSession(props.projectRoot));
     setError(null);
     setEnded(false);
@@ -1564,9 +1745,18 @@ function TerminalPane(props: {
       .catch(() => setLauncherCaptureConfig(null));
   }, [props.projectRoot, props.fallbackCwd]);
 
+  // Load the launcher's capture-consent copy (both modes need it for the
+  // "will this be captured?" line on the Start-a-session screen).
+  useEffect(() => {
+    getCaptureConfig({ startDir: props.projectRoot || props.fallbackCwd })
+      .then(setLauncherCaptureConfig)
+      .catch(() => setLauncherCaptureConfig(null));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.projectRoot]);
+
   // Onboarding (or Home) can hand us an agent to launch immediately.
   useEffect(() => {
-    if (props.initialLaunch !== undefined && loadTerminalSession(props.projectRoot) === null) {
+    if (props.initialLaunch !== undefined && session === null) {
       startSession(props.initialLaunch);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1810,9 +2000,13 @@ function TerminalPane(props: {
             return;
           }
           if (!revive.found) {
-            // Nothing to revive (explicitly ended): back to the launcher.
-            localStorage.removeItem(terminalStorageKey(props.projectRoot));
+            // Nothing to revive (explicitly ended): drop this session.
             sessionStorage.removeItem(launchGuard);
+            if (controlled && session) {
+              props.onEnded?.(session.id);
+            } else {
+              localStorage.removeItem(terminalStorageKey(props.projectRoot));
+            }
             setSession(null);
             return;
           }
@@ -1877,8 +2071,12 @@ function TerminalPane(props: {
   const endSession = () => {
     if (session) {
       void invoke("terminal_close", { id: session.id });
-      localStorage.removeItem(terminalStorageKey(props.projectRoot));
       sessionStorage.removeItem(`grafiki-terminal-launched:${session.id}`);
+      if (controlled) {
+        props.onEnded?.(session.id);
+      } else {
+        localStorage.removeItem(terminalStorageKey(props.projectRoot));
+      }
     }
     setSession(null);
     setEnded(false);
@@ -1889,7 +2087,11 @@ function TerminalPane(props: {
   const startSession = (cmd: string) => {
     const id = `term-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
     const next = { id, launch: cmd };
-    localStorage.setItem(terminalStorageKey(props.projectRoot), JSON.stringify(next));
+    if (controlled) {
+      props.onStarted?.(next);
+    } else {
+      localStorage.setItem(terminalStorageKey(props.projectRoot), JSON.stringify(next));
+    }
     spawnRef.current = true;
     setEnded(false);
     setError(null);

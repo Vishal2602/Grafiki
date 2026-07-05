@@ -2332,3 +2332,103 @@ button:active:not(:disabled) {
   color: var(--ink-2);
   line-height: 1.5;
 }
+
+/* ===== Sessions: per-project tab strip over the detached-PTY pool ===== */
+.sessions-host {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+.session-tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 2px 10px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+/* Soft rounded cards (the chat-bubble aesthetic): inactive = a quiet fill,
+   active = a white card with a hairline + a whisper of shadow. */
+.session-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px 7px 8px;
+  border-radius: 11px;
+  background: var(--banner-tint);
+  border: 1px solid transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  font-size: 12.5px;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.session-tab:hover {
+  color: var(--ink);
+}
+.session-tab.active {
+  background: var(--card);
+  border-color: var(--hairline-2);
+  color: var(--ink);
+  box-shadow: 0 1px 2px rgba(3, 33, 19, 0.06);
+}
+.session-tab-glyph {
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.session-tab.active .session-tab-glyph {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+.session-tab-label {
+  font-weight: 550;
+  white-space: nowrap;
+}
+.session-tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+  color: var(--ink-3);
+  opacity: 0.55;
+}
+.session-tab-close:hover {
+  opacity: 1;
+  background: var(--hover-tint);
+  color: var(--danger);
+}
+.session-tab-new {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  background: none;
+  border: 1px dashed var(--hairline-2);
+  color: var(--ink-2);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.session-tab-new:hover {
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  background: var(--accent-soft);
+}
+.sessions-host-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
