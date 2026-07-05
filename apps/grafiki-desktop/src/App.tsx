@@ -956,6 +956,10 @@ function classifyTurn(turn: LiveTranscriptTurn): "user" | "assistant" | "system"
   if (!text) return null;
   if (LENS_DROP.some((re) => re.test(text))) return null;
   if (turn.role === "assistant") return "assistant";
+  // The backend now tags tool output as "tool" (and system/developer turns
+  // normalize to "system") — render those as neutral full-width lines. This is
+  // the durable fix; the heuristic below is a fallback for anything untagged.
+  if (turn.role === "tool" || turn.role === "system") return "system";
   // role === "user": a genuine message OR a tool_result. Route command / tool
   // output to a neutral system line instead of a green "you" bubble.
   const looksLikeToolOutput =

@@ -308,7 +308,13 @@ pub fn read_live_transcript(start_dir: &Path, limit: usize) -> Result<Vec<LiveTr
     Ok(events
         .drain(keep_from..)
         .map(|event| LiveTranscriptTurn {
-            role: event.role,
+            // Tool output (flagged in the parser) surfaces as "tool" so the chat
+            // lens renders it as a neutral system line, not a "you" bubble.
+            role: if event.kind == "tool_result" {
+                "tool".to_owned()
+            } else {
+                event.role
+            },
             text: event.text,
             timestamp: event.timestamp,
         })
@@ -591,7 +597,18 @@ fn parse_claude_event(value: &Value) -> Option<ParsedTranscriptEvent> {
         .get("role")
         .and_then(Value::as_str)
         .unwrap_or(event_type);
-    let text = extract_text_from_value(message.get("content")?)?;
+    let content = message.get("content")?;
+    // Claude Code files tool_result blocks under role "user" — the SAME role a
+    // typed human message uses — so rendered verbatim they masquerade as the
+    // user's own messages. Flag them via `kind` so the chat lens can show them
+    // as neutral system lines instead of right-aligned "you" bubbles. `role` is
+    // left untouched, so the import/extraction path is unaffected.
+    let kind = if content_has_block_type(content, "tool_result") {
+        "tool_result"
+    } else {
+        event_type
+    };
+    let text = extract_text_from_value(content)?;
     let timestamp = value
         .get("timestamp")
         .and_then(Value::as_str)
@@ -601,8 +618,21 @@ fn parse_claude_event(value: &Value) -> Option<ParsedTranscriptEvent> {
         &format!("Claude Code {role} turn"),
         &text,
         timestamp,
-        event_type,
+        kind,
     ))
+}
+
+/// True when a Claude Code message `content` is (or contains) a block of the
+/// given `type` — e.g. "tool_result" (a tool's output, filed under role "user")
+/// or "tool_use" (the assistant invoking a tool).
+fn content_has_block_type(content: &Value, block_type: &str) -> bool {
+    match content {
+        Value::Array(items) => items
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some(block_type)),
+        Value::Object(map) => map.get("type").and_then(Value::as_str) == Some(block_type),
+        _ => false,
+    }
 }
 
 fn parse_generic_json_event(agent: &str, value: &Value) -> Option<ParsedTranscriptEvent> {
@@ -727,8 +757,40 @@ mod tests {
     use crate::project::{init_project, InitOptions};
 
     use super::{
-        encode_claude_project_name, import_agent_transcripts, ImportAgentTranscriptsOptions,
+        encode_claude_project_name, import_agent_transcripts, parse_claude_event,
+        ImportAgentTranscriptsOptions,
     };
+
+    #[test]
+    fn claude_tool_results_are_flagged_not_treated_as_user_turns() {
+        // A real typed user message.
+        let user = serde_json::json!({
+            "type": "user",
+            "message": { "role": "user", "content": "why did we pick Postgres?" }
+        });
+        let parsed = parse_claude_event(&user).unwrap();
+        assert_eq!(parsed.role, "user");
+        assert_eq!(parsed.kind, "user");
+
+        // A tool_result — Claude Code files it under role "user" too, but it is
+        // the OUTPUT of a tool, not something the human typed.
+        let tool = serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    { "type": "tool_result", "tool_use_id": "abc",
+                      "content": "{\n  \"screen\": \"App shell\"\n}" }
+                ]
+            }
+        });
+        let parsed = parse_claude_event(&tool).unwrap();
+        // role is untouched (import/extraction unaffected) but kind is flagged so
+        // the chat lens renders it as a neutral system line, not a "you" bubble.
+        assert_eq!(parsed.role, "user");
+        assert_eq!(parsed.kind, "tool_result");
+        assert!(parsed.text.contains("App shell"));
+    }
 
     #[test]
     fn encodes_claude_project_dir_name_like_claude_code() {
