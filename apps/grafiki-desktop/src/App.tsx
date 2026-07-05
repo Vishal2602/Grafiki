@@ -920,21 +920,49 @@ function CollapsibleBody({ text }: { text: string }) {
 
 /// One conversation bubble. Long tool-output walls collapse to a preview with
 /// an expand control — the Granola calm rule applied to agent transcripts.
-function LensBubble(props: { role: string; text: string }) {
+function LensBubble(props: { role: "user" | "assistant" | "system"; text: string }) {
   const [expanded, setExpanded] = useState(false);
   const lines = props.text.split("\n");
   const isWall = props.text.length > 600 || lines.length > 10;
   const shown = expanded || !isWall ? props.text : lines.slice(0, 6).join("\n");
   return (
-    <div className={`lens-bubble ${props.role === "user" ? "user" : "assistant"}`}>
+    <div className={`lens-bubble ${props.role}`}>
       {renderLensText(shown)}
       {isWall ? (
         <button className="link-button lens-expand" onClick={() => setExpanded(!expanded)}>
-          {expanded ? "Show less" : `Show all ${lines.length} lines`}
+          {expanded ? "Show less" : "Show full response"}
         </button>
       ) : null}
     </div>
   );
+}
+
+// Claude Code records tool_results and raw bash/tool output under role "user" —
+// the SAME role a human's typed message uses — so rendered verbatim, git-push
+// output ("To https://github.com/…") and "file updated successfully"
+// bookkeeping masquerade as right-aligned "you" bubbles (2026-07-04 audit fix:
+// crossed alignment + leaked tool plumbing). Reclassify obvious tool/system
+// output to a neutral system line and drop pure file-state plumbing, so only
+// genuine human prose stays a "you" bubble. The durable fix is backend (tag
+// tool_result turns as role "tool" in get_live_transcript); this is the
+// render-layer mitigation.
+const LENS_DROP = [
+  /has been updated successfully/i,
+  /file state is current in your context/i,
+  /no need to Read it back/i,
+];
+function classifyTurn(turn: LiveTranscriptTurn): "user" | "assistant" | "system" | null {
+  const text = turn.text.trim();
+  if (!text) return null;
+  if (LENS_DROP.some((re) => re.test(text))) return null;
+  if (turn.role === "assistant") return "assistant";
+  // role === "user": a genuine message OR a tool_result. Route command / tool
+  // output to a neutral system line instead of a green "you" bubble.
+  const looksLikeToolOutput =
+    /^(To |remote:|fatal:|error:|warning:|\d+\s+\/)/m.test(text) ||
+    /(->|→)\s*\S+\s*$/m.test(text) ||
+    /^[0-9a-f]{7,}\.\.[0-9a-f]{7,}/m.test(text);
+  return looksLikeToolOutput ? "system" : "user";
 }
 
 type PaletteAction = {
@@ -1582,6 +1610,19 @@ function TerminalPane(props: {
   const [composer, setComposer] = useState("");
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const chatCapable = session?.launch === "claude";
+  // Filter tool-plumbing noise and reclassify Claude Code's tool_result turns
+  // (which it files under role "user") before rendering the chat lens — so
+  // terminal/git output stops masquerading as right-aligned "you" bubbles.
+  const visibleTurns = useMemo(
+    () =>
+      turns
+        .map((turn) => ({ turn, display: classifyTurn(turn) }))
+        .filter(
+          (item): item is { turn: LiveTranscriptTurn; display: "user" | "assistant" | "system" } =>
+            item.display !== null,
+        ),
+    [turns],
+  );
   // Raw terminal tail (decoded, unbounded ANSI-included) so the chat lens can
   // detect a permission prompt the JSONL transcript never records — otherwise
   // the last rendered bubble looks like a normal finished turn while the agent
@@ -1895,13 +1936,24 @@ function TerminalPane(props: {
   return (
     <div className="view-stack" style={{ display: "flex", flexDirection: "column", height: "100%", gap: 8 }}>
       <div className="toolbar-row" style={{ alignItems: "center", gap: 10 }}>
-        <span className="muted" style={{ fontSize: 12 }}>
-          {session.launch ? `Running: ${session.launch}` : "Shell"} ·{" "}
-          {props.projectRoot || props.fallbackCwd || "this project"}
-          {capturing === true ? " · capturing" : ""}
-          {capturing === false ? ` · not capturing — ${captureHint ?? "initialize this folder in Settings"}` : ""}
-          {ended ? " · session ended" : ""}
-        </span>
+        <div className="session-status">
+          <span className={`status-dot ${ended ? "ended" : "live"}`} aria-hidden />
+          <span className="session-status-label">
+            {ended ? "Session ended" : session.launch ? `${session.launch} running` : "Shell"}
+          </span>
+          <span
+            className="session-status-path"
+            title={props.projectRoot || props.fallbackCwd || "this project"}
+          >
+            {tidyPath(props.projectRoot || props.fallbackCwd || "this project")}
+          </span>
+          {capturing === true ? <span className="chip chip-live">Capturing</span> : null}
+          {capturing === false ? (
+            <span className="chip chip-warn" title={captureHint ?? "initialize this folder in Settings"}>
+              Not capturing
+            </span>
+          ) : null}
+        </div>
         {chatCapable ? (
           <span className="seg-tabs lens-tabs">
             <button
@@ -1919,13 +1971,15 @@ function TerminalPane(props: {
           </span>
         ) : null}
         <button
-          className="peek-toggle"
-          style={{ marginLeft: "auto", padding: "4px 10px" }}
+          className={`button secondary session-peek-toggle ${peekOpen ? "active" : ""}`}
+          style={{ marginLeft: "auto" }}
           onClick={() => setPeekOpen((current) => !current)}
+          title={peekOpen ? "Hide the learned panel" : "Show the learned panel"}
         >
-          Learned: {peekNew.length}
+          Learned
+          {peekNew.length > 0 ? <span className="count-badge">{peekNew.length}</span> : null}
         </button>
-        <button style={{ padding: "4px 10px" }} onClick={endSession}>
+        <button className={`button ${ended ? "primary" : "danger"}`} onClick={endSession}>
           {ended ? "New session" : "End session"}
         </button>
       </div>
@@ -1955,14 +2009,14 @@ function TerminalPane(props: {
               </div>
             ) : null}
             <div className="chat-lens-scroll" ref={chatScrollRef}>
-              {turns.length === 0 ? (
+              {visibleTurns.length === 0 ? (
                 <p className="muted" style={{ margin: "auto", textAlign: "center" }}>
                   Waiting for the conversation… (the transcript appears after Claude's first
                   reply — flip to Terminal for permission prompts)
                 </p>
               ) : (
-                turns.map((turn, index) => (
-                  <LensBubble key={index} role={turn.role} text={turn.text} />
+                visibleTurns.map((item, index) => (
+                  <LensBubble key={index} role={item.display} text={item.turn.text} />
                 ))
               )}
             </div>
@@ -1986,10 +2040,29 @@ function TerminalPane(props: {
           <aside className="term-peek">
             <div className="term-peek-title">Learned this session</div>
             {peekNew.length === 0 ? (
-              <p className="subtle">
-                Nothing yet — memories appear here as you work.
-                {peekOlder > 0 ? ` ${peekOlder} older waiting in Review.` : ""}
-              </p>
+              <div className="peek-empty">
+                <p className="subtle">
+                  No durable memories captured yet. Grafiki is watching this session for
+                  decisions, fixes, and commands worth keeping.
+                </p>
+                {capturing === true ? (
+                  <ul className="watch-list">
+                    <li>
+                      <CheckCircle2 size={13} /> Terminal
+                    </li>
+                    <li>
+                      <CheckCircle2 size={13} /> Git
+                    </li>
+                    <li>
+                      <CheckCircle2 size={13} /> Files
+                    </li>
+                    <li>
+                      <CheckCircle2 size={13} /> Transcript
+                    </li>
+                  </ul>
+                ) : null}
+                {peekOlder > 0 ? <p className="subtle">{peekOlder} older waiting in Review.</p> : null}
+              </div>
             ) : (
               peekNew.map((candidate) => (
                 <motion.div
