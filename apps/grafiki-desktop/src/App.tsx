@@ -1361,19 +1361,32 @@ function HomePane(props: {
             animate={{ opacity: 1, y: 0 }}
             transition={transition.quick}
           >
-            {live.tail?.trim() ? <div className="term-preview">{live.tail}</div> : null}
-            <div className="live-bar">
-              <span className="pulse-dot" />
-              {live.launch || "shell"} ·{" "}
-              {live.capturing ? "capturing" : `not capturing — ${live.capture_hint ?? "check Settings"}`} ·{" "}
-              {live.cwd}
-              <button
-                className="link-button open-link"
-                onClick={() => props.onNavigate("terminal")}
-              >
-                Open →
-              </button>
+            <div className="live-avatar">{agentGlyph(live.launch)}</div>
+            <div className="live-body">
+              <div className="live-row1">
+                <b>{live.launch ? agentLabel(live.launch) : "shell"}</b>
+                {live.capturing ? (
+                  <span className="chip chip-live">
+                    <span className="pulse-dot" /> Capturing
+                  </span>
+                ) : (
+                  <span className="chip chip-warn" title={live.capture_hint ?? "check Settings"}>
+                    Not capturing
+                  </span>
+                )}
+                <span className="live-cwd" title={live.cwd}>
+                  {tidyPath(live.cwd)}
+                </span>
+              </div>
+              <div className="live-hint">
+                {live.capturing
+                  ? "Capturing this session into memory"
+                  : (live.capture_hint ?? "Turn capture on in Settings → Capture Consent")}
+              </div>
             </div>
+            <button className="button primary live-open" onClick={() => props.onNavigate("terminal")}>
+              Open →
+            </button>
           </motion.div>
         ) : resumable ? (
           <motion.div
