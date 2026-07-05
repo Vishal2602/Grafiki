@@ -377,6 +377,14 @@ export default function App() {
   }
 
   function switchPrimaryPane(kind: PaneKind, patch: Partial<PaneState> = {}) {
+    const current = layout.panes.find((candidate) => candidate.id === layout.activePaneId);
+    if (current && current.kind === kind && Object.keys(patch).length === 0) {
+      // Already showing this pane with no new params — skip the pointless
+      // exit/enter transition a fresh pane id would trigger (e.g. clicking
+      // the brand logo or a rail item while already on that screen briefly
+      // rendered two copies of the pane mid-transition).
+      return;
+    }
     const pane: PaneState = {
       id: newPaneId(kind),
       kind,
@@ -3124,6 +3132,24 @@ function SettingsPane(props: {
   const [blockedPathDraft, setBlockedPathDraft] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Settings is a tabbed sheet per docs/UX_REDESIGN.md §5.6 ("Tabs, each one
+  // screen, no scroll-of-doom") — it used to be one long undifferentiated
+  // scroll (2026-07-04 don-norman-design-critic finding).
+  const [settingsTab, setSettingsTab] = useState<
+    "projects" | "capture" | "local-ai" | "hookups" | "about"
+  >("projects");
+  const [localModels, setLocalModels] = useState<string[] | null>(null);
+  useEffect(() => {
+    if (settingsTab === "local-ai" && localModels === null) {
+      listLocalModels()
+        .then(setLocalModels)
+        .catch(() => setLocalModels([]));
+    }
+  }, [settingsTab, localModels]);
+  const copyToClipboard = (text: string, label: string) => {
+    void navigator.clipboard?.writeText(text);
+    setMessage(`${label} copied to clipboard.`);
+  };
   // Only sources an actual capture path checks (2026-07-04 don-norman-design-critic:
   // ide/system/screen/browser/audio rendered as live-looking checkboxes that wrote
   // to the config file but gated nothing — false affordances in a consent surface
@@ -3331,252 +3357,33 @@ function SettingsPane(props: {
     }
   }
 
+  const mcpAddCommand = `claude mcp add grafiki -- grafiki mcp --path "${draftRoot || "."}"`;
+  const cursorJson = JSON.stringify(
+    { mcpServers: { grafiki: { command: "grafiki", args: ["mcp", "--path", draftRoot || "."] } } },
+    null,
+    2,
+  );
+  const shellHookCommand = `grafiki capture shell-hook --path "${draftRoot || "."}"`;
+
   return (
     <div className="view-stack">
-      <section className="settings-grid">
-        <div className="settings-editor">
-          <div className="setting-row">
-            <span>Appearance</span>
-            <select
-              aria-label="Appearance"
-              value={themePref}
-              onChange={(event) => changeTheme(event.target.value as ThemePref)}
-            >
-              <option value="light">Light</option>
-              <option value="dark">Dark</option>
-              <option value="system">System</option>
-            </select>
-          </div>
-        </div>
-      </section>
-
-      <section className="settings-grid">
-        <div className="settings-editor">
-          <label className="field-label">
-            <span>Project Folder</span>
-            <input
-              value={draftRoot}
-              onChange={(event) => setDraftRoot(event.target.value)}
-              placeholder="/path/to/project"
-            />
-          </label>
-          <div className="form-actions">
-            <button className="button secondary" onClick={browseProjectFolder}>
-              <FolderOpen size={15} />
-              Browse
-            </button>
-            <button className="button secondary" onClick={() => props.onProjectRootChange(draftRoot)}>
-              Load Project
-            </button>
-            <button className="button primary" onClick={initialize} disabled={initializing || !draftRoot.trim()}>
-              Initialize
-            </button>
-          </div>
-        </div>
-      </section>
-
-      <section className="settings-grid">
-        <ListHeading title="Capture Consent" icon={ShieldQuestion} />
-        <div className="settings-editor">
-          <div className="capture-config-summary">
-            <span>{captureConfig?.config_path ?? "No capture config loaded"}</span>
-            <code title="Redaction profile">{captureConfig?.config.redaction_profile ?? "default"} redaction</code>
-          </div>
-          <div className="capture-source-grid">
-            {captureSourceLabels.map(([source, label]) => (
-              <label className="capture-toggle" key={source}>
-                <input
-                  type="checkbox"
-                  checked={captureConfig?.config.sources[source] ?? false}
-                  disabled={captureConfigBusy || !captureConfig}
-                  onChange={(event) => updateCaptureSource(source, event.currentTarget.checked)}
-                />
-                <span>{label}</span>
-              </label>
-            ))}
-          </div>
-          <div className="metadata-grid">
-            <label>
-              <span>Terminal Output</span>
-              <select
-                value={captureConfig?.config.terminal_output ?? "off"}
-                disabled={captureConfigBusy || !captureConfig}
-                onChange={(event) =>
-                  patchCaptureConfig({ terminalOutput: event.currentTarget.value as "off" | "digest" | "full" })
-                }
-              >
-                <option value="off">Off</option>
-                <option value="digest">Digest</option>
-                <option value="full">Full</option>
-              </select>
-            </label>
-            <label>
-              <span>Screen Policy</span>
-              <select
-                value={captureConfig?.config.screen_policy ?? "manual"}
-                disabled={captureConfigBusy || !captureConfig}
-                onChange={(event) =>
-                  patchCaptureConfig({ screenPolicy: event.currentTarget.value as "off" | "manual" | "allowlist" })
-                }
-              >
-                <option value="off">Off</option>
-                <option value="manual">Manual</option>
-                <option value="allowlist">Allowlist</option>
-              </select>
-            </label>
-          </div>
-          <label className="field-label">
-            <span>Blocked Path</span>
-            <input
-              value={blockedPathDraft}
-              onChange={(event) => setBlockedPathDraft(event.target.value)}
-              placeholder="secrets or .env.local"
-            />
-          </label>
-          <div className="maintenance-actions">
-            <button className="button secondary" type="button" onClick={refreshCaptureConfig} disabled={captureConfigBusy || !draftRoot.trim()}>
-              <RefreshCcw size={15} />
-              Refresh
-            </button>
-            <button className="button primary" type="button" onClick={addBlockedPath} disabled={captureConfigBusy || !blockedPathDraft.trim()}>
-              <Plus size={15} />
-              Block Path
-            </button>
-          </div>
-          <div className="capture-blocked-list">
-            {(captureConfig?.config.blocked_paths ?? []).slice(0, 12).map((path) => (
-              <button
-                className="evidence-chip"
-                type="button"
-                key={path}
-                onClick={() => removeBlockedPath(path)}
-                disabled={captureConfigBusy}
-                title="Remove blocked path"
-              >
-                {path}
-                <X size={11} />
-              </button>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      <section className="settings-grid">
-        <ListHeading title="Local Daemon" icon={Activity} />
-        <div className="settings-editor">
-          <div className={`daemon-status ${daemonStatus?.running ? "running" : ""}`}>
-            <span>{daemonStatus?.running ? "Running" : "Stopped"}</span>
-            <strong>{daemonStatus?.url ?? "http://127.0.0.1:9700"}</strong>
-            <code>{daemonStatus?.cli_path ?? "CLI not found"}</code>
-          </div>
-          <div className="metadata-grid">
-            <label>
-              <span>Host</span>
-              <input value={daemonHost} onChange={(event) => setDaemonHost(event.target.value)} />
-            </label>
-            <label>
-              <span>Port</span>
-              <input
-                type="number"
-                min={1024}
-                max={65535}
-                value={daemonPort}
-                onChange={(event) => setDaemonPort(Number(event.target.value) || 9700)}
-              />
-            </label>
-          </div>
-          <label>
-            <span>Token</span>
-            <input
-              value={daemonToken}
-              onChange={(event) => setDaemonToken(event.target.value)}
-              placeholder="auto-generated on Start"
-            />
-          </label>
-          {daemonToken ? (
-            <p className="daemon-token-hint">
-              External agents authenticate with this token (header{" "}
-              <code>X-Grafiki-Token</code>).{" "}
-              <button
-                className="link-button"
-                type="button"
-                onClick={() => {
-                  void navigator.clipboard?.writeText(daemonToken);
-                  setMessage("Daemon token copied to clipboard.");
-                }}
-              >
-                Copy
-              </button>
-            </p>
-          ) : null}
-          <div className="maintenance-actions">
-            <button
-              className="button secondary"
-              onClick={refreshDaemonStatus}
-              disabled={daemonBusy !== null || !draftRoot.trim()}
-            >
-              <RefreshCcw size={15} />
-              Refresh
-            </button>
-            <button
-              className="button primary"
-              onClick={startProjectDaemon}
-              disabled={daemonBusy !== null || !draftRoot.trim() || !daemonStatus?.cli_available}
-            >
-              <Activity size={15} />
-              Start
-            </button>
-            <button
-              className="button secondary danger-button"
-              onClick={stopProjectDaemon}
-              disabled={daemonBusy !== null || !draftRoot.trim() || !daemonStatus?.cli_available}
-            >
-              <X size={15} />
-              Stop
-            </button>
-          </div>
-        </div>
-      </section>
-
-      <section className="settings-grid">
-        <ListHeading title="Memory Maintenance" icon={Database} />
-        <div className="settings-editor">
-          <div className="maintenance-actions">
-            <button
-              className="button secondary"
-              onClick={exportJson}
-              disabled={maintenanceBusy !== null || !draftRoot.trim()}
-            >
-              <Download size={15} />
-              Export JSON
-            </button>
-            <button
-              className="button secondary"
-              onClick={importJson}
-              disabled={maintenanceBusy !== null || !draftRoot.trim()}
-            >
-              <Upload size={15} />
-              Import JSON
-            </button>
-            <button
-              className="button secondary"
-              onClick={() => runEmbeddings(false)}
-              disabled={maintenanceBusy !== null || !draftRoot.trim()}
-            >
-              <Sparkles size={15} />
-              Process Embeddings
-            </button>
-            <button
-              className="button primary"
-              onClick={() => runEmbeddings(true)}
-              disabled={maintenanceBusy !== null || !draftRoot.trim()}
-            >
-              <RefreshCcw size={15} />
-              Rebuild Embeddings
-            </button>
-          </div>
-        </div>
-      </section>
+      <div className="seg-tabs">
+        <button className={`seg-tab ${settingsTab === "projects" ? "active" : ""}`} onClick={() => setSettingsTab("projects")}>
+          Projects
+        </button>
+        <button className={`seg-tab ${settingsTab === "capture" ? "active" : ""}`} onClick={() => setSettingsTab("capture")}>
+          Capture & privacy
+        </button>
+        <button className={`seg-tab ${settingsTab === "local-ai" ? "active" : ""}`} onClick={() => setSettingsTab("local-ai")}>
+          Local AI
+        </button>
+        <button className={`seg-tab ${settingsTab === "hookups" ? "active" : ""}`} onClick={() => setSettingsTab("hookups")}>
+          Agent hookups
+        </button>
+        <button className={`seg-tab ${settingsTab === "about" ? "active" : ""}`} onClick={() => setSettingsTab("about")}>
+          About
+        </button>
+      </div>
 
       {message ? <section className="notice compact good">{message}</section> : null}
       {error ? (
@@ -3586,14 +3393,339 @@ function SettingsPane(props: {
         </section>
       ) : null}
 
-      <section className="settings-grid">
-        <Setting label="Project" value={snapshot?.project?.project ?? "Not initialized"} />
-        <Setting label="Database" value={snapshot?.project?.db_path ?? "Unavailable"} mono />
-        <Setting label="Embedding provider" value={embedding?.provider ?? "Unknown"} />
-        <Setting label="Vector backend" value={embedding?.vector_backend ?? "Unknown"} />
-        <Setting label="Indexed records" value={`${embedding?.indexed_records ?? 0}`} />
-        <Setting label="Missing or stale" value={`${embedding?.missing_or_stale_records ?? 0}`} />
-      </section>
+      {settingsTab === "projects" ? (
+        <section className="settings-grid">
+          <div className="settings-editor">
+            <label className="field-label">
+              <span>Project Folder</span>
+              <input
+                value={draftRoot}
+                onChange={(event) => setDraftRoot(event.target.value)}
+                placeholder="/path/to/project"
+              />
+            </label>
+            <div className="form-actions">
+              <button className="button secondary" onClick={browseProjectFolder}>
+                <FolderOpen size={15} />
+                Browse
+              </button>
+              <button className="button secondary" onClick={() => props.onProjectRootChange(draftRoot)}>
+                Load Project
+              </button>
+              <button className="button primary" onClick={initialize} disabled={initializing || !draftRoot.trim()}>
+                Initialize
+              </button>
+            </div>
+          </div>
+          <div className="settings-editor">
+            <Setting label="Current project" value={snapshot?.project?.project ?? "Not initialized"} />
+            <Setting label="Database" value={snapshot?.project?.db_path ?? "Unavailable"} mono />
+          </div>
+        </section>
+      ) : null}
+
+      {settingsTab === "capture" ? (
+        <section className="settings-grid">
+          <ListHeading title="Capture Consent" icon={ShieldQuestion} />
+          <div className="settings-editor">
+            <div className="capture-config-summary">
+              <span>{captureConfig?.config_path ?? "No capture config loaded"}</span>
+              <code title="Redaction profile">{captureConfig?.config.redaction_profile ?? "default"} redaction</code>
+            </div>
+            <div className="capture-source-grid">
+              {captureSourceLabels.map(([source, label]) => (
+                <label className="capture-toggle" key={source}>
+                  <input
+                    type="checkbox"
+                    checked={captureConfig?.config.sources[source] ?? false}
+                    disabled={captureConfigBusy || !captureConfig}
+                    onChange={(event) => updateCaptureSource(source, event.currentTarget.checked)}
+                  />
+                  <span>{label}</span>
+                </label>
+              ))}
+            </div>
+            <div className="metadata-grid">
+              <label>
+                <span>Terminal Output</span>
+                <select
+                  value={captureConfig?.config.terminal_output ?? "off"}
+                  disabled={captureConfigBusy || !captureConfig}
+                  onChange={(event) =>
+                    patchCaptureConfig({ terminalOutput: event.currentTarget.value as "off" | "digest" | "full" })
+                  }
+                >
+                  <option value="off">Off</option>
+                  <option value="digest">Digest</option>
+                  <option value="full">Full</option>
+                </select>
+              </label>
+              <label>
+                <span>Screen Policy</span>
+                <select
+                  value={captureConfig?.config.screen_policy ?? "manual"}
+                  disabled={captureConfigBusy || !captureConfig}
+                  onChange={(event) =>
+                    patchCaptureConfig({ screenPolicy: event.currentTarget.value as "off" | "manual" | "allowlist" })
+                  }
+                >
+                  <option value="off">Off</option>
+                  <option value="manual">Manual</option>
+                  <option value="allowlist">Allowlist</option>
+                </select>
+              </label>
+            </div>
+            <label className="field-label">
+              <span>Blocked Path</span>
+              <input
+                value={blockedPathDraft}
+                onChange={(event) => setBlockedPathDraft(event.target.value)}
+                placeholder="secrets or .env.local"
+              />
+            </label>
+            <div className="maintenance-actions">
+              <button className="button secondary" type="button" onClick={refreshCaptureConfig} disabled={captureConfigBusy || !draftRoot.trim()}>
+                <RefreshCcw size={15} />
+                Refresh
+              </button>
+              <button className="button primary" type="button" onClick={addBlockedPath} disabled={captureConfigBusy || !blockedPathDraft.trim()}>
+                <Plus size={15} />
+                Block Path
+              </button>
+            </div>
+            <div className="capture-blocked-list">
+              {(captureConfig?.config.blocked_paths ?? []).slice(0, 12).map((path) => (
+                <button
+                  className="evidence-chip"
+                  type="button"
+                  key={path}
+                  onClick={() => removeBlockedPath(path)}
+                  disabled={captureConfigBusy}
+                  title="Remove blocked path"
+                >
+                  {path}
+                  <X size={11} />
+                </button>
+              ))}
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      {settingsTab === "local-ai" ? (
+        <section className="settings-grid">
+          <ListHeading title="Local AI" icon={Sparkles} />
+          <div className="settings-editor">
+            {localModels === null ? (
+              <p className="muted">Checking for Ollama…</p>
+            ) : localModels.length > 0 ? (
+              <>
+                <p className="muted">
+                  Ollama is running with {localModels.length} model{localModels.length === 1 ? "" : "s"} installed.
+                  Grafiki uses one of these to turn sessions into memory, entirely on this machine.
+                </p>
+                <div className="capture-blocked-list">
+                  {localModels.map((model) => (
+                    <span key={model} className="evidence-chip">
+                      {model}
+                    </span>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <p className="muted">
+                No local model found. Extraction still works manually, but automatic memory extraction needs
+                Ollama — install it, then run <code>ollama pull gemma3:1b</code> (or any model).
+              </p>
+            )}
+            <div className="form-actions">
+              <button className="button secondary" type="button" onClick={() => setLocalModels(null)}>
+                <RefreshCcw size={15} />
+                Recheck
+              </button>
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      {settingsTab === "hookups" ? (
+        <section className="settings-grid">
+          <ListHeading title="Agent Hookups" icon={Activity} />
+          <div className="settings-editor">
+            <p className="muted">
+              Give other tools access to this project&apos;s memory over MCP — they can search and cite it, never
+              write directly (writes still go through Review).
+            </p>
+            <label className="field-label">
+              <span>Claude Code</span>
+              <div className="copy-row">
+                <code>{mcpAddCommand}</code>
+                <button className="button secondary" type="button" onClick={() => copyToClipboard(mcpAddCommand, "Command")}>
+                  Copy
+                </button>
+              </div>
+            </label>
+            <label className="field-label">
+              <span>Cursor (.cursor/mcp.json)</span>
+              <div className="copy-row">
+                <code className="copy-row-multiline">{cursorJson}</code>
+                <button className="button secondary" type="button" onClick={() => copyToClipboard(cursorJson, "Cursor config")}>
+                  Copy
+                </button>
+              </div>
+            </label>
+            <label className="field-label">
+              <span>Shell hook (records terminal command metadata)</span>
+              <div className="copy-row">
+                <code>{shellHookCommand}</code>
+                <button className="button secondary" type="button" onClick={() => copyToClipboard(shellHookCommand, "Command")}>
+                  Copy
+                </button>
+              </div>
+            </label>
+            <p className="muted" style={{ fontSize: 11.5 }}>
+              Run that shell-hook command in a terminal and paste its output into <code>~/.zshrc</code>.
+            </p>
+          </div>
+          <details className="settings-advanced">
+            <summary>Advanced — HTTP daemon</summary>
+            <div className="settings-editor">
+              <div className={`daemon-status ${daemonStatus?.running ? "running" : ""}`}>
+                <span>{daemonStatus?.running ? "Running" : "Stopped"}</span>
+                <strong>{daemonStatus?.url ?? "http://127.0.0.1:9700"}</strong>
+                <code>{daemonStatus?.cli_path ?? "CLI not found"}</code>
+              </div>
+              <div className="metadata-grid">
+                <label>
+                  <span>Host</span>
+                  <input value={daemonHost} onChange={(event) => setDaemonHost(event.target.value)} />
+                </label>
+                <label>
+                  <span>Port</span>
+                  <input
+                    type="number"
+                    min={1024}
+                    max={65535}
+                    value={daemonPort}
+                    onChange={(event) => setDaemonPort(Number(event.target.value) || 9700)}
+                  />
+                </label>
+              </div>
+              <label>
+                <span>Token</span>
+                <input
+                  value={daemonToken}
+                  onChange={(event) => setDaemonToken(event.target.value)}
+                  placeholder="auto-generated on Start"
+                />
+              </label>
+              {daemonToken ? (
+                <p className="daemon-token-hint">
+                  External agents authenticate with this token (header <code>X-Grafiki-Token</code>).{" "}
+                  <button className="link-button" type="button" onClick={() => copyToClipboard(daemonToken, "Daemon token")}>
+                    Copy
+                  </button>
+                </p>
+              ) : null}
+              <div className="maintenance-actions">
+                <button
+                  className="button secondary"
+                  onClick={refreshDaemonStatus}
+                  disabled={daemonBusy !== null || !draftRoot.trim()}
+                >
+                  <RefreshCcw size={15} />
+                  Refresh
+                </button>
+                <button
+                  className="button primary"
+                  onClick={startProjectDaemon}
+                  disabled={daemonBusy !== null || !draftRoot.trim() || !daemonStatus?.cli_available}
+                >
+                  <Activity size={15} />
+                  Start
+                </button>
+                <button
+                  className="button secondary danger-button"
+                  onClick={stopProjectDaemon}
+                  disabled={daemonBusy !== null || !draftRoot.trim() || !daemonStatus?.cli_available}
+                >
+                  <X size={15} />
+                  Stop
+                </button>
+              </div>
+            </div>
+          </details>
+        </section>
+      ) : null}
+
+      {settingsTab === "about" ? (
+        <section className="settings-grid">
+          <div className="settings-editor">
+            <div className="setting-row">
+              <span>Appearance</span>
+              <select
+                aria-label="Appearance"
+                value={themePref}
+                onChange={(event) => changeTheme(event.target.value as ThemePref)}
+              >
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+                <option value="system">System</option>
+              </select>
+            </div>
+            <Setting label="Version" value="0.1.0" />
+            <Setting label="License" value="MIT" />
+            <Setting label="Data location" value={snapshot?.project?.db_path ?? "Unavailable"} mono />
+          </div>
+          <div className="settings-editor">
+            <div className="maintenance-actions">
+              <button
+                className="button secondary"
+                onClick={exportJson}
+                disabled={maintenanceBusy !== null || !draftRoot.trim()}
+              >
+                <Download size={15} />
+                Export JSON
+              </button>
+              <button
+                className="button secondary"
+                onClick={importJson}
+                disabled={maintenanceBusy !== null || !draftRoot.trim()}
+              >
+                <Upload size={15} />
+                Import JSON
+              </button>
+            </div>
+          </div>
+          <details className="settings-advanced">
+            <summary>Advanced — embeddings & diagnostics</summary>
+            <div className="settings-editor">
+              <div className="maintenance-actions">
+                <button
+                  className="button secondary"
+                  onClick={() => runEmbeddings(false)}
+                  disabled={maintenanceBusy !== null || !draftRoot.trim()}
+                >
+                  <Sparkles size={15} />
+                  Process Embeddings
+                </button>
+                <button
+                  className="button primary"
+                  onClick={() => runEmbeddings(true)}
+                  disabled={maintenanceBusy !== null || !draftRoot.trim()}
+                >
+                  <RefreshCcw size={15} />
+                  Rebuild Embeddings
+                </button>
+              </div>
+              <Setting label="Embedding provider" value={embedding?.provider ?? "Unknown"} />
+              <Setting label="Vector backend" value={embedding?.vector_backend ?? "Unknown"} />
+              <Setting label="Indexed records" value={`${embedding?.indexed_records ?? 0}`} />
+              <Setting label="Missing or stale" value={`${embedding?.missing_or_stale_records ?? 0}`} />
+            </div>
+          </details>
+        </section>
+      ) : null}
     </div>
   );
 }
@@ -4149,7 +4281,7 @@ function PromptModal(props: { config: PromptConfig; reduceMotion: boolean; onClo
       >
         <header>
           <strong>{config.title}</strong>
-          <button className="icon-button" onClick={props.onClose}>
+          <button className="icon-button" onClick={props.onClose} title="Close" aria-label="Close">
             <X size={16} />
           </button>
         </header>

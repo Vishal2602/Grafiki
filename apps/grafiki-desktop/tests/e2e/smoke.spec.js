@@ -157,6 +157,9 @@ describe("Grafiki desktop", () => {
   it("Settings switches the theme and back", async () => {
     await landOnHome();
     await q.clickByText(".rail-item", "Settings");
+    await q.waitFor(".settings-grid");
+    // Theme lives under the About tab (docs/UX_REDESIGN.md §5.6 tab layout).
+    await q.clickByText(".seg-tab", "About");
     await q.waitFor(".setting-row select");
     const initial = (await q.attr("html", "data-theme")) ?? "light";
     const flipped = initial === "dark" ? "light" : "dark";

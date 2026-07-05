@@ -27,11 +27,16 @@ export function createDefaultLayout(): LayoutState {
 }
 
 export function loadInitialLayout(): LayoutState {
-  return (
-    decodeLayoutFromHash(window.location.hash) ??
-    decodeLayout(localStorage.getItem(STORAGE_KEY)) ??
-    createDefaultLayout()
-  );
+  // Always start at Home on a fresh launch — the ledger is the app's front
+  // door (docs/UX_REDESIGN.md §4). A resumable/live session is offered there
+  // via the Resume banner and live-session card, never as a silent
+  // full-screen takeover. Before this fix the app reopened directly into
+  // whatever pane (often the live terminal) was last active, so launch and
+  // the "Sessions" nav item showed the identical screen with no explanation
+  // (2026-07-04 don-norman-design-critic: "no idea what to do and where to
+  // look"). Mid-session navigation still persists via persistLayout below —
+  // this only overrides what a fresh process boot opens to.
+  return createDefaultLayout();
 }
 
 export function persistLayout(layout: LayoutState) {
