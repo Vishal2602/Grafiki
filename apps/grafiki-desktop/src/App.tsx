@@ -3526,7 +3526,7 @@ function SettingsPane(props: {
   const shellHookCommand = `grafiki capture shell-hook --path "${draftRoot || "."}"`;
 
   return (
-    <div className="view-stack">
+    <div className="view-stack settings-stack">
       <div className="seg-tabs">
         <button className={`seg-tab ${settingsTab === "projects" ? "active" : ""}`} onClick={() => setSettingsTab("projects")}>
           Projects
@@ -3587,10 +3587,18 @@ function SettingsPane(props: {
       {settingsTab === "capture" ? (
         <section className="settings-grid">
           <ListHeading title="Capture Consent" icon={ShieldQuestion} />
+          <p className="muted">
+            Choose what Grafiki may read from this project. Everything stays on this machine —
+            nothing is uploaded.
+          </p>
           <div className="settings-editor">
             <div className="capture-config-summary">
-              <span>{captureConfig?.config_path ?? "No capture config loaded"}</span>
-              <code title="Redaction profile">{captureConfig?.config.redaction_profile ?? "default"} redaction</code>
+              <span title={captureConfig?.config_path ?? ""}>
+                {tidyPath(captureConfig?.config_path ?? "No capture config loaded")}
+              </span>
+              <code title="How captured text is scrubbed before it is stored">
+                Redaction profile: {captureConfig?.config.redaction_profile ?? "default"}
+              </code>
             </div>
             <div className="capture-source-grid">
               {captureSourceLabels.map(([source, label]) => (
@@ -3605,9 +3613,9 @@ function SettingsPane(props: {
                 </label>
               ))}
             </div>
-            <div className="metadata-grid">
-              <label>
-                <span>Terminal Output</span>
+            <div className="settings-duo">
+              <label className="field-label">
+                <span>Terminal capture</span>
                 <select
                   value={captureConfig?.config.terminal_output ?? "off"}
                   disabled={captureConfigBusy || !captureConfig}
@@ -3616,12 +3624,12 @@ function SettingsPane(props: {
                   }
                 >
                   <option value="off">Off</option>
-                  <option value="digest">Digest</option>
-                  <option value="full">Full</option>
+                  <option value="digest">Digest only</option>
+                  <option value="full">Full output</option>
                 </select>
               </label>
-              <label>
-                <span>Screen Policy</span>
+              <label className="field-label">
+                <span>Screenshots</span>
                 <select
                   value={captureConfig?.config.screen_policy ?? "manual"}
                   disabled={captureConfigBusy || !captureConfig}
@@ -3630,7 +3638,7 @@ function SettingsPane(props: {
                   }
                 >
                   <option value="off">Off</option>
-                  <option value="manual">Manual</option>
+                  <option value="manual">Ask each time</option>
                   <option value="allowlist">Allowlist</option>
                 </select>
               </label>
@@ -3750,17 +3758,28 @@ function SettingsPane(props: {
           <details className="settings-advanced">
             <summary>Advanced — HTTP daemon</summary>
             <div className="settings-editor">
-              <div className={`daemon-status ${daemonStatus?.running ? "running" : ""}`}>
-                <span>{daemonStatus?.running ? "Running" : "Stopped"}</span>
-                <strong>{daemonStatus?.url ?? "http://127.0.0.1:9700"}</strong>
-                <code>{daemonStatus?.cli_path ?? "CLI not found"}</code>
-              </div>
-              <div className="metadata-grid">
-                <label>
+              <dl className={`daemon-facts ${daemonStatus?.running ? "running" : ""}`}>
+                <div>
+                  <dt>Status</dt>
+                  <dd className="daemon-state">{daemonStatus?.running ? "Running" : "Stopped"}</dd>
+                </div>
+                <div>
+                  <dt>Endpoint</dt>
+                  <dd className="mono">{daemonStatus?.url ?? "http://127.0.0.1:9700"}</dd>
+                </div>
+                <div>
+                  <dt>Binary</dt>
+                  <dd className="mono" title={daemonStatus?.cli_path ?? ""}>
+                    {tidyPath(daemonStatus?.cli_path ?? "CLI not found")}
+                  </dd>
+                </div>
+              </dl>
+              <div className="settings-duo">
+                <label className="field-label">
                   <span>Host</span>
                   <input value={daemonHost} onChange={(event) => setDaemonHost(event.target.value)} />
                 </label>
-                <label>
+                <label className="field-label">
                   <span>Port</span>
                   <input
                     type="number"
@@ -3771,7 +3790,7 @@ function SettingsPane(props: {
                   />
                 </label>
               </div>
-              <label>
+              <label className="field-label">
                 <span>Token</span>
                 <input
                   value={daemonToken}
@@ -3799,15 +3818,20 @@ function SettingsPane(props: {
                 <button
                   className="button primary"
                   onClick={startProjectDaemon}
-                  disabled={daemonBusy !== null || !draftRoot.trim() || !daemonStatus?.cli_available}
+                  disabled={
+                    daemonBusy !== null ||
+                    !draftRoot.trim() ||
+                    !daemonStatus?.cli_available ||
+                    Boolean(daemonStatus?.running)
+                  }
                 >
                   <Activity size={15} />
                   Start
                 </button>
                 <button
-                  className="button secondary danger-button"
+                  className="button danger-button"
                   onClick={stopProjectDaemon}
-                  disabled={daemonBusy !== null || !draftRoot.trim() || !daemonStatus?.cli_available}
+                  disabled={daemonBusy !== null || !daemonStatus?.running}
                 >
                   <X size={15} />
                   Stop

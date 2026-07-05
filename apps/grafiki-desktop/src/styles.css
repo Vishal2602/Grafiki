@@ -434,6 +434,11 @@ textarea,
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* overflow-y:auto leaves overflow-x computing to `auto`, so any 1px child
+     overflow paints a stray horizontal scrollbar thumb — the "mysterious gray
+     handle at bottom-center" both audits flagged. Pin it. (Inner .copy-row /
+     code blocks keep their own scroll.) */
+  overflow-x: hidden;
   padding: 4px 20px 20px;
 }
 /* Terminal/chat views own their scrolling: the pane frame stays FIXED (toolbar
@@ -679,12 +684,18 @@ textarea {
   font-size: 11.5px;
 }
 .list-heading {
-  font-size: 10px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--ink-3);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--fs-section);
+  letter-spacing: -0.005em;
+  text-transform: none;
+  color: var(--ink);
   font-weight: 600;
-  margin: 10px 0 4px;
+  margin: 6px 0 2px;
+}
+.list-heading svg {
+  color: var(--ink-2);
 }
 .record-type {
   display: inline-flex;
@@ -978,7 +989,67 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 16px;
-  max-width: 720px;
+  width: 100%;
+}
+/* Center the whole Settings column (tabs + content) at the reading width so
+   switching Home↔Settings keeps the content column stable, not a lone 720. */
+.settings-stack {
+  max-width: var(--page-max-form);
+  width: 100%;
+  margin: 0 auto;
+}
+/* Two-up field pairs (Terminal capture / Screenshots, Host / Port). */
+.settings-duo {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.field-label > span {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+/* The .mono class was referenced by Setting rows but never defined — paths
+   rendered as plain sans and overflowed. Define + truncate. */
+.mono {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--ink-2);
+}
+.setting-row > strong {
+  min-width: 0;
+  max-width: 62%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
+/* Daemon facts: labeled Status / Endpoint / Binary rows. */
+.daemon-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 14px;
+  align-items: baseline;
+  font-size: 12.5px;
+}
+.daemon-facts > div {
+  display: contents;
+}
+.daemon-facts dt {
+  color: var(--ink-3);
+}
+.daemon-facts dd {
+  color: var(--ink);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.daemon-facts .daemon-state {
+  font-weight: 600;
+}
+.daemon-facts.running .daemon-state {
+  color: var(--ok);
 }
 .settings-editor {
   background: var(--card);
@@ -1007,19 +1078,19 @@ textarea {
   border-bottom: 0;
 }
 .capture-source-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-  gap: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 .capture-toggle {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 8px;
   font-size: 12.5px;
-  padding: 6px 8px;
-  border: 1px solid var(--hairline);
+  padding: 6px 12px;
+  border: 1px solid var(--hairline-2);
   border-radius: var(--r-btn);
-  background: var(--sheet);
+  background: var(--card);
 }
 .capture-toggle input {
   accent-color: var(--accent);
