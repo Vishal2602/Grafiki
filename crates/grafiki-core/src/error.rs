@@ -106,6 +106,18 @@ pub enum GrafikiError {
     ProjectNotInitialized(String),
 
     #[error(
+        "This folder already belongs to project '{existing}' ({path}), which has memory on disk. \
+         Re-initializing as '{requested}' would hide it (the '{existing}' memory stays under \
+         `--project {existing}`). To intentionally re-point this folder, delete its `.grafiki` \
+         file first."
+    )]
+    ProjectMarkerConflict {
+        existing: String,
+        requested: String,
+        path: String,
+    },
+
+    #[error(
         "Database schema version {found} is newer than this Grafiki build supports ({supported}). \
          Upgrade Grafiki to open this project."
     )]

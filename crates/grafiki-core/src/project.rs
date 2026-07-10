@@ -169,6 +169,7 @@ impl Default for CaptureConfig {
 
 pub fn init_project(options: InitOptions) -> Result<InitReport> {
     let project_dir = normalize_project_dir(&options.project_dir)?;
+    let explicit_name = options.project_name.is_some();
     let project = match options.project_name {
         Some(name) => validate_project_name(name.trim())?,
         None => infer_project_name(&project_dir)?,
@@ -182,6 +183,24 @@ pub fn init_project(options: InitOptions) -> Result<InitReport> {
     crate::db::restrict_dir_permissions(&grafiki_home);
 
     let marker_path = project_dir.join(".grafiki");
+    // Refuse to silently re-point a folder that already belongs to a different
+    // project WITH memory on disk. `grafiki init beta` in an `alpha` folder used
+    // to overwrite `.grafiki`, leaving alpha's DB orphaned (default commands
+    // then saw an empty database). Only guards the explicit-name path; inferred
+    // re-init resolves to the existing marker and never conflicts.
+    if explicit_name && marker_path.exists() {
+        let existing = fs::read_to_string(&marker_path)?.trim().to_owned();
+        if !existing.is_empty()
+            && existing != project
+            && grafiki_home.join(format!("{existing}.db")).exists()
+        {
+            return Err(GrafikiError::ProjectMarkerConflict {
+                existing,
+                requested: project,
+                path: marker_path.display().to_string(),
+            });
+        }
+    }
     let created_marker = write_marker_if_needed(&marker_path, &project)?;
     let capture_config_path = capture_config_path(&project_dir);
     let created_capture_config = write_default_capture_config_if_needed(&capture_config_path)?;

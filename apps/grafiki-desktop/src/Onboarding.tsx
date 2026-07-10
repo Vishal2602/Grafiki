@@ -54,6 +54,17 @@ export default function Onboarding(props: {
   const enableCaptureLate = async () => {
     const dir = folder.trim();
     if (!dir) return;
+    // Re-state consent before flipping capture on from this later step — same
+    // disclosure as the step-1 checkbox, so no path enables capture silently.
+    if (
+      !window.confirm(
+        "Turn on terminal capture for this workspace?\n\nGrafiki will store this project's " +
+          "terminal output as local, redacted capture events so it can become reviewable memory. " +
+          "Nothing leaves this Mac, and you can turn it off anytime in Settings → Capture & privacy.",
+      )
+    ) {
+      return;
+    }
     setEnablingCapture(true);
     try {
       await updateCaptureConfig({ startDir: dir, terminal: true, terminalOutput: "full" });

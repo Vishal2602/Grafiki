@@ -11,11 +11,49 @@ permissions:
   contents: write
 
 jobs:
+  # Release gate: nothing publishes unless the same core checks CI runs on every
+  # push/PR (fmt, clippy, core+cli+eval tests, eval regression gate) pass here too.
+  # A tag push bypasses branch-protection status checks, so this job re-runs the
+  # gates directly inside the release workflow rather than trusting a prior CI run.
+  lint-and-test:
+    name: Lint & test (release gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-ubuntu-latest-${{ hashFiles('Cargo.lock') }}
+      # rust-toolchain.toml pins the version + components (rustfmt, clippy).
+      - name: Rustfmt
+        run: cargo fmt --all --check
+      - name: Clippy (core + cli)
+        run: cargo clippy -p grafiki-core -p grafiki-cli --all-targets -- -D warnings
+      - name: Clippy (code-index feature)
+        run: cargo clippy -p grafiki-core -p grafiki-cli --all-targets --features code-index -- -D warnings
+      - name: Test core + cli + eval
+        run: cargo test -p grafiki-core -p grafiki-cli -p grafiki-eval
+      # Deterministic, model-free: keyword retrieval, memory-QA replay,
+      # supersession, and redaction over bundled fixtures. Any secret leak,
+      # consent/review isolation break, stale-fact leak, or quality regression
+      # beyond the committed floors fails the build.
+      - name: Memory loop + safety regression gate
+        run: |
+          cargo run -p grafiki-eval -- run \
+            --arm all --mode keyword \
+            --baseline crates/grafiki-eval/fixtures/baselines/baseline.json \
+            --fail-on-regression --format md
+
   # Real semantic search ships only in release builds: the fastembed + sqlite-vec
   # features are compiled in here, so the published binaries embed for real while
   # day-to-day dev builds stay lightweight.
   cli:
     name: CLI (${{ matrix.target }})
+    needs: [lint-and-test]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -43,6 +81,7 @@ jobs:
 
   desktop:
     name: Desktop DMG (macOS)
+    needs: [lint-and-test]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4

@@ -78,9 +78,21 @@ export async function getProjectSnapshot(input: { startDir?: string; scope?: str
   if (!hasTauri()) return (await getPreviewData()).mockSnapshot;
 
   try {
-    return await invoke<ProjectSnapshot>("get_project_snapshot", {
+    const raw = await invoke<ProjectSnapshot>("get_project_snapshot", {
       request: { startDir: input.startDir ?? "", scope: input.scope ?? "" },
     });
+    // The `as T` on `invoke` is a compile-time assertion only — a shape drift
+    // (renamed field, wrong type) would flow through as a valid-looking snapshot
+    // and mislead the whole app. Runtime-check the load-bearing fields; treat a
+    // malformed payload as an error, not a healthy empty project.
+    if (
+      raw === null ||
+      typeof raw !== "object" ||
+      typeof (raw as ProjectSnapshot).memory_available !== "boolean"
+    ) {
+      throw new Error("malformed project snapshot from backend");
+    }
+    return raw;
   } catch (error) {
     return {
       start_dir: input.startDir ?? "",

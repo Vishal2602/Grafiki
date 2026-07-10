@@ -29,6 +29,14 @@ use tauri::State;
 const SCROLLBACK_MAX: usize = 512 * 1024;
 /// Capture is flushed to `capture_events` whenever this much output accumulates.
 const CAPTURE_FLUSH_THRESHOLD: usize = 64 * 1024;
+/// Trailing raw bytes held back (not flushed) at each full-capture flush and
+/// carried into the next accumulation. `redact_text` works line-by-line, so a
+/// flush that lands mid-secret — the key on one side of the 64 KiB boundary,
+/// the value on the other — would otherwise redact each side independently
+/// and let the half with no key-bearing context through in the clear. Holding
+/// back a trailing window reunites a boundary-straddling secret in one
+/// redaction call as long as it starts within the window.
+const REDACT_CARRY: usize = 4 * 1024;
 /// How much (ANSI-stripped) tail is persisted to disk for cross-relaunch resume.
 const RESUME_TAIL_MAX: usize = 32 * 1024;
 /// Machine-readable exit signal sent through the output channel when the child
@@ -109,6 +117,12 @@ fn store_descriptor(id: &str, descriptor: Option<SessionDescriptor>) {
         }
     }
     if let Ok(json) = serde_json::to_string_pretty(&all) {
+        // Write to a sibling temp file, then rename it over the target. A
+        // truncate-and-write in place leaves a corrupt (or empty) store if
+        // the process dies mid-write; a same-directory rename is atomic, so
+        // a crash here always leaves either the old file or the new one, never
+        // a partial one.
+        let tmp_path = path.with_extension("tmp");
         #[cfg(unix)]
         let result = {
             use std::os::unix::fs::OpenOptionsExt;
@@ -117,11 +131,13 @@ fn store_descriptor(id: &str, descriptor: Option<SessionDescriptor>) {
                 .truncate(true)
                 .write(true)
                 .mode(0o600)
-                .open(&path)
+                .open(&tmp_path)
                 .and_then(|mut file| file.write_all(json.as_bytes()))
+                .and_then(|()| std::fs::rename(&tmp_path, &path))
         };
         #[cfg(not(unix))]
-        let result = std::fs::write(&path, json);
+        let result =
+            std::fs::write(&tmp_path, json).and_then(|()| std::fs::rename(&tmp_path, &path));
         let _ = result;
         #[cfg(unix)]
         {
@@ -711,8 +727,12 @@ fn spawn_session(
     // only detaches the channel; it never stops the session.
     {
         let shared = shared.clone();
-        let capture_id = capture_id.clone();
-        let capture_mode_for_reader = capture_mode;
+        // Mutable: re-checked against the live capture policy on every flush so
+        // a mid-session "capture off" in Settings actually stops persistence
+        // instead of the reader thread running for the session's whole life on
+        // the consent it was spawned with.
+        let mut capture_id = capture_id.clone();
+        let mut capture_mode_for_reader = capture_mode;
         let project_root = cwd.clone();
         let id = id.clone();
         let launch = launch.clone();
@@ -735,9 +755,8 @@ fn spawn_session(
                                 match capture_mode_for_reader {
                                     CaptureMode::Full => {
                                         state.capture.extend_from_slice(bytes);
-                                        (state.capture.len() > CAPTURE_FLUSH_THRESHOLD).then(|| {
-                                            CaptureFlush::Full(std::mem::take(&mut state.capture))
-                                        })
+                                        take_capture_for_flush(&mut state.capture)
+                                            .map(CaptureFlush::Full)
                                     }
                                     CaptureMode::Digest => {
                                         state.digest.push(bytes);
@@ -753,17 +772,46 @@ fn spawn_session(
                             }
                         };
                         if let Some(flush) = flush {
-                            flush_capture(&project_root, &capture_id, flush);
-                            // Piggyback resume-tail persistence on the capture
-                            // cadence so a hard app quit loses little context.
-                            persist_tail(
-                                &id,
-                                &project_root,
-                                &launch,
-                                &capture_id,
-                                capture_mode_for_reader,
-                                &shared,
-                            );
+                            // Re-read the live capture policy before persisting —
+                            // a mid-session "capture off" in Settings must stop
+                            // persistence, not just be honored on the next
+                            // terminal_open. Re-reading once per ~64 KiB flush is
+                            // cheap; don't thrash the config file per byte.
+                            let still_capturing =
+                                capture_id.is_some() && capture_policy(&project_root).is_ok();
+                            if still_capturing {
+                                flush_capture(&project_root, &capture_id, flush);
+                                // Piggyback resume-tail persistence on the capture
+                                // cadence so a hard app quit loses little context.
+                                persist_tail(
+                                    &id,
+                                    &project_root,
+                                    &launch,
+                                    &capture_id,
+                                    capture_mode_for_reader,
+                                    &shared,
+                                );
+                            } else if let Some(stopped) = capture_id.take() {
+                                // Capture was turned off mid-session: drop this
+                                // already-buffered chunk instead of persisting it,
+                                // finalize the capture session once, and flip to
+                                // Off so no further flush is even attempted.
+                                let _ = stop_capture_session(StopCaptureOptions {
+                                    project_name: None,
+                                    start_dir: PathBuf::from(&project_root),
+                                    grafiki_home: None,
+                                    capture_id: stopped,
+                                });
+                                capture_mode_for_reader = CaptureMode::Off;
+                                persist_tail(
+                                    &id,
+                                    &project_root,
+                                    &launch,
+                                    &capture_id,
+                                    capture_mode_for_reader,
+                                    &shared,
+                                );
+                            }
                         }
                     }
                 }
@@ -920,13 +968,18 @@ pub fn terminal_write(
         let sessions = registry.0.lock().unwrap();
         sessions.get(&id).map(|session| session.writer.clone())
     };
-    if let Some(writer) = writer {
-        let mut writer = writer.lock().unwrap();
-        writer
-            .write_all(data.as_bytes())
-            .map_err(|error| error.to_string())?;
-        writer.flush().map_err(|error| error.to_string())?;
-    }
+    // A missing session must be an error, not a silent no-op: the UI clears
+    // the composer as soon as this call returns Ok, so an `Ok(())` here for a
+    // session that no longer exists tells the user their input landed when it
+    // was actually dropped on the floor.
+    let Some(writer) = writer else {
+        return Err(format!("terminal session {id} is no longer running"));
+    };
+    let mut writer = writer.lock().unwrap();
+    writer
+        .write_all(data.as_bytes())
+        .map_err(|error| error.to_string())?;
+    writer.flush().map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -986,6 +1039,19 @@ fn finish_session(mut session: TerminalSession) {
             capture_id,
         });
     }
+}
+
+/// Split a full-capture accumulator at a flush point, holding back the last
+/// `REDACT_CARRY` bytes (raw, unredacted) in `capture` so a secret whose key
+/// falls in that trailing window survives into the next accumulation instead
+/// of being redacted (or not) independently of its value. Returns `None`
+/// until `capture` exceeds the flush threshold.
+fn take_capture_for_flush(capture: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if capture.len() <= CAPTURE_FLUSH_THRESHOLD {
+        return None;
+    }
+    let split_at = capture.len().saturating_sub(REDACT_CARRY);
+    Some(capture.drain(..split_at).collect())
 }
 
 enum CaptureFlush {
@@ -1093,7 +1159,11 @@ fn strip_ansi(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, DigestBuffer, TermShared, SCROLLBACK_MAX};
+    use super::{
+        strip_ansi, take_capture_for_flush, DigestBuffer, TermShared, CAPTURE_FLUSH_THRESHOLD,
+        REDACT_CARRY, SCROLLBACK_MAX,
+    };
+    use grafiki_core::redact_text;
 
     #[test]
     fn strips_color_and_cursor_sequences_but_keeps_text() {
@@ -1172,5 +1242,43 @@ mod tests {
         assert!(!report.contains("secret-value"));
         assert!(!report.contains("API_TOKEN"));
         assert!(report.contains("2 lines"));
+    }
+
+    #[test]
+    fn full_capture_redacts_a_secret_split_across_the_flush_boundary() {
+        // Read 1: harmless filler followed immediately by the START of a
+        // secret assignment ("API_TOKEN=sk-") — sized so the READ ALONE
+        // crosses the flush threshold, with the key landing in the trailing
+        // bytes. Without a carry, a naive flush takes the WHOLE accumulator
+        // here (key, no value yet — nothing leaks on this call) and resets
+        // to empty; the value then arrives on its own later with no key on
+        // its line, and leaks unredacted. `take_capture_for_flush` instead
+        // holds back the last `REDACT_CARRY` bytes — which the key sits
+        // inside of — so it survives into the next accumulation instead.
+        let secret_key = b"API_TOKEN=sk-";
+        let filler_len = CAPTURE_FLUSH_THRESHOLD + 64 - secret_key.len() - 1;
+        let mut capture: Vec<u8> = vec![b'x'; filler_len];
+        capture.push(b'\n');
+        capture.extend_from_slice(secret_key);
+        assert!(capture.len() > CAPTURE_FLUSH_THRESHOLD);
+
+        let flush1 = take_capture_for_flush(&mut capture).expect("threshold crossed on read 1");
+        // The key survived into the carry rather than being flushed alone.
+        assert_eq!(capture.len(), REDACT_CARRY);
+        let raw_flush1 = String::from_utf8_lossy(&flush1);
+        assert!(!raw_flush1.contains("API_TOKEN"));
+
+        // Read 2: the PTY delivers the rest of the secret. The session then
+        // ends, so the whole remaining (carried) buffer is flushed as one.
+        capture.extend_from_slice(b"SECRETVALUE\n");
+        let flush2 = std::mem::take(&mut capture);
+
+        let (redacted1, _) = redact_text(&strip_ansi(&flush1));
+        let (redacted2, _) = redact_text(&strip_ansi(&flush2));
+
+        assert!(!redacted1.contains("SECRETVALUE"));
+        assert!(!redacted2.contains("SECRETVALUE"));
+        assert!(!redacted2.contains("sk-SECRETVALUE"));
+        assert!(redacted2.contains("REDACTED"));
     }
 }

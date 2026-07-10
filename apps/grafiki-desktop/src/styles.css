@@ -40,12 +40,16 @@
   /* Semantic status — chips / dots / icons / labels only, never large fills.
      Distinct hues so the states stop colliding on green:
        selected/active = accent · approved/online = success · neutral = info */
-  --success: #2e9e6b;       /* success / approved / online */
+  /* Darkened from #2e9e6b: as small STATUS TEXT (11–12px "online"/"capturing")
+     the brighter green sat at ~3.3:1 on the near-white sheet, under the 4.5:1
+     WCAG AA floor. This darker pine clears it; the brighter --accent-live is
+     kept for the large/decorative pulse dot where contrast isn't the concern. */
+  --success: #0f6a43;       /* success / approved / online */
   --success-soft: #e4f2ea;
-  --info: #3d6e8e;          /* slate: neutral status, tag-chip borders */
+  --info: #2f5a75;          /* slate: neutral status, tag-chip borders */
   --info-soft: #e8eef3;
   --user-bubble: #eceef1;   /* chat "you" bubble — neutral, NOT green */
-  --ok: #2e9e6b;            /* legacy alias of --success (kept for existing refs) */
+  --ok: #0f6a43;            /* legacy alias of --success (kept for existing refs) */
   --warn: #8a5b00;
   --warn-surface: #e5bc62;
   --danger: #ad372f;
@@ -2535,13 +2539,15 @@ button:active:not(:disabled) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
-  height: 16px;
-  border-radius: 5px;
+  /* 24×24 hit area (was 16×16, under the WCAG 2.5.8 target-size minimum) —
+     the glyph stays small but the clickable region is comfortable. */
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
   color: var(--ink-3);
   opacity: 0.55;
   padding: 0;
-  margin-right: 5px;
+  margin-right: 3px;
   border: 0;
   background: transparent;
 }

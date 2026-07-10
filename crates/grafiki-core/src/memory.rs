@@ -1429,13 +1429,17 @@ pub fn log_decision(options: LogDecisionOptions) -> Result<DecisionReport> {
     )?;
 
     if let Some(superseded_id) = &options.supersedes {
+        // Only supersede a decision that's still in play. Overwriting a
+        // 'revoked' status with 'superseded' would resurrect a decision the
+        // user explicitly killed (superseded is searchable-by-status; revoked
+        // is a hard stop).
         tx.execute(
             "
             UPDATE decisions
             SET status = 'superseded',
                 superseded_by = ?1,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-            WHERE id = ?2
+            WHERE id = ?2 AND status != 'revoked'
             ",
             params![decision_id, superseded_id],
         )?;
@@ -1509,12 +1513,16 @@ pub fn list_decisions(options: DecisionListOptions) -> Result<Vec<DecisionItem>>
             let rows = statement.query_map(params.as_slice(), decision_item_from_row)?;
             collect_rows(rows)
         }
+        // Superseded decisions are obsolete — a retrieval that includes them
+        // surfaces the old rule next to the current one. They're excluded here
+        // and from search/embedding/count below; an explicit `status` filter
+        // (the arm above) can still list them.
         None => query_scoped_rows(
             &connection,
             "
             SELECT id, title, status, scope, reasoning
             FROM decisions
-            WHERE status != 'revoked' AND scope IN ({scopes})
+            WHERE status NOT IN ('revoked', 'superseded') AND scope IN ({scopes})
             ORDER BY updated_at DESC, created_at DESC, id DESC
             ",
             &scope_chain,
@@ -2763,8 +2771,32 @@ pub fn chat_with_provider(
         });
     }
 
-    let citations = memories
+    // Verify the answer's citations against the memories we actually provided.
+    // Two failures used to slip through: (1) EVERY retrieved memory was attached
+    // as a citation regardless of what the answer cited, and (2) an answer citing
+    // a nonexistent source like [99] was accepted as grounded. A reference to a
+    // source we never supplied means the model fabricated — abstain rather than
+    // present a confident, wrongly-cited answer.
+    let valid_indices: std::collections::HashSet<usize> =
+        memories.iter().map(|memory| memory.index).collect();
+    let cited = crate::chat::parse_cited_indices(&answer);
+    if cited.iter().any(|index| !valid_indices.contains(index)) {
+        return Ok(ChatReply {
+            question,
+            scope,
+            answer: NO_MEMORY_ANSWER.to_owned(),
+            citations: Vec::new(),
+            used_memory: false,
+            flagged_injection,
+        });
+    }
+
+    // Attach ONLY the memories the answer actually cited. If the model cited
+    // nothing at all (some models omit markers), fall back to the provided set
+    // so the answer still carries its provenance rather than none.
+    let citations: Vec<Citation> = memories
         .iter()
+        .filter(|memory| cited.is_empty() || cited.contains(&memory.index))
         .map(|memory| Citation {
             index: memory.index,
             record_type: memory.record_type.clone(),
@@ -4269,11 +4301,31 @@ struct ApprovalRestoreSnapshot {
     prior_status: Option<String>,
     prior_superseded_by: Option<String>,
     prior_valid_to: Option<String>,
+    /// Full prior contents of a key/name-collision record that approval
+    /// overwrote via UPSERT. Present ⇒ the record PRE-EXISTED and undo must
+    /// restore these contents (context/state) or refuse (entity) rather than
+    /// delete — otherwise undo destroys data the candidate never owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prior_upsert: Option<PriorUpsert>,
 }
 
-/// Persist the predecessor's exact state before approval mutates it. The snapshot
-/// lives on the candidate so approval retry and later undo share one durable,
-/// auditable restoration source.
+/// The pre-approval row of a keyed record an upsert-approval would overwrite.
+#[derive(Debug, Serialize, Deserialize)]
+struct PriorUpsert {
+    /// "context" | "state" | "entity".
+    record_type: String,
+    /// context/state `key`, or the entity `id`.
+    key: String,
+    /// Prior column values (null for entity — we only refuse, not restore).
+    row: Option<serde_json::Value>,
+}
+
+/// Persist the predecessor's exact state before approval mutates it. Captures
+/// two kinds of loss: a supersession target (decision/observation) whose status
+/// approval flips, AND a key/name-collision record (context/state/entity) whose
+/// full contents an upsert-approval would overwrite. The snapshot lives on the
+/// candidate so approval retry and later undo share one durable restoration
+/// source.
 fn snapshot_candidate_supersession(
     connection: &Connection,
     candidate: &ExtractionCandidate,
@@ -4286,50 +4338,167 @@ fn snapshot_candidate_supersession(
     if already_snapshotted {
         return Ok(());
     }
-    let Some(record_id) = candidate_payload_optional_string(&candidate.payload, &["supersedes"])
+
+    // (a) Supersession target, if the payload names one.
+    let supersession = match candidate_payload_optional_string(&candidate.payload, &["supersedes"])
+    {
+        Some(record_id) => match candidate.record_type.as_str() {
+            "decision" => connection
+                .query_row(
+                    "SELECT status, superseded_by FROM decisions WHERE id = ?1",
+                    [&record_id],
+                    |row| {
+                        Ok((
+                            Some(row.get::<_, String>(0)?),
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .map(|(status, superseded_by)| (record_id.clone(), status, superseded_by, None)),
+            "observation" => connection
+                .query_row(
+                    "SELECT valid_to FROM observations WHERE id = ?1",
+                    [&record_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .map(|valid_to| (record_id.clone(), None, None, Some(valid_to))),
+            _ => None,
+        },
+        None => None,
+    };
+
+    // (b) Key/name-collision record whose contents an upsert would overwrite.
+    let prior_upsert = snapshot_prior_upsert(connection, candidate)?;
+
+    let Some(mut snapshot) = supersession
+        .map(
+            |(record_id, prior_status, prior_superseded_by, prior_valid_to)| {
+                ApprovalRestoreSnapshot {
+                    record_type: candidate.record_type.clone(),
+                    record_id,
+                    prior_status,
+                    prior_superseded_by,
+                    prior_valid_to: prior_valid_to.flatten(),
+                    prior_upsert: None,
+                }
+            },
+        )
+        .or_else(|| {
+            prior_upsert.as_ref().map(|upsert| ApprovalRestoreSnapshot {
+                record_type: candidate.record_type.clone(),
+                record_id: upsert.key.clone(),
+                prior_status: None,
+                prior_superseded_by: None,
+                prior_valid_to: None,
+                prior_upsert: None,
+            })
+        })
     else {
         return Ok(());
     };
-    let snapshot = match candidate.record_type.as_str() {
-        "decision" => connection
-            .query_row(
-                "SELECT status, superseded_by FROM decisions WHERE id = ?1",
-                [&record_id],
-                |row| {
-                    Ok(ApprovalRestoreSnapshot {
-                        record_type: "decision".to_owned(),
-                        record_id: record_id.clone(),
-                        prior_status: Some(row.get(0)?),
-                        prior_superseded_by: row.get(1)?,
-                        prior_valid_to: None,
-                    })
-                },
-            )
-            .optional()?,
-        "observation" => connection
-            .query_row(
-                "SELECT valid_to FROM observations WHERE id = ?1",
-                [&record_id],
-                |row| {
-                    Ok(ApprovalRestoreSnapshot {
-                        record_type: "observation".to_owned(),
-                        record_id: record_id.clone(),
-                        prior_status: None,
-                        prior_superseded_by: None,
-                        prior_valid_to: row.get(0)?,
-                    })
-                },
-            )
-            .optional()?,
-        _ => None,
-    };
-    if let Some(snapshot) = snapshot {
-        connection.execute(
-            "UPDATE extraction_candidates SET approval_restore = ?1 WHERE id = ?2",
-            params![serde_json::to_string(&snapshot)?, candidate.id],
-        )?;
-    }
+    snapshot.prior_upsert = prior_upsert;
+
+    connection.execute(
+        "UPDATE extraction_candidates SET approval_restore = ?1 WHERE id = ?2",
+        params![serde_json::to_string(&snapshot)?, candidate.id],
+    )?;
     Ok(())
+}
+
+/// Capture the prior row of a context/state key (or entity name) the candidate
+/// would upsert-overwrite. Returns None when nothing with that key exists (a
+/// genuinely new record — undo can safely delete it).
+fn snapshot_prior_upsert(
+    connection: &Connection,
+    candidate: &ExtractionCandidate,
+) -> Result<Option<PriorUpsert>> {
+    match candidate.record_type.as_str() {
+        "context" => {
+            let Some(key) = candidate_payload_optional_string(&candidate.payload, &["key"]) else {
+                return Ok(None);
+            };
+            connection
+                .query_row(
+                    "SELECT title, content, category, scope, checksum, version
+                     FROM context WHERE key = ?1",
+                    [&key],
+                    |row| {
+                        Ok(serde_json::json!({
+                            "title": row.get::<_, String>(0)?,
+                            "content": row.get::<_, String>(1)?,
+                            "category": row.get::<_, String>(2)?,
+                            "scope": row.get::<_, String>(3)?,
+                            "checksum": row.get::<_, String>(4)?,
+                            "version": row.get::<_, i64>(5)?,
+                        }))
+                    },
+                )
+                .optional()
+                .map(|row| {
+                    row.map(|row| PriorUpsert {
+                        record_type: "context".to_owned(),
+                        key,
+                        row: Some(row),
+                    })
+                })
+                .map_err(Into::into)
+        }
+        "state" => {
+            let Some(key) = candidate_payload_optional_string(&candidate.payload, &["key"]) else {
+                return Ok(None);
+            };
+            connection
+                .query_row(
+                    "SELECT title, status, owner, details, blockers, depends_on, scope, priority
+                     FROM state WHERE key = ?1",
+                    [&key],
+                    |row| {
+                        Ok(serde_json::json!({
+                            "title": row.get::<_, String>(0)?,
+                            "status": row.get::<_, String>(1)?,
+                            "owner": row.get::<_, Option<String>>(2)?,
+                            "details": row.get::<_, Option<String>>(3)?,
+                            "blockers": row.get::<_, String>(4)?,
+                            "depends_on": row.get::<_, String>(5)?,
+                            "scope": row.get::<_, String>(6)?,
+                            "priority": row.get::<_, String>(7)?,
+                        }))
+                    },
+                )
+                .optional()
+                .map(|row| {
+                    row.map(|row| PriorUpsert {
+                        record_type: "state".to_owned(),
+                        key,
+                        row: Some(row),
+                    })
+                })
+                .map_err(Into::into)
+        }
+        "entity" => {
+            // Entities upsert by slug(name). If one already exists, undo can't
+            // cleanly unwind (the added observation/relation and the merge are
+            // entangled), so we only record that it pre-existed and REFUSE undo.
+            let Some(name) =
+                candidate_payload_optional_string(&candidate.payload, &["name", "title"])
+            else {
+                return Ok(None);
+            };
+            let entity_id = entity_id_for_name(connection, &name)?;
+            if entity_exists(connection, &entity_id)? {
+                Ok(Some(PriorUpsert {
+                    record_type: "entity".to_owned(),
+                    key: entity_id,
+                    row: None,
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 fn release_candidate_approval_claim(options: &ApproveCandidateOptions) {
@@ -4348,6 +4517,86 @@ fn release_candidate_approval_claim(options: &ApproveCandidateOptions) {
              WHERE id = ?1 AND status = 'pending'",
             params![&options.id],
         );
+    }
+}
+
+/// Restore a pre-existing context/state record's prior contents that an
+/// upsert-approval overwrote. Returns whether it restored anything (⇒ the
+/// caller must NOT delete the record). Entity prior-upserts are refused earlier,
+/// never restored here.
+fn restore_prior_upsert(
+    tx: &rusqlite::Transaction<'_>,
+    prior_upsert: Option<&PriorUpsert>,
+    trusted_record_id: &str,
+) -> Result<bool> {
+    let Some(upsert) = prior_upsert else {
+        return Ok(false);
+    };
+    let Some(row) = &upsert.row else {
+        return Ok(false);
+    };
+    // The overwritten record IS the trusted record (same key); a mismatch means
+    // something else changed it since — don't clobber that.
+    if upsert.key != trusted_record_id {
+        return Ok(false);
+    }
+    let get = |field: &str| {
+        row.get(field)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+    match upsert.record_type.as_str() {
+        "context" => {
+            let content = get("content");
+            tx.execute(
+                "UPDATE context
+                 SET title = ?1, content = ?2, category = ?3, scope = ?4,
+                     checksum = ?5, version = ?6, retired_at = NULL,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE key = ?7",
+                params![
+                    get("title"),
+                    content,
+                    get("category"),
+                    get("scope"),
+                    get("checksum"),
+                    row.get("version").and_then(|v| v.as_i64()).unwrap_or(1),
+                    upsert.key,
+                ],
+            )?;
+            let scope = get("scope");
+            enqueue_embedding_job(
+                tx,
+                "context",
+                &upsert.key,
+                &scope,
+                &format!("{} {}", get("title"), content),
+            )?;
+            Ok(true)
+        }
+        "state" => {
+            tx.execute(
+                "UPDATE state
+                 SET title = ?1, status = ?2, owner = ?3, details = ?4,
+                     blockers = ?5, depends_on = ?6, scope = ?7, priority = ?8,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE key = ?9",
+                params![
+                    get("title"),
+                    get("status"),
+                    row.get("owner").and_then(|v| v.as_str()),
+                    row.get("details").and_then(|v| v.as_str()),
+                    get("blockers"),
+                    get("depends_on"),
+                    get("scope"),
+                    get("priority"),
+                    upsert.key,
+                ],
+            )?;
+            Ok(true)
+        }
+        _ => Ok(false),
     }
 }
 
@@ -4476,6 +4725,28 @@ pub fn revert_candidate_approval(
         )));
     };
 
+    // Did approval OVERWRITE a pre-existing keyed record? If so, undo must
+    // restore its prior contents (context/state) or refuse (entity) — deleting
+    // the record would destroy data the candidate never owned.
+    let restore_snapshot: Option<ApprovalRestoreSnapshot> = connection
+        .query_row(
+            "SELECT approval_restore FROM extraction_candidates WHERE id = ?1",
+            [&options.id],
+            |row| row.get::<_, Option<String>>(0),
+        )?
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let prior_upsert = restore_snapshot.and_then(|snapshot| snapshot.prior_upsert);
+    if let Some(upsert) = &prior_upsert {
+        if upsert.record_type == "entity" {
+            return Err(GrafikiError::InvalidCandidate(format!(
+                "candidate {} approved into an entity that already existed before approval — \
+                 undo can't cleanly separate the merge; retire the specific fact from Browse \
+                 instead",
+                options.id
+            )));
+        }
+    }
+
     // Entities are upserted by (name, scope) across approvals (`save_entity`),
     // so a DIFFERENT, already-approved candidate's observation/relation can
     // point at this SAME entity row. Deleting it would cascade away someone
@@ -4540,12 +4811,29 @@ pub fn revert_candidate_approval(
         params![&options.id],
     )?;
     restore_candidate_supersession(&tx, &options.id, &trusted_record_type, &trusted_record_id)?;
+    // If approval overwrote a pre-existing context/state record, restore its
+    // prior contents in the same transaction and SKIP the delete below — the
+    // record must survive undo with the data it held before approval.
+    let restored_prior = restore_prior_upsert(&tx, prior_upsert.as_ref(), &trusted_record_id)?;
     tx.execute(
         "UPDATE extraction_candidates SET approval_restore = NULL WHERE id = ?1",
         [&options.id],
     )?;
     tx.commit()?;
     drop(connection);
+
+    if restored_prior {
+        let (_project, connection) = resolve_and_open(
+            options.project_name,
+            options.start_dir,
+            options.grafiki_home,
+        )?;
+        let candidate = load_extraction_candidate(&connection, &options.id)?;
+        return Ok(CandidateMutationReport {
+            candidate,
+            message: "Approval undone — the record's previous contents were restored.".to_owned(),
+        });
+    }
 
     // Best-effort delete of the underlying trusted record. The candidate is
     // ALREADY correctly reverted above regardless of what happens here — an
@@ -6297,15 +6585,7 @@ pub fn add_context(options: AddContextOptions) -> Result<ContextReport> {
             retired_at = NULL,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
         ",
-        params![
-            id,
-            key,
-            title,
-            content,
-            category,
-            scope.as_str(),
-            checksum
-        ],
+        params![id, key, title, content, category, scope.as_str(), checksum],
     )?;
     enqueue_embedding_job(
         &tx,
@@ -7469,6 +7749,14 @@ fn insert_candidate_evidence(
     candidate_id: &str,
     evidence: &[EvidenceInput],
 ) -> Result<()> {
+    // Redact the free-text evidence fields too. The candidate payload is
+    // redacted at the trust boundary, but evidence excerpt/title/source/uri are
+    // raw provenance lifted straight from captured output — a secret in the
+    // source line (reproducible via the HTTP propose API) would otherwise
+    // persist in the clear alongside a redacted payload.
+    let redact_opt = |value: &Option<String>| -> Option<String> {
+        value.as_ref().map(|text| redact_text(text).0)
+    };
     for item in evidence {
         let source_type = validate_evidence_source_type(&item.source_type)?;
         connection.execute(
@@ -7483,10 +7771,10 @@ fn insert_candidate_evidence(
                 candidate_id,
                 item.source_event_id,
                 source_type,
-                item.source,
-                item.title,
-                compact_excerpt(&item.excerpt, 800),
-                item.uri,
+                redact_opt(&item.source),
+                redact_opt(&item.title),
+                redact_text(&compact_excerpt(&item.excerpt, 800)).0,
+                redact_opt(&item.uri),
                 item.byte_start,
                 item.byte_end,
                 item.line_start,
@@ -9200,7 +9488,7 @@ fn load_embeddable_records(
         "
         SELECT id, scope, title || ' ' || coalesce(reasoning, '')
         FROM decisions
-        WHERE status != 'revoked' AND scope IN ({scopes})
+        WHERE status NOT IN ('revoked', 'superseded') AND scope IN ({scopes})
         ORDER BY created_at ASC, id ASC
         ",
         scope_chain,
@@ -10469,7 +10757,7 @@ fn load_search_result(
                 "
                 SELECT id, title, coalesce(reasoning, ''), scope
                 FROM decisions
-                WHERE id = ?1 AND status != 'revoked'
+                WHERE id = ?1 AND status NOT IN ('revoked', 'superseded')
                 ",
                 [record_id],
                 |row| {
@@ -10597,7 +10885,8 @@ fn search_decisions(
         SELECT d.id, d.title, coalesce(d.reasoning, ''), d.scope
         FROM decisions_fts f
         JOIN decisions d ON d.rowid = f.rowid
-        WHERE decisions_fts MATCH ? AND d.status != 'revoked' AND d.scope IN ({scopes})
+        WHERE decisions_fts MATCH ?
+          AND d.status NOT IN ('revoked', 'superseded') AND d.scope IN ({scopes})
         ORDER BY rank
         LIMIT ?
         ",
@@ -10774,7 +11063,8 @@ fn count_scoped_observations(connection: &Connection, scope_chain: &[String]) ->
 fn count_scoped_decisions(connection: &Connection, scope_chain: &[String]) -> Result<i64> {
     query_scoped_count(
         connection,
-        "SELECT COUNT(*) FROM decisions WHERE status != 'revoked' AND scope IN ({scopes})",
+        "SELECT COUNT(*) FROM decisions
+         WHERE status NOT IN ('revoked', 'superseded') AND scope IN ({scopes})",
         scope_chain,
     )
 }
@@ -11188,7 +11478,7 @@ fn status_recent_decisions(connection: &Connection, scope_chain: &[String]) -> R
         "
         SELECT id, title, status, scope
         FROM decisions
-        WHERE status != 'revoked' AND scope IN ({scopes})
+        WHERE status NOT IN ('revoked', 'superseded') AND scope IN ({scopes})
         ORDER BY created_at DESC
         LIMIT 10
         ",
@@ -11325,32 +11615,32 @@ mod tests {
 
     use super::{
         add_context, approve_candidate, ask_memory, bulk_review_candidates, capture_ledger, chat,
-        delete_context, delete_decision, delete_entity, delete_observation,
+        chat_with_provider, delete_context, delete_decision, delete_entity, delete_observation,
         delete_relation, delete_state, edit_candidate, end_session, export_memory,
-        extract_capture_memory, redact_sensitive_text, MAX_BODY_CHARS, MAX_TITLE_CHARS,
-        TRUNCATION_MARK,
-        generate_report, get_context, get_embedding_status, get_graph, get_status, handoff_session,
-        hybrid_search_results, import_memory, ingest_capture_event, list_candidates,
-        list_capture_events, list_context, list_decisions, list_entities, list_events,
-        list_observations, list_relations, list_sessions, list_state, log_decision,
-        pending_embedding_count, process_embedding_jobs, propose_candidate, reject_candidate,
-        reopen_candidate, resolve_and_open, revert_candidate_approval, run_capture_watch,
-        save_entity, search_memory, start_capture_session, update_context, update_decision,
-        update_entity, update_observation, update_relation, update_session, upsert_state,
-        AddContextOptions, ApproveCandidateOptions, AskMemoryOptions, BulkCandidateReviewOptions,
-        CandidateOrder, CaptureLedgerOptions, ChatOptions, ContextListOptions, DecisionListOptions,
-        DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions, DeleteObservationOptions,
-        DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions, EmbeddingStatusOptions,
-        EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions, ExtractCaptureOptions,
-        ExtractionCandidate, GetContextOptions, GraphOptions, HandoffOptions, ImportOptions,
-        IngestCaptureEventOptions, ListCandidatesOptions, ListCaptureEventsOptions,
-        LogDecisionOptions, ObservationListOptions, ProcessEmbeddingsOptions, ProjectReportOptions,
+        extract_capture_memory, generate_report, get_context, get_embedding_status, get_graph,
+        get_status, handoff_session, hybrid_search_results, import_memory, ingest_capture_event,
+        list_candidates, list_capture_events, list_context, list_decisions, list_entities,
+        list_events, list_observations, list_relations, list_sessions, list_state, log_decision,
+        pending_embedding_count, process_embedding_jobs, propose_candidate, redact_sensitive_text,
+        reject_candidate, reopen_candidate, resolve_and_open, revert_candidate_approval,
+        run_capture_watch, save_entity, search_memory, start_capture_session, update_context,
+        update_decision, update_entity, update_observation, update_relation, update_session,
+        upsert_state, AddContextOptions, ApproveCandidateOptions, AskMemoryOptions,
+        BulkCandidateReviewOptions, CandidateOrder, CaptureLedgerOptions, ChatOptions,
+        ContextListOptions, DecisionListOptions, DeleteContextOptions, DeleteDecisionOptions,
+        DeleteEntityOptions, DeleteObservationOptions, DeleteRelationOptions, DeleteStateOptions,
+        EditCandidateOptions, EmbeddingStatusOptions, EndSessionOptions, EventListOptions,
+        EvidenceInput, ExportOptions, ExtractCaptureOptions, ExtractionCandidate,
+        GetContextOptions, GraphOptions, HandoffOptions, ImportOptions, IngestCaptureEventOptions,
+        ListCandidatesOptions, ListCaptureEventsOptions, LogDecisionOptions,
+        ObservationListOptions, ProcessEmbeddingsOptions, ProjectReportOptions,
         ProposeCandidateOptions, RejectCandidateOptions, RelationListOptions,
         ReopenCandidateOptions, RevertApprovalOptions, RunCaptureWatchOptions, SaveEntityOptions,
         SearchMemoryOptions, SearchMode, SearchReport, SearchResult, SessionLogOptions,
         StartCaptureOptions, StateListOptions, StatusOptions, UpdateContextOptions,
         UpdateDecisionOptions, UpdateEntityOptions, UpdateObservationOptions,
-        UpdateRelationOptions, UpdateSessionOptions, UpsertStateOptions,
+        UpdateRelationOptions, UpdateSessionOptions, UpsertStateOptions, MAX_BODY_CHARS,
+        MAX_TITLE_CHARS, TRUNCATION_MARK,
     };
 
     fn setup_project() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -12727,6 +13017,156 @@ mod tests {
     }
 
     #[test]
+    fn chat_rejects_fabricated_citations_and_attaches_only_cited() {
+        use crate::chat::{ChatProvider, GroundedMemory};
+
+        let (_temp, home, project_dir) = setup_project();
+        let scope = "example-project/core";
+        for (name, obs) in [
+            ("Deploy Target", "We deploy to GCP europe-west1"),
+            ("CI Runner", "CI runs on self-hosted linux workers"),
+        ] {
+            save_entity(SaveEntityOptions {
+                project_name: None,
+                start_dir: project_dir.clone(),
+                grafiki_home: Some(home.clone()),
+                name: name.to_owned(),
+                entity_type: "service".to_owned(),
+                observe: Some(obs.to_owned()),
+                category: "architecture".to_owned(),
+                scope: scope.to_owned(),
+                relate: None,
+            })
+            .unwrap();
+        }
+
+        // A model that cites a source it was never given ([99]) = fabrication.
+        struct Fabricator;
+        impl ChatProvider for Fabricator {
+            fn generate(&self, _q: &str, _m: &[GroundedMemory]) -> crate::Result<String> {
+                Ok("We deploy to the moon [99].".to_owned())
+            }
+            fn judges_relevance(&self) -> bool {
+                true
+            }
+        }
+        let fabricated = chat_with_provider(
+            ChatOptions {
+                project_name: None,
+                start_dir: project_dir.clone(),
+                grafiki_home: Some(home.clone()),
+                question: "where do we deploy".to_owned(),
+                scope: scope.to_owned(),
+                limit: 8,
+                temporal_weight: 0.0,
+            },
+            &Fabricator,
+        )
+        .unwrap();
+        assert!(
+            !fabricated.used_memory && fabricated.citations.is_empty(),
+            "a fabricated [99] citation must be rejected, not presented as grounded"
+        );
+        assert_eq!(fabricated.answer, crate::chat::NO_MEMORY_ANSWER);
+
+        // A model that cites exactly [1] must get ONLY that one citation back,
+        // not every retrieved memory.
+        struct CitesFirst;
+        impl ChatProvider for CitesFirst {
+            fn generate(&self, _q: &str, _m: &[GroundedMemory]) -> crate::Result<String> {
+                Ok("We deploy to GCP europe-west1 [1].".to_owned())
+            }
+            fn judges_relevance(&self) -> bool {
+                true
+            }
+        }
+        let cited = chat_with_provider(
+            ChatOptions {
+                project_name: None,
+                start_dir: project_dir,
+                grafiki_home: Some(home),
+                question: "where do we deploy".to_owned(),
+                scope: scope.to_owned(),
+                limit: 8,
+                temporal_weight: 0.0,
+            },
+            &CitesFirst,
+        )
+        .unwrap();
+        assert!(cited.used_memory);
+        assert_eq!(
+            cited.citations.len(),
+            1,
+            "only the cited memory should be attached, not all retrieved ones"
+        );
+        assert_eq!(cited.citations[0].index, 1);
+    }
+
+    #[test]
+    fn superseded_decisions_are_excluded_from_retrieval() {
+        let (_temp, home, project_dir) = setup_project();
+        let scope = "example-project/core";
+        let first = log_decision(LogDecisionOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            title: "Use REST for the public API".to_owned(),
+            reasoning: Some("Simplest for early clients".to_owned()),
+            alternatives: vec![],
+            tags: vec![],
+            scope: scope.to_owned(),
+            supersedes: None,
+        })
+        .unwrap();
+        log_decision(LogDecisionOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            title: "Use gRPC for the public API".to_owned(),
+            reasoning: Some("Stronger typing across services".to_owned()),
+            alternatives: vec![],
+            tags: vec![],
+            scope: scope.to_owned(),
+            supersedes: Some(first.decision_id.clone()),
+        })
+        .unwrap();
+
+        // Keyword search for the shared subject must return the CURRENT decision
+        // only — not the obsolete superseded one alongside it.
+        let results = search_memory(SearchMemoryOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            query: "public API".to_owned(),
+            record_type: "decisions".to_owned(),
+            mode: SearchMode::Keyword,
+            scope: scope.to_owned(),
+            limit: 10,
+            temporal_weight: 0.0,
+        })
+        .unwrap();
+        assert!(
+            results.results.iter().all(|r| r.id != first.decision_id),
+            "the superseded decision must not appear in search results"
+        );
+        assert!(
+            results.results.iter().any(|r| r.title.contains("gRPC")),
+            "the current decision should still be found"
+        );
+
+        // The default decision list (no explicit status filter) also excludes it.
+        let listed = list_decisions(DecisionListOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            status: None,
+            scope: scope.to_owned(),
+        })
+        .unwrap();
+        assert!(listed.iter().all(|d| d.id != first.decision_id));
+    }
+
+    #[test]
     fn extract_capture_memory_proposes_reviewable_candidates() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -12836,11 +13276,13 @@ mod tests {
 
         // The same token WITHOUT a secret-naming word on the line survives —
         // build ids / artifact hashes are not secrets by default.
-        let mut benign = String::from(
-            "The deployment build is a3f9c2e81b7d4056e9c1f80a2b6d4e37 for staging.",
-        );
+        let mut benign =
+            String::from("The deployment build is a3f9c2e81b7d4056e9c1f80a2b6d4e37 for staging.");
         redact_sensitive_text(&mut benign);
-        assert!(benign.contains("a3f9c2e81b7d4056e9c1f80a2b6d4e37"), "{benign}");
+        assert!(
+            benign.contains("a3f9c2e81b7d4056e9c1f80a2b6d4e37"),
+            "{benign}"
+        );
 
         // Long pure-alphabetic words on a key-naming line survive (no digits).
         let mut prose = String::from(
@@ -12869,8 +13311,7 @@ mod tests {
         })
         .unwrap();
 
-        let (_project, connection) =
-            resolve_and_open(None, project_dir, Some(home)).unwrap();
+        let (_project, connection) = resolve_and_open(None, project_dir, Some(home)).unwrap();
         let (title, reasoning): (String, String) = connection
             .query_row(
                 "SELECT title, reasoning FROM decisions WHERE id = ?1",
@@ -13292,6 +13733,123 @@ mod tests {
         assert!(observations
             .iter()
             .any(|o| o.entity_id == entity_id && o.entity_name == "SharedThing"));
+    }
+
+    #[test]
+    fn undo_restores_a_context_record_that_approval_overwrote() {
+        let (_temp, home, project_dir) = setup_project();
+        // A trusted context record already exists (the user wrote it directly).
+        add_context(AddContextOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            key: "deploy-runbook".to_owned(),
+            title: "Deploy Runbook".to_owned(),
+            content: "ORIGINAL: run ./deploy.sh from main".to_owned(),
+            category: "runbook".to_owned(),
+            scope: String::new(),
+        })
+        .unwrap();
+
+        // A candidate approval collides on the same key and overwrites it.
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:llm".to_owned(),
+            source: None,
+            record_type: "context".to_owned(),
+            payload: serde_json::json!({
+                "key": "deploy-runbook",
+                "title": "Deploy Runbook",
+                "category": "runbook",
+                "content": "OVERWRITTEN: run make deploy",
+            }),
+            scope: String::new(),
+            confidence: 0.6,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+        approve_candidate(ApproveCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: proposed.candidate.id.clone(),
+        })
+        .unwrap();
+
+        // Undo must bring back the ORIGINAL contents, not delete the record.
+        revert_candidate_approval(RevertApprovalOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: proposed.candidate.id,
+        })
+        .unwrap();
+        let restored = get_context(GetContextOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            key: "deploy-runbook".to_owned(),
+        })
+        .unwrap();
+        assert!(
+            restored.content.contains("ORIGINAL"),
+            "undo must restore the overwritten record's prior contents, got: {}",
+            restored.content
+        );
+    }
+
+    #[test]
+    fn candidate_evidence_free_text_is_redacted() {
+        let (_temp, home, project_dir) = setup_project();
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:llm".to_owned(),
+            source: None,
+            record_type: "decision".to_owned(),
+            payload: serde_json::json!({ "title": "Wire up webhook", "reasoning": "ship it" }),
+            scope: String::new(),
+            confidence: 0.6,
+            rationale: None,
+            evidence: vec![EvidenceInput {
+                source_event_id: None,
+                source_type: "terminal".to_owned(),
+                source: Some("export API_TOKEN=supersecretvalue123".to_owned()),
+                title: Some("API_SECRET=anothersecretvalue456".to_owned()),
+                excerpt: "$ export SESSION_PASSWORD=thirdsecretvalue789 && curl ...".to_owned(),
+                uri: None,
+                byte_start: None,
+                byte_end: None,
+                line_start: None,
+                line_end: None,
+                captured_at: None,
+            }],
+        })
+        .unwrap();
+        let candidate = list_candidates(ListCandidatesOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            status: Some("pending".to_owned()),
+            scope: String::new(),
+            limit: 10,
+            order: CandidateOrder::Recent,
+        })
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == proposed.candidate.id)
+        .unwrap();
+        let evidence_blob = format!("{:?}", candidate.evidence);
+        assert!(
+            !evidence_blob.contains("supersecretvalue123")
+                && !evidence_blob.contains("anothersecretvalue456")
+                && !evidence_blob.contains("thirdsecretvalue789"),
+            "evidence source/title/excerpt must all be redacted, got: {evidence_blob}"
+        );
     }
 
     #[test]

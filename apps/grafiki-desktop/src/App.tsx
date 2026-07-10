@@ -145,6 +145,14 @@ function paneSubtitle(kind: PaneKind): string {
   }
 }
 
+// Shown before any one-click "turn on capture" action outside onboarding, so
+// enabling full terminal-output capture always carries the same disclosure the
+// onboarding consent checkbox does.
+const CAPTURE_ENABLE_DISCLOSURE =
+  "Turn on terminal capture for this folder?\n\nGrafiki will store this workspace's terminal " +
+  "output as local, redacted capture events so it can become reviewable memory. Nothing leaves " +
+  "this Mac, and you can turn it off anytime in Settings → Capture & privacy.";
+
 // Pane titles render as the page heading; an unbounded one (a 2,000-char ask)
 // collapsed the chat scroller to 0px. The full text still flows as `query`.
 function clampTitle(text: string, max = 90): string {
@@ -289,6 +297,18 @@ export default function App() {
   const [recordDetailLoading, setRecordDetailLoading] = useState(false);
   const [detailRevision, setDetailRevision] = useState(0);
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  // At ≤1100px (the app's normal/min width) the Inspector renders as a fixed
+  // overlay ON TOP of the workspace — so the covered controls must not stay
+  // keyboard-focusable behind it. Track the breakpoint to make the workspace
+  // `inert` while the overlay is open.
+  const [inspectorIsOverlay, setInspectorIsOverlay] = useState(false);
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 1100px)");
+    const sync = () => setInspectorIsOverlay(media.matches);
+    sync();
+    media.addEventListener("change", sync);
+    return () => media.removeEventListener("change", sync);
+  }, []);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [onboarding, setOnboarding] = useState(
     () => !localStorage.getItem("grafiki.onboarded") && !localStorage.getItem(PROJECT_ROOT_KEY),
@@ -607,7 +627,7 @@ export default function App() {
         reduceMotion={reduceMotion}
       />
 
-      <main className="workspace">
+      <main className="workspace" inert={inspectorOpen && inspectorIsOverlay ? true : undefined}>
         <TopStatus
           snapshot={snapshot}
           inspectorOpen={inspectorOpen}
@@ -1482,6 +1502,10 @@ function HomePane(props: {
   }, [props.projectRoot, props.snapshot?.memory_available, pipelineCheck]);
 
   const enableCaptureNow = () => {
+    // Re-disclose before enabling full-output capture — the same consent the
+    // onboarding checkbox obtains. A one-click "Turn on capture" that silently
+    // starts storing terminal output would bypass the initial disclosure.
+    if (!window.confirm(CAPTURE_ENABLE_DISCLOSURE)) return;
     setPipelineFixBusy(true);
     updateCaptureConfig({ startDir: props.projectRoot, terminal: true, terminalOutput: "full" })
       .then(() => {
@@ -2772,6 +2796,9 @@ function ChatPane(props: {
   >("chat");
   const [decisions, setDecisions] = useState<DecisionItem[] | null>(null);
   const [contexts, setContexts] = useState<ContextSummary[] | null>(null);
+  // A backend failure is NOT an empty list — "no decisions yet" told the user
+  // their memory was empty when the query actually errored.
+  const [browseError, setBrowseError] = useState<string | null>(null);
   const [activity, setActivity] = useState<AgentQueryLogItem[] | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchMode, setSearchMode] = useState<SearchMode>("keyword");
@@ -2790,22 +2817,24 @@ function ChatPane(props: {
     let cancelled = false;
     if (memTab === "decisions") {
       setDecisions(null);
+      setBrowseError(null);
       listProjectDecisions({ startDir: props.projectRoot, scope })
         .then((items) => {
           if (!cancelled) setDecisions(items);
         })
-        .catch(() => {
-          if (!cancelled) setDecisions([]);
+        .catch((loadError) => {
+          if (!cancelled) setBrowseError(String(loadError));
         });
     }
     if (memTab === "context") {
       setContexts(null);
+      setBrowseError(null);
       listProjectContext({ startDir: props.projectRoot, scope })
         .then((items) => {
           if (!cancelled) setContexts(items);
         })
-        .catch(() => {
-          if (!cancelled) setContexts([]);
+        .catch((loadError) => {
+          if (!cancelled) setBrowseError(String(loadError));
         });
     }
     if (memTab === "activity") {
@@ -3125,7 +3154,12 @@ function ChatPane(props: {
       ) : null}
       {memTab === "decisions" ? (
         <div className="mem-tab-panel">
-          {decisions === null ? (
+          {browseError ? (
+            <div className="mem-empty" role="alert">
+              <h3>Couldn't load decisions</h3>
+              <p>{browseError}</p>
+            </div>
+          ) : decisions === null ? (
             <p className="muted">Loading…</p>
           ) : decisions.length === 0 ? (
             <div className="mem-empty">
@@ -3169,7 +3203,12 @@ function ChatPane(props: {
       ) : null}
       {memTab === "context" ? (
         <div className="mem-tab-panel">
-          {contexts === null ? (
+          {browseError ? (
+            <div className="mem-empty" role="alert">
+              <h3>Couldn't load context</h3>
+              <p>{browseError}</p>
+            </div>
+          ) : contexts === null ? (
             <p className="muted">Loading…</p>
           ) : contexts.length === 0 ? (
             <div className="mem-empty">
@@ -3547,16 +3586,26 @@ function CandidatesPane(props: {
     setBusyId(candidate.id);
     setMessage(null);
     setError(null);
+    let result;
     try {
-      const result = await approveCandidate({ startDir: props.startDir, id: candidate.id });
-      setMessage(`Approved “${candidateTitle(candidate)}” — now briefs your agent.`);
-      armUndo([candidate.id], candidateTitle(candidate));
-      const trustedResult = candidateToSearchResult(result.candidate);
-      if (trustedResult) props.onSelectResult(trustedResult);
-      await load();
-      await props.onMemoryChanged();
+      // The MUTATION is the operation whose success/failure we report. It
+      // committed or it didn't — a later list-refresh error must not overwrite
+      // the success message and tell the user the approval "failed".
+      result = await approveCandidate({ startDir: props.startDir, id: candidate.id });
     } catch (approveError) {
       setError(String(approveError));
+      setBusyId(null);
+      return;
+    }
+    setMessage(`Approved “${candidateTitle(candidate)}” — now briefs your agent.`);
+    armUndo([candidate.id], candidateTitle(candidate));
+    const trustedResult = candidateToSearchResult(result.candidate);
+    if (trustedResult) props.onSelectResult(trustedResult);
+    try {
+      await load();
+      await props.onMemoryChanged();
+    } catch (refreshError) {
+      notifyBackground(`Approved, but the view couldn't refresh: ${String(refreshError)}`);
     } finally {
       setBusyId(null);
     }
@@ -3591,13 +3640,21 @@ function CandidatesPane(props: {
     setBusyId(candidate.id);
     setMessage(null);
     setError(null);
+    let result;
     try {
-      const result = await rejectCandidate({ startDir: props.startDir, id: candidate.id, rationale });
-      setMessage(result.message);
-      await load();
-      await props.onMemoryChanged();
+      result = await rejectCandidate({ startDir: props.startDir, id: candidate.id, rationale });
     } catch (rejectError) {
       setError(String(rejectError));
+      setBusyId(null);
+      return;
+    }
+    // Mutation succeeded — a refresh failure is non-fatal, not a reject failure.
+    setMessage(result.message);
+    try {
+      await load();
+      await props.onMemoryChanged();
+    } catch (refreshError) {
+      notifyBackground(`Rejected, but the view couldn't refresh: ${String(refreshError)}`);
     } finally {
       setBusyId(null);
     }
@@ -3624,20 +3681,40 @@ function CandidatesPane(props: {
   async function performUndo() {
     if (!undo) return;
     window.clearTimeout(undoTimerRef.current);
-    const ids = undo.ids;
-    setUndo(null);
+    const { ids, label } = undo;
     setBusyId("bulk");
     setMessage(null);
     setError(null);
-    try {
-      for (const id of ids) {
+    // Undo each independently and track what didn't revert. A mid-loop failure
+    // used to leave the rest un-undone AND had already cleared the Undo button,
+    // stranding the user with a half-applied bulk approve and no recovery.
+    const failed: string[] = [];
+    let lastError: unknown = null;
+    for (const id of ids) {
+      try {
         await revertCandidateApproval({ startDir: props.startDir, id });
+      } catch (undoError) {
+        failed.push(id);
+        lastError = undoError;
       }
-      setMessage(ids.length === 1 ? "Approval undone." : `${ids.length} approvals undone.`);
+    }
+    const undone = ids.length - failed.length;
+    if (failed.length === 0) {
+      setUndo(null);
+      setMessage(undone === 1 ? "Approval undone." : `${undone} approvals undone.`);
+    } else {
+      // Keep the still-approved ones armed so the recovery action survives.
+      setUndo({ ids: failed, label });
+      undoTimerRef.current = window.setTimeout(() => setUndo(null), 10_000);
+      setError(
+        `Undid ${undone} of ${ids.length}; ${failed.length} could not be undone (${String(lastError)}). Try Undo again.`,
+      );
+    }
+    try {
       await load();
       await props.onMemoryChanged();
-    } catch (undoError) {
-      setError(String(undoError));
+    } catch (refreshError) {
+      notifyBackground(`Undo finished, but the view couldn't refresh: ${String(refreshError)}`);
     } finally {
       setBusyId(null);
     }
@@ -4286,13 +4363,25 @@ function SettingsPane(props: {
     setDraftRoot(props.projectRoot || snapshot?.start_dir || "");
   }, [props.projectRoot, snapshot?.start_dir]);
 
+  // Monotonic guard: a slow getCaptureConfig/getDaemonStatus for project A must
+  // not write A's privacy settings (or token) into project B's Settings after a
+  // switch. Each refresh captures the current id and applies only if still current.
+  const settingsRequestRef = useRef(0);
   useEffect(() => {
+    const request = ++settingsRequestRef.current;
+    // A per-project daemon token must NOT carry into the next project — reusing
+    // project A's bearer token to start project B's daemon is a cross-workspace
+    // credential leak. Reset the daemon fields on every switch.
+    setDaemonToken("");
+    setDaemonStatus(null);
+    setDaemonHost("127.0.0.1");
+    setDaemonPort(9700);
     // Pass the fresh root explicitly: this effect runs in the same commit as
     // the setDraftRoot above, so the functions' closures still hold the OLD
     // project's draftRoot and would show the previous project's config.
     const freshDir = props.projectRoot || snapshot?.start_dir || "";
-    refreshDaemonStatus(freshDir);
-    refreshCaptureConfig(freshDir);
+    refreshDaemonStatus(freshDir, { request });
+    refreshCaptureConfig(freshDir, request);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.projectRoot, snapshot?.project?.project]);
 
@@ -4304,12 +4393,14 @@ function SettingsPane(props: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.projectRoot]);
 
-  async function refreshDaemonStatus(dir?: string, opts?: { silent?: boolean }) {
+  async function refreshDaemonStatus(dir?: string, opts?: { silent?: boolean; request?: number }) {
     if (!opts?.silent) setDaemonBusy("status");
     try {
       const next = await getDaemonStatus({
         startDir: dir ?? (draftRoot || props.projectRoot || snapshot?.start_dir || ""),
       });
+      // Drop a response that arrived after the project changed under it.
+      if (opts?.request !== undefined && opts.request !== settingsRequestRef.current) return;
       setDaemonStatus(next);
       if (next.host) setDaemonHost(next.host);
       if (next.port) setDaemonPort(next.port);
@@ -4320,12 +4411,14 @@ function SettingsPane(props: {
     }
   }
 
-  async function refreshCaptureConfig(dir?: string) {
+  async function refreshCaptureConfig(dir?: string, request?: number) {
     const startDir = dir ?? (draftRoot || props.projectRoot || snapshot?.start_dir || "");
     if (!startDir.trim()) return;
     setCaptureConfigBusy(true);
     try {
       const next = await getCaptureConfig({ startDir });
+      // Drop a stale project's config so it can't overwrite the current one.
+      if (request !== undefined && request !== settingsRequestRef.current) return;
       setCaptureConfig(next);
     } catch (configError) {
       setError(String(configError));

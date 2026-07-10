@@ -45,13 +45,22 @@ Grafiki answers with trusted project memory and evidence links back to capture e
 
 See [docs/INSTALL.md](docs/INSTALL.md) for the full guide. The short version:
 
+**From source (works today):**
+
 ```bash
-brew tap <owner>/grafiki
+git clone https://github.com/Vishal2602/Grafiki && cd Grafiki
+cargo build --release -p grafiki-cli --features fastembed,sqlite-vec
+```
+
+**Homebrew (not yet available — no tap or signed release is published yet):**
+
+```bash
+brew tap Vishal2602/grafiki
 brew install grafiki            # the `grafiki` CLI + MCP server
 brew install --cask grafiki     # optional desktop app (macOS)
 ```
 
-Released binaries include real semantic search (`fastembed` + `sqlite-vec`).
+Released binaries (once published) include real semantic search (`fastembed` + `sqlite-vec`).
 
 ## Quickstart
 

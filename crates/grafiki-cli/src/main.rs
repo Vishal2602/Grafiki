@@ -6071,6 +6071,32 @@ fn daemon_start(
     };
     fs::write(&pid_path, serde_json::to_string_pretty(&record)?)?;
 
+    // Wait for the daemon to actually accept connections before reporting
+    // success — otherwise `daemon start` returns while the server is still
+    // binding, and an immediate follow-up request races a not-yet-ready socket.
+    let mut ready = false;
+    for _ in 0..25 {
+        if !pid_running(pid) {
+            return Err(format!(
+                "Daemon process {pid} exited during startup — see the log at {}.",
+                log_path.display()
+            )
+            .into());
+        }
+        if daemon_health_matches(&record) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !ready {
+        return Err(format!(
+            "Daemon process {pid} started but did not become healthy within 5s — see the log at {}.",
+            log_path.display()
+        )
+        .into());
+    }
+
     Ok(DaemonStartReport {
         project: context.project,
         running: true,

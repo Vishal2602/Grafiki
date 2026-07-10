@@ -28,45 +28,73 @@ location above — unset it (or point it at the same directory) to keep the mode
 
 ## CLI
 
-### Homebrew (recommended)
+### From source (recommended — the only path that works today)
 
 ```bash
-brew tap <owner>/grafiki
+git clone https://github.com/Vishal2602/Grafiki && cd Grafiki
+cargo install --path crates/grafiki-cli --features fastembed,sqlite-vec
+```
+
+### Homebrew (not yet available)
+
+No `homebrew-grafiki` tap has been published and no signed release binaries
+exist yet. Once a tap is published, installation will look like:
+
+```bash
+brew tap Vishal2602/grafiki
 brew install grafiki        # installs the `grafiki` binary
 ```
 
-### From a release tarball
+### From a release tarball (not yet available)
+
+No tagged GitHub release has been published yet, so there is no tarball to
+download. Once one exists:
 
 ```bash
 # pick your target: aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu
-curl -L https://github.com/<owner>/grafiki/releases/latest/download/grafiki-aarch64-apple-darwin.tar.gz | tar -xz
+curl -L https://github.com/Vishal2602/Grafiki/releases/latest/download/grafiki-aarch64-apple-darwin.tar.gz | tar -xz
 sudo mv grafiki /usr/local/bin/
 ```
 
 A standalone downloaded binary is quarantined by macOS; clear it with
 `xattr -d com.apple.quarantine ./grafiki` (Homebrew does this for you).
 
-### From source
-
-```bash
-cargo install --path crates/grafiki-cli --features fastembed,sqlite-vec
-```
-
 ## Desktop app (macOS)
 
-### Homebrew Cask (recommended)
+### Build from source (works today)
+
+No signed release or Homebrew cask is published yet. Build the app locally:
 
 ```bash
-brew tap <owner>/grafiki
+git clone https://github.com/Vishal2602/Grafiki && cd Grafiki
+cd apps/grafiki-desktop
+npm install
+npm run tauri:build:release
+```
+
+See [PRODUCTION_RELEASE.md](PRODUCTION_RELEASE.md) for the full build/signing
+notes, or [scripts/build_desktop_debug.sh](../scripts/build_desktop_debug.sh)
+for a repeatable debug build.
+
+### Homebrew Cask (not yet available)
+
+No `homebrew-grafiki` tap has been published and no signed DMG has been
+released. Once one exists:
+
+```bash
+brew tap Vishal2602/grafiki
 brew install --cask grafiki
 ```
 
 `brew install --cask` strips the quarantine flag, so the app opens cleanly even
 before Developer ID signing/notarization is configured.
 
-### Download the DMG
+### Download the DMG (not yet available)
 
-1. Grab `Grafiki_<version>_aarch64.dmg` from the [Releases](https://github.com/<owner>/grafiki/releases) page.
+No tagged GitHub release has been published yet, so there is no DMG to
+download. Once one exists:
+
+1. Grab `Grafiki_<version>_aarch64.dmg` from the [Releases](https://github.com/Vishal2602/Grafiki/releases) page.
 2. Open the DMG and drag **Grafiki** to Applications.
 3. **If macOS blocks it** ("Apple could not verify…"): open
    **System Settings → Privacy & Security**, scroll to the Grafiki notice, and
