@@ -1,0 +1,7 @@
+{"doc_id":"entity-auth-api","record_type":"entity","payload":{"name":"auth api gateway","entity_type":"service","category":"architecture"}}
+{"doc_id":"entity-auth-worker","record_type":"entity","payload":{"name":"auth background worker","entity_type":"service","category":"architecture"}}
+{"doc_id":"entity-auth-cache","record_type":"entity","payload":{"name":"auth session cache","entity_type":"service","category":"architecture"}}
+{"doc_id":"entity-auth-admin","record_type":"entity","payload":{"name":"auth admin console","entity_type":"service","category":"architecture"}}
+{"doc_id":"entity-auth-proxy","record_type":"entity","payload":{"name":"auth edge proxy","entity_type":"service","category":"architecture"}}
+{"doc_id":"entity-auth-sdk","record_type":"entity","payload":{"name":"auth client sdk","entity_type":"library","category":"architecture"}}
+{"doc_id":"observation-auth-rotation","record_type":"observation","payload":{"name":"credential runbook","entity_type":"concept","category":"gotcha","text":"auth rotate emergency credentials immediately"}}

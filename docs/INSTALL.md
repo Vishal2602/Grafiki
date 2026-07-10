@@ -81,7 +81,9 @@ After `grafiki init`, point your MCP client at:
 grafiki mcp --project <name> --path /path/to/repo
 ```
 
-`grafiki init` prints the exact command for your project.
+`grafiki init` prints the exact read-only command for your project. Add
+`--allow-write` only when a trusted client intentionally needs to save, approve,
+update, or retire memory.
 
 ## Linux / Windows
 

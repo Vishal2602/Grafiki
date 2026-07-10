@@ -11,13 +11,15 @@
 //! `terminal_close` (or child exit) ends a session.
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use grafiki_core::{
-    ingest_capture_event, load_capture_config, start_capture_session, stop_capture_session,
-    CaptureConfigOptions, IngestCaptureEventOptions, StartCaptureOptions, StopCaptureOptions,
+    ingest_capture_event, load_capture_config, read_live_transcript, redact_text,
+    start_capture_session, stop_capture_session, CaptureConfigOptions, IngestCaptureEventOptions,
+    LiveTranscriptTurn, StartCaptureOptions, StopCaptureOptions,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tauri::ipc::Channel;
@@ -29,6 +31,10 @@ const SCROLLBACK_MAX: usize = 512 * 1024;
 const CAPTURE_FLUSH_THRESHOLD: usize = 64 * 1024;
 /// How much (ANSI-stripped) tail is persisted to disk for cross-relaunch resume.
 const RESUME_TAIL_MAX: usize = 32 * 1024;
+/// Machine-readable exit signal sent through the output channel when the child
+/// dies — an OSC sequence xterm renders as nothing, matched verbatim by the UI
+/// (App.tsx) to flip the session header to "ended" in real time.
+pub const GRAFIKI_EXIT_SENTINEL: &str = "\x1b]7777;grafiki-session-exited\x07";
 /// App-level file (under the Grafiki home dir) holding resumable session
 /// descriptors — the terminal's equivalent of an editor's session store.
 const DESCRIPTOR_FILE: &str = "terminal_sessions.json";
@@ -41,6 +47,12 @@ struct SessionDescriptor {
     cwd: String,
     /// The agent command originally launched ("" = plain shell).
     launch: String,
+    /// Capture session that owns memories produced by this terminal launch.
+    #[serde(default)]
+    capture_id: Option<String>,
+    /// Consent mode at the time this descriptor was written.
+    #[serde(default)]
+    capture_mode: String,
     /// ANSI-stripped tail of the session output, replayed on revive.
     #[serde(default)]
     tail: String,
@@ -90,9 +102,79 @@ fn store_descriptor(id: &str, descriptor: Option<SessionDescriptor>) {
     }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
     if let Ok(json) = serde_json::to_string_pretty(&all) {
-        let _ = std::fs::write(&path, json);
+        #[cfg(unix)]
+        let result = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+                .and_then(|mut file| file.write_all(json.as_bytes()))
+        };
+        #[cfg(not(unix))]
+        let result = std::fs::write(&path, json);
+        let _ = result;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureMode {
+    Off,
+    Digest,
+    Full,
+}
+
+impl CaptureMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Digest => "digest",
+            Self::Full => "full",
+        }
+    }
+
+    fn allows_resume_tail(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+#[derive(Debug, Default)]
+struct DigestBuffer {
+    observed_bytes: usize,
+    observed_lines: usize,
+}
+
+impl DigestBuffer {
+    fn push(&mut self, bytes: &[u8]) {
+        self.observed_bytes = self.observed_bytes.saturating_add(bytes.len());
+        self.observed_lines = self
+            .observed_lines
+            .saturating_add(bytes.iter().filter(|byte| **byte == b'\n').count());
+    }
+
+    fn take(&mut self) -> Option<String> {
+        if self.observed_bytes == 0 {
+            return None;
+        }
+        let observed = std::mem::take(&mut self.observed_bytes);
+        let lines = std::mem::take(&mut self.observed_lines);
+        Some(format!(
+            "Terminal digest: {observed} output bytes across approximately {lines} lines were observed. No terminal output sample or full output was retained in digest mode."
+        ))
     }
 }
 
@@ -115,6 +197,8 @@ pub struct LiveTerminalInfo {
     /// the Home live card so the off state isn't a bare, unexplained label
     /// (2026-07-04 don-norman-design-critic finding).
     pub capture_hint: Option<String>,
+    pub capture_id: Option<String>,
+    pub capture_mode: String,
 }
 
 /// Snapshot every live session (for Home's live-session card).
@@ -127,21 +211,27 @@ pub fn live_sessions(registry: &TerminalRegistry) -> Vec<LiveTerminalInfo> {
             if state.exited {
                 return None;
             }
-            let scrollback = &state.scrollback;
-            let start = scrollback.len().saturating_sub(600);
-            let text = strip_ansi(&scrollback[start..]);
-            let mut lines: Vec<&str> = text
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .collect();
-            let keep = lines.split_off(lines.len().saturating_sub(3));
+            let tail = if session.capture_mode.allows_resume_tail() {
+                let scrollback = &state.scrollback;
+                let start = scrollback.len().saturating_sub(600);
+                let text = redact_text(&strip_ansi(&scrollback[start..])).0;
+                let mut lines: Vec<&str> = text
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .collect();
+                lines.split_off(lines.len().saturating_sub(3)).join("\n")
+            } else {
+                String::new()
+            };
             Some(LiveTerminalInfo {
                 id: id.clone(),
                 launch: session.launch.clone(),
                 cwd: session.project_root.clone(),
-                tail: keep.join("\n"),
+                tail,
                 capturing: session.capture_id.is_some(),
                 capture_hint: session.capture_hint.clone(),
+                capture_id: session.capture_id.clone(),
+                capture_mode: session.capture_mode.as_str().to_owned(),
             })
         })
         .collect()
@@ -155,6 +245,8 @@ pub struct ResumableInfo {
     pub launch: String,
     pub cwd: String,
     pub updated_at: u64,
+    pub capture_id: Option<String>,
+    pub capture_mode: String,
 }
 
 pub fn latest_resumable() -> Option<ResumableInfo> {
@@ -168,16 +260,28 @@ pub fn latest_resumable() -> Option<ResumableInfo> {
             launch: descriptor.launch,
             cwd: descriptor.cwd,
             updated_at: descriptor.updated_at,
+            capture_id: descriptor.capture_id,
+            capture_mode: descriptor.capture_mode,
         })
 }
 
 /// Refresh a session's persisted tail from its current scrollback.
-fn persist_tail(id: &str, cwd: &str, launch: &str, shared: &Arc<Mutex<TermShared>>) {
-    let tail = {
+fn persist_tail(
+    id: &str,
+    cwd: &str,
+    launch: &str,
+    capture_id: &Option<String>,
+    capture_mode: CaptureMode,
+    shared: &Arc<Mutex<TermShared>>,
+) {
+    let tail = if capture_mode.allows_resume_tail() {
         let state = shared.lock().unwrap();
         let scrollback = &state.scrollback;
         let start = scrollback.len().saturating_sub(RESUME_TAIL_MAX);
-        strip_ansi(&scrollback[start..])
+        let stripped = strip_ansi(&scrollback[start..]);
+        redact_text(&stripped).0
+    } else {
+        String::new()
     };
     store_descriptor(
         id,
@@ -185,6 +289,8 @@ fn persist_tail(id: &str, cwd: &str, launch: &str, shared: &Arc<Mutex<TermShared
             id: id.to_owned(),
             cwd: cwd.to_owned(),
             launch: launch.to_owned(),
+            capture_id: capture_id.clone(),
+            capture_mode: capture_mode.as_str().to_owned(),
             tail,
             updated_at: unix_now(),
         }),
@@ -198,6 +304,7 @@ struct TermShared {
     scrollback: Vec<u8>,
     channel: Option<Channel<Vec<u8>>>,
     capture: Vec<u8>,
+    digest: DigestBuffer,
     exited: bool,
 }
 
@@ -218,11 +325,9 @@ impl TermShared {
     }
 }
 
-/// Consent gate for hosted-terminal output capture (Settings → Capture Consent).
-/// `Ok(())` = the user consented (the `terminal` source is on AND `terminal_output`
-/// is not `"off"`); `Err(hint)` = capture must not run, with the user-facing reason.
+/// Consent gate and storage mode for hosted-terminal output capture.
 /// The default config ships `terminal_output: "off"`, so capture is opt-in.
-fn capture_consent(cwd: &str) -> Result<(), String> {
+fn capture_policy(cwd: &str) -> Result<CaptureMode, String> {
     match load_capture_config(CaptureConfigOptions {
         project_name: None,
         start_dir: PathBuf::from(cwd),
@@ -231,9 +336,19 @@ fn capture_consent(cwd: &str) -> Result<(), String> {
         Ok(report) if !report.config.sources.terminal || report.config.terminal_output == "off" => {
             Err("terminal capture is off in Settings".to_owned())
         }
-        Ok(_) => Ok(()),
+        Ok(report) if report.config.terminal_output == "digest" => Ok(CaptureMode::Digest),
+        Ok(_) => Ok(CaptureMode::Full),
         Err(_) => Err("initialize this folder in Settings".to_owned()),
     }
+}
+
+fn transcript_signature(turn: &LiveTranscriptTurn) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        turn.role,
+        turn.timestamp.as_deref().unwrap_or_default(),
+        turn.text
+    )
 }
 
 /// A live hosted terminal session.
@@ -253,15 +368,79 @@ struct TerminalSession {
     capture_id: Option<String>,
     /// User-facing reason capture is off (`None` while capturing).
     capture_hint: Option<String>,
+    capture_mode: CaptureMode,
     project_root: String,
     /// The agent command this session was started for ("" = plain shell).
     launch: String,
+    /// Last transcript turn that existed before this terminal launched. The chat
+    /// lens uses it as a boundary so an old project transcript never appears as
+    /// this session's conversation.
+    transcript_baseline: Option<String>,
     shared: Arc<Mutex<TermShared>>,
 }
 
 /// Tauri managed state: all live terminal sessions by id.
 #[derive(Default)]
 pub struct TerminalRegistry(Mutex<HashMap<String, TerminalSession>>);
+
+/// Return only transcript turns attributable to one hosted terminal. Claude's
+/// project transcript directory does not expose our terminal id, so we bind by
+/// the last turn that existed before launch. When two live Claude terminals use
+/// the same project the mapping is ambiguous; returning an explicit error is
+/// safer than showing one session's private conversation in another tab.
+pub fn session_live_transcript(
+    registry: &TerminalRegistry,
+    id: &str,
+    start_dir: &std::path::Path,
+) -> Result<Vec<LiveTranscriptTurn>, String> {
+    let (baseline, project_root) = {
+        let sessions = registry.0.lock().unwrap();
+        let Some(session) = sessions.get(id) else {
+            return Err("This terminal session is no longer running.".to_owned());
+        };
+        if !session.launch.trim().starts_with("claude") {
+            return Ok(Vec::new());
+        }
+        let same_project_claude = sessions
+            .values()
+            .filter(|candidate| {
+                !candidate.shared.lock().unwrap().exited
+                    && candidate.project_root == session.project_root
+                    && candidate.launch.trim().starts_with("claude")
+            })
+            .count();
+        if same_project_claude > 1 {
+            return Err(
+                "Chat view is disabled while multiple Claude sessions run in this project; use Terminal so conversations cannot be mixed."
+                    .to_owned(),
+            );
+        }
+        (
+            session.transcript_baseline.clone(),
+            session.project_root.clone(),
+        )
+    };
+
+    if std::path::Path::new(&project_root) != start_dir && !start_dir.as_os_str().is_empty() {
+        return Err("The requested transcript does not belong to this project.".to_owned());
+    }
+    let turns = read_live_transcript(&PathBuf::from(project_root), 500)
+        .map_err(|error| error.to_string())?;
+    let session_turns = if let Some(baseline) = baseline {
+        match turns
+            .iter()
+            .rposition(|turn| transcript_signature(turn) == baseline)
+        {
+            Some(index) => turns.into_iter().skip(index + 1).collect::<Vec<_>>(),
+            // A new transcript file replaced the pre-launch newest file.
+            None => turns,
+        }
+    } else {
+        turns
+    };
+    let keep_from = session_turns.len().saturating_sub(80);
+    Ok(session_turns.into_iter().skip(keep_from).collect())
+}
 
 /// What `terminal_attach` tells the UI about a session it asked for.
 #[derive(serde::Serialize)]
@@ -273,6 +452,8 @@ pub struct AttachReply {
     pub capturing: bool,
     /// User-facing reason capture is off (`None` while capturing).
     pub capture_hint: Option<String>,
+    pub capture_id: Option<String>,
+    pub capture_mode: String,
 }
 
 /// What `terminal_open` (and a revive's spawn) tells the UI.
@@ -284,6 +465,8 @@ pub struct OpenReply {
     pub capturing: bool,
     /// User-facing reason capture is off (`None` while capturing).
     pub capture_hint: Option<String>,
+    pub capture_id: Option<String>,
+    pub capture_mode: String,
 }
 
 /// What `terminal_revive` tells the UI about a disk-restored session.
@@ -294,6 +477,8 @@ pub struct ReviveReply {
     pub cwd: String,
     pub capturing: bool,
     pub capture_hint: Option<String>,
+    pub capture_id: Option<String>,
+    pub capture_mode: String,
 }
 
 fn pty_size(rows: u16, cols: u16) -> PtySize {
@@ -359,14 +544,19 @@ pub fn terminal_revive(
             cwd: String::new(),
             capturing: false,
             capture_hint: None,
+            capture_id: None,
+            capture_mode: CaptureMode::Off.as_str().to_owned(),
         });
     };
     let mut preamble = Vec::new();
-    if !descriptor.tail.trim().is_empty() {
+    let tail_replay_allowed = capture_policy(&descriptor.cwd).is_ok()
+        && matches!(descriptor.capture_mode.as_str(), "digest" | "full");
+    if tail_replay_allowed && !descriptor.tail.trim().is_empty() {
+        let redacted_tail = redact_text(&descriptor.tail).0;
         preamble.extend_from_slice(
             b"\x1b[2m\xe2\x94\x80\xe2\x94\x80 previous session \xe2\x94\x80\xe2\x94\x80\x1b[0m\r\n",
         );
-        preamble.extend_from_slice(descriptor.tail.replace('\n', "\r\n").as_bytes());
+        preamble.extend_from_slice(redacted_tail.replace('\n', "\r\n").as_bytes());
         preamble.extend_from_slice(b"\r\n\x1b[2m\xe2\x94\x80\xe2\x94\x80 end of previous session \xe2\x94\x80\xe2\x94\x80 resuming\x1b[0m\r\n");
     }
     let opened = spawn_session(
@@ -386,6 +576,8 @@ pub fn terminal_revive(
         cwd: descriptor.cwd,
         capturing: opened.capturing,
         capture_hint: opened.capture_hint,
+        capture_id: opened.capture_id,
+        capture_mode: opened.capture_mode,
     })
 }
 
@@ -413,6 +605,8 @@ fn spawn_session(
                     id,
                     capturing,
                     capture_hint,
+                    capture_id: existing.capture_id.clone(),
+                    capture_mode: existing.capture_mode.as_str().to_owned(),
                 });
             }
             // Exited leftover under this id: drop it and spawn fresh below.
@@ -467,22 +661,32 @@ fn spawn_session(
     // consent (Settings → Capture Consent; the default config says off). Skipped
     // when it isn't a Grafiki project. The terminal itself always works —
     // capture is additive, never blocking.
-    let (capture_id, capture_hint) = match capture_consent(&cwd) {
-        Ok(()) => (
-            start_capture_session(StartCaptureOptions {
-                project_name: None,
-                start_dir: PathBuf::from(&cwd),
-                grafiki_home: None,
-                scope: String::new(),
-                source_app: Some("grafiki-terminal".to_owned()),
-                consent_profile: None,
-                redaction_profile: None,
-            })
+    let (capture_id, capture_mode, capture_hint) = match capture_policy(&cwd) {
+        Ok(mode) => match start_capture_session(StartCaptureOptions {
+            project_name: None,
+            start_dir: PathBuf::from(&cwd),
+            grafiki_home: None,
+            scope: String::new(),
+            source_app: Some("grafiki-terminal".to_owned()),
+            consent_profile: None,
+            redaction_profile: None,
+        }) {
+            Ok(report) => (Some(report.capture.id), mode, None),
+            Err(_) => (
+                None,
+                CaptureMode::Off,
+                Some("capture could not start for this folder".to_owned()),
+            ),
+        },
+        Err(hint) => (None, CaptureMode::Off, Some(hint)),
+    };
+
+    let transcript_baseline = if launch.trim().starts_with("claude") {
+        read_live_transcript(&PathBuf::from(&cwd), 500)
             .ok()
-            .map(|report| report.capture.id),
-            None,
-        ),
-        Err(hint) => (None, Some(hint)),
+            .and_then(|turns| turns.last().map(transcript_signature))
+    } else {
+        None
     };
 
     let preamble = preamble.unwrap_or_default();
@@ -490,6 +694,7 @@ fn spawn_session(
         scrollback: preamble.clone(),
         channel: Some(on_output),
         capture: Vec::new(),
+        digest: DigestBuffer::default(),
         exited: false,
     }));
     // Show the revive preamble before any live output (the reader thread only
@@ -507,6 +712,7 @@ fn spawn_session(
     {
         let shared = shared.clone();
         let capture_id = capture_id.clone();
+        let capture_mode_for_reader = capture_mode;
         let project_root = cwd.clone();
         let id = id.clone();
         let launch = launch.clone();
@@ -526,21 +732,38 @@ fn spawn_session(
                                 }
                             }
                             if capture_id.is_some() {
-                                state.capture.extend_from_slice(bytes);
-                                if state.capture.len() > CAPTURE_FLUSH_THRESHOLD {
-                                    Some(std::mem::take(&mut state.capture))
-                                } else {
-                                    None
+                                match capture_mode_for_reader {
+                                    CaptureMode::Full => {
+                                        state.capture.extend_from_slice(bytes);
+                                        (state.capture.len() > CAPTURE_FLUSH_THRESHOLD).then(|| {
+                                            CaptureFlush::Full(std::mem::take(&mut state.capture))
+                                        })
+                                    }
+                                    CaptureMode::Digest => {
+                                        state.digest.push(bytes);
+                                        (state.digest.observed_bytes > CAPTURE_FLUSH_THRESHOLD)
+                                            .then(|| state.digest.take())
+                                            .flatten()
+                                            .map(CaptureFlush::Digest)
+                                    }
+                                    CaptureMode::Off => None,
                                 }
                             } else {
                                 None
                             }
                         };
-                        if let Some(raw) = flush {
-                            flush_capture(&project_root, &capture_id, raw);
+                        if let Some(flush) = flush {
+                            flush_capture(&project_root, &capture_id, flush);
                             // Piggyback resume-tail persistence on the capture
                             // cadence so a hard app quit loses little context.
-                            persist_tail(&id, &project_root, &launch, &shared);
+                            persist_tail(
+                                &id,
+                                &project_root,
+                                &launch,
+                                &capture_id,
+                                capture_mode_for_reader,
+                                &shared,
+                            );
                         }
                     }
                 }
@@ -550,16 +773,38 @@ fn spawn_session(
             let remainder = {
                 let mut state = shared.lock().unwrap();
                 state.exited = true;
+                // Machine-readable exit sentinel first — an OSC xterm renders as
+                // nothing, but the UI flips its header/composer to "ended" on it.
+                // Without this the status dot stayed "live" while keystrokes fell
+                // into a dead PTY (I/O error swallowed by a void invoke).
+                let sentinel = GRAFIKI_EXIT_SENTINEL.as_bytes();
+                state.push_scrollback(sentinel);
                 let marker = b"\r\n\x1b[2m[session ended]\x1b[0m\r\n";
                 state.push_scrollback(marker);
                 if let Some(channel) = &state.channel {
+                    let _ = channel.send(sentinel.to_vec());
                     let _ = channel.send(marker.to_vec());
                 }
-                std::mem::take(&mut state.capture)
+                match capture_mode_for_reader {
+                    CaptureMode::Full => {
+                        Some(CaptureFlush::Full(std::mem::take(&mut state.capture)))
+                    }
+                    CaptureMode::Digest => state.digest.take().map(CaptureFlush::Digest),
+                    CaptureMode::Off => None,
+                }
             };
-            persist_tail(&id, &project_root, &launch, &shared);
+            persist_tail(
+                &id,
+                &project_root,
+                &launch,
+                &capture_id,
+                capture_mode_for_reader,
+                &shared,
+            );
             if let Some(capture) = capture_id {
-                flush_capture(&project_root, &Some(capture.clone()), remainder);
+                if let Some(remainder) = remainder {
+                    flush_capture(&project_root, &Some(capture.clone()), remainder);
+                }
                 let _ = stop_capture_session(StopCaptureOptions {
                     project_name: None,
                     start_dir: PathBuf::from(&project_root),
@@ -572,9 +817,10 @@ fn spawn_session(
 
     // Persist the descriptor immediately so even a session that quits without
     // producing output can be revived into its folder.
-    persist_tail(&id, &cwd, &launch, &shared);
+    persist_tail(&id, &cwd, &launch, &capture_id, capture_mode, &shared);
 
     let capturing = capture_id.is_some();
+    let reply_capture_id = capture_id.clone();
     registry.0.lock().unwrap().insert(
         id.clone(),
         TerminalSession {
@@ -583,8 +829,10 @@ fn spawn_session(
             child,
             capture_id,
             capture_hint: capture_hint.clone(),
+            capture_mode,
             project_root: cwd,
             launch,
+            transcript_baseline,
             shared,
         },
     );
@@ -592,6 +840,8 @@ fn spawn_session(
         id,
         capturing,
         capture_hint,
+        capture_id: reply_capture_id,
+        capture_mode: capture_mode.as_str().to_owned(),
     })
 }
 
@@ -614,6 +864,8 @@ pub fn terminal_attach(
                 cwd: session.project_root.clone(),
                 capturing: session.capture_id.is_some(),
                 capture_hint: session.capture_hint.clone(),
+                capture_id: session.capture_id.clone(),
+                capture_mode: session.capture_mode.as_str().to_owned(),
             })
         }
         None => Ok(AttachReply {
@@ -622,6 +874,8 @@ pub fn terminal_attach(
             cwd: String::new(),
             capturing: false,
             capture_hint: None,
+            capture_id: None,
+            capture_mode: CaptureMode::Off.as_str().to_owned(),
         }),
     }
 }
@@ -639,12 +893,14 @@ pub fn terminal_detach(registry: State<TerminalRegistry>, id: String) -> Result<
             (
                 session.project_root.clone(),
                 session.launch.clone(),
+                session.capture_id.clone(),
+                session.capture_mode,
                 session.shared.clone(),
             )
         })
     };
-    if let Some((cwd, launch, shared)) = persist {
-        persist_tail(&id, &cwd, &launch, &shared);
+    if let Some((cwd, launch, capture_id, capture_mode, shared)) = persist {
+        persist_tail(&id, &cwd, &launch, &capture_id, capture_mode, &shared);
     }
     Ok(())
 }
@@ -711,9 +967,18 @@ pub fn terminal_close(registry: State<TerminalRegistry>, id: String) -> Result<(
 /// so double flushing the same bytes is harmless.
 fn finish_session(mut session: TerminalSession) {
     let _ = session.child.kill();
-    let raw = std::mem::take(&mut session.shared.lock().unwrap().capture);
+    let flush = {
+        let mut shared = session.shared.lock().unwrap();
+        match session.capture_mode {
+            CaptureMode::Full => Some(CaptureFlush::Full(std::mem::take(&mut shared.capture))),
+            CaptureMode::Digest => shared.digest.take().map(CaptureFlush::Digest),
+            CaptureMode::Off => None,
+        }
+    };
     if let Some(capture_id) = session.capture_id.clone() {
-        flush_capture(&session.project_root, &session.capture_id, raw);
+        if let Some(flush) = flush {
+            flush_capture(&session.project_root, &session.capture_id, flush);
+        }
         let _ = stop_capture_session(StopCaptureOptions {
             project_name: None,
             start_dir: PathBuf::from(&session.project_root),
@@ -723,10 +988,22 @@ fn finish_session(mut session: TerminalSession) {
     }
 }
 
+enum CaptureFlush {
+    Full(Vec<u8>),
+    Digest(String),
+}
+
 /// Persist a chunk of terminal output as a capture event (ANSI-stripped). Silent
 /// on error — capture must never disrupt the live terminal.
-fn flush_capture(project_root: &str, capture_id: &Option<String>, raw: Vec<u8>) {
-    let text = strip_ansi(&raw);
+fn flush_capture(project_root: &str, capture_id: &Option<String>, flush: CaptureFlush) {
+    let (text, title, already_redacted) = match flush {
+        CaptureFlush::Full(raw) => {
+            let stripped = strip_ansi(&raw);
+            let (redacted, changed) = redact_text(&stripped);
+            (redacted, "Hosted terminal session", changed)
+        }
+        CaptureFlush::Digest(digest) => (redact_text(&digest).0, "Hosted terminal digest", true),
+    };
     if text.trim().is_empty() {
         return;
     }
@@ -738,12 +1015,12 @@ fn flush_capture(project_root: &str, capture_id: &Option<String>, raw: Vec<u8>) 
         scope: String::new(),
         source_type: "terminal".to_owned(),
         source: Some("grafiki-terminal".to_owned()),
-        title: Some("Hosted terminal session".to_owned()),
+        title: Some(title.to_owned()),
         text: Some(text),
         payload: None,
         metadata: None,
         privacy_level: None,
-        redacted: false,
+        redacted: already_redacted,
         captured_at: None,
     });
 }
@@ -816,7 +1093,7 @@ fn strip_ansi(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, TermShared, SCROLLBACK_MAX};
+    use super::{strip_ansi, DigestBuffer, TermShared, SCROLLBACK_MAX};
 
     #[test]
     fn strips_color_and_cursor_sequences_but_keeps_text() {
@@ -856,6 +1133,7 @@ mod tests {
             scrollback: Vec::new(),
             channel: None,
             capture: Vec::new(),
+            digest: DigestBuffer::default(),
             exited: false,
         };
         // Fill well past the cap with recognizable lines.
@@ -868,5 +1146,31 @@ mod tests {
         assert!(text.starts_with("line "));
         // The newest line is retained.
         assert!(text.ends_with("line 39999\n"));
+    }
+
+    #[test]
+    fn digest_retains_counts_but_no_output_sample() {
+        let mut digest = DigestBuffer::default();
+        digest.push(b"API_TOKEN=super-secret-value\n");
+        for index in 0..2_000 {
+            digest.push(format!("ordinary output line {index}\n").as_bytes());
+        }
+        let report = digest.take().expect("digest");
+        assert!(report.contains("No terminal output sample"));
+        assert!(!report.contains("super-secret-value"));
+        assert_eq!(digest.observed_bytes, 0);
+        assert_eq!(digest.observed_lines, 0);
+    }
+
+    #[test]
+    fn digest_never_reassembles_or_persists_split_secrets() {
+        let mut digest = DigestBuffer::default();
+        digest.push(b"API_TOKEN=super-");
+        digest.push(b"secret-value\nnext line\n");
+        let report = digest.take().expect("digest");
+        assert!(!report.contains("super-"));
+        assert!(!report.contains("secret-value"));
+        assert!(!report.contains("API_TOKEN"));
+        assert!(report.contains("2 lines"));
     }
 }

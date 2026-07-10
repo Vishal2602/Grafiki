@@ -21,7 +21,7 @@
   /* Ink on sheet */
   --ink: #1b1a17;
   --ink-2: #6e6c66;
-  --ink-3: #a3a199;
+  --ink-3: #73716b;
   --ink-on-well: #e8e6e0;
 
   /* Lines */
@@ -46,8 +46,9 @@
   --info-soft: #e8eef3;
   --user-bubble: #eceef1;   /* chat "you" bubble — neutral, NOT green */
   --ok: #2e9e6b;            /* legacy alias of --success (kept for existing refs) */
-  --warn: #c7912b;
-  --danger: #c4483c;
+  --warn: #8a5b00;
+  --warn-surface: #e5bc62;
+  --danger: #ad372f;
   --danger-soft: #faeae8;
   --danger-border: rgba(196, 72, 60, 0.35);
 
@@ -103,6 +104,9 @@
   --ink: #e9efe9;
   --ink-2: #a5b3a9;
   --ink-3: #8a978d;
+  --warn: #d7a94b;
+  --warn-surface: #7a5310;
+  --danger: #ee756b;
   --hairline: rgba(255, 255, 255, 0.08);
   --hairline-2: rgba(255, 255, 255, 0.15);
   --accent: #58b98a;
@@ -168,6 +172,17 @@ body {
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
   user-select: none;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 input,
 textarea,
@@ -243,6 +258,38 @@ textarea,
 .brand-text {
   letter-spacing: 0.01em;
 }
+/* Visible signifier for the command palette / ask-memory entry point —
+   an affordance with no signifier doesn't exist for a new user. */
+.rail-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 2px 0 10px;
+  padding: 6px 10px;
+  border: 1px solid rgba(250, 250, 247, 0.16);
+  border-radius: var(--r-btn);
+  background: rgba(250, 250, 247, 0.06);
+  color: var(--rail-ink-2);
+  font-size: 12.5px;
+  cursor: pointer;
+  text-align: left;
+}
+.rail-search:hover {
+  background: rgba(250, 250, 247, 0.12);
+  color: var(--rail-ink);
+}
+.rail-search span {
+  flex: 1;
+}
+.rail-search kbd {
+  font-family: inherit;
+  font-size: 10.5px;
+  opacity: 0.75;
+  border: 1px solid rgba(250, 250, 247, 0.22);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
 .rail-nav {
   display: flex;
   flex-direction: column;
@@ -395,6 +442,13 @@ textarea,
   line-height: 1.2;
   letter-spacing: -0.01em;
   color: var(--ink);
+  /* Titles derive from user input (asks); clamp so a long one can never
+     swallow the pane below it. */
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 /* Replaces the incoherent eyebrow ("SETTINGS / Settings", "CHAT / Memory") with
    a real one-line statement of what the page is for. */
@@ -746,7 +800,7 @@ textarea {
   line-height: 1.5;
 }
 .preview-banner {
-  background: var(--warn);
+  background: var(--warn-surface);
   color: #241a02;
   font-size: 12px;
   font-weight: 550;
@@ -783,6 +837,30 @@ textarea {
 }
 .data-row:last-child {
   border-bottom: 0;
+}
+.pane-body button.data-row-button {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--hairline);
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  padding: 9px 2px;
+}
+.pane-body button.data-row-button:hover {
+  background: var(--hover-tint);
+  border-color: var(--hairline);
+}
+.data-row-button > b,
+.agent-activity-row > span:nth-child(2) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-activity-row > span:nth-child(2) {
+  flex: 1;
 }
 .empty-record-list {
   padding: 28px 8px;
@@ -1482,6 +1560,13 @@ textarea {
   border-bottom: 1px solid var(--hairline);
   cursor: pointer;
   border-radius: 6px;
+  width: 100%;
+  border-top: 0;
+  border-left: 0;
+  border-right: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
 }
 .ledger-row:hover {
   background: rgba(27, 26, 23, 0.03);
@@ -1989,6 +2074,17 @@ textarea {
   gap: 8px;
   width: 100%;
 }
+.onboarding-folder-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+.onboarding-folder-field > label {
+  color: var(--ink-2);
+  font-size: 12.5px;
+  font-weight: 500;
+}
 .onboarding-folder input {
   flex: 1;
   font-family: var(--mono);
@@ -2098,7 +2194,9 @@ button:active:not(:disabled) {
 }
 .mem-chat-scroll {
   flex: 1;
-  min-height: 0;
+  /* A tall header (long ask rendered as the title) must squeeze, not erase,
+     the conversation — 0px here made the answer genuinely unreachable. */
+  min-height: 120px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -2376,29 +2474,41 @@ button:active:not(:disabled) {
   flex-wrap: wrap;
   flex-shrink: 0;
 }
-/* Soft rounded cards (the chat-bubble aesthetic): inactive = a quiet fill,
-   active = a white card with a hairline + a whisper of shadow. */
-.session-tab {
+/* The tab and its independent close action share a visual wrapper so controls
+   stay valid HTML (no button nested inside another button). */
+.session-tab-wrap {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 7px 10px 7px 8px;
+  gap: 1px;
   border-radius: 11px;
   background: var(--banner-tint);
   border: 1px solid transparent;
   color: var(--ink-2);
-  cursor: pointer;
-  font-size: 12.5px;
   transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
 }
-.session-tab:hover {
+.session-tab-wrap:hover {
   color: var(--ink);
 }
-.session-tab.active {
+.session-tab-wrap.active {
   background: var(--card);
   border-color: var(--hairline-2);
   color: var(--ink);
   box-shadow: 0 1px 2px rgba(3, 33, 19, 0.06);
+}
+.pane-body .session-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 6px 7px 8px;
+  border: 0;
+  border-radius: 10px 0 0 10px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 12.5px;
+}
+.pane-body .session-tab:hover {
+  border-color: transparent;
 }
 .session-tab-glyph {
   width: 18px;
@@ -2413,7 +2523,7 @@ button:active:not(:disabled) {
   font-weight: 700;
   flex-shrink: 0;
 }
-.session-tab.active .session-tab-glyph {
+.session-tab-wrap.active .session-tab-glyph {
   background: var(--accent);
   color: var(--on-accent);
 }
@@ -2421,7 +2531,7 @@ button:active:not(:disabled) {
   font-weight: 550;
   white-space: nowrap;
 }
-.session-tab-close {
+.pane-body button.session-tab-close {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2430,6 +2540,10 @@ button:active:not(:disabled) {
   border-radius: 5px;
   color: var(--ink-3);
   opacity: 0.55;
+  padding: 0;
+  margin-right: 5px;
+  border: 0;
+  background: transparent;
 }
 .session-tab-close:hover {
   opacity: 1;
@@ -2459,4 +2573,295 @@ button:active:not(:disabled) {
   min-height: 0;
   display: flex;
   flex-direction: column;
+}
+
+/* Memory management surfaces: explicit search, manual capture, and query log. */
+.memory-surface-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: -46px;
+  min-height: 34px;
+  pointer-events: none;
+}
+.memory-surface-actions > button {
+  pointer-events: auto;
+}
+.manual-memory-form {
+  max-width: 760px;
+  width: 100%;
+  margin: 0 auto;
+}
+.trusted-search-form {
+  display: grid;
+  grid-template-columns: minmax(220px, 2fr) repeat(3, minmax(118px, 1fr)) auto;
+  align-items: end;
+  gap: 10px;
+  padding: 12px;
+  margin-bottom: 8px;
+  background: var(--card);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-card);
+}
+.trusted-search-form .compact-select {
+  align-items: stretch;
+  flex-direction: column;
+}
+.trusted-search-form .compact-select > span {
+  font-weight: 500;
+}
+.trusted-search-form select {
+  min-height: 32px;
+}
+.agent-activity-row code {
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+.fatal-error {
+  min-height: 100vh;
+  display: grid;
+  place-content: center;
+  gap: 12px;
+  padding: 32px;
+  background: var(--sheet);
+  color: var(--ink);
+  text-align: center;
+}
+.fatal-error h1 {
+  font-family: var(--serif);
+  font-size: 26px;
+  font-weight: 550;
+}
+.fatal-error pre {
+  max-width: min(720px, 90vw);
+  overflow: auto;
+  padding: 12px;
+  border-radius: var(--r-card);
+  background: var(--well);
+  color: var(--ink-on-well);
+  text-align: left;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 1100px) {
+  .app-shell.inspector-open {
+    grid-template-columns: 208px minmax(0, 1fr);
+  }
+  .inspector {
+    position: fixed;
+    z-index: 70;
+    top: var(--frame-margin);
+    right: var(--frame-margin);
+    bottom: var(--frame-margin);
+    width: min(320px, calc(100vw - 84px));
+    margin: 0;
+    box-shadow: 0 14px 48px rgba(3, 33, 19, 0.3);
+  }
+  .trusted-search-form {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .trusted-search-query {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 800px) {
+  :root {
+    --frame-margin: 6px;
+  }
+  .app-shell,
+  .app-shell.inspector-open {
+    grid-template-columns: 60px minmax(0, 1fr);
+  }
+  .rail {
+    padding-inline: 6px;
+  }
+  .brand,
+  .rail-item {
+    justify-content: center;
+    padding-inline: 6px;
+  }
+  .brand-text,
+  .rail-item > span:not(.rail-badge) {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+  }
+  .rail-badge {
+    position: absolute;
+    transform: translate(13px, -11px);
+    min-width: 15px;
+    padding: 0 4px;
+  }
+  .workspace {
+    padding-right: var(--frame-margin);
+  }
+  .status-pill:not(.warn) {
+    display: none;
+  }
+  .project-lockup span {
+    max-width: 40vw;
+  }
+  .pane-header {
+    padding-inline: 14px;
+  }
+  .pane-body {
+    padding-inline: 14px;
+  }
+  .settings-duo,
+  .trusted-search-form {
+    grid-template-columns: 1fr;
+  }
+  .trusted-search-query {
+    grid-column: auto;
+  }
+  .term-peek {
+    width: min(220px, 42%);
+  }
+  .session-status-path {
+    display: none;
+  }
+  .memory-surface-actions {
+    margin-top: 0;
+    justify-content: flex-start;
+  }
+  .seg-tabs {
+    overflow-x: auto;
+    flex-shrink: 0;
+  }
+  .seg-tabs button.seg-tab {
+    white-space: nowrap;
+  }
+}
+
+@media (max-width: 560px) {
+  .app-shell,
+  .app-shell.inspector-open {
+    grid-template-columns: 52px minmax(0, 1fr);
+  }
+  .top-status {
+    min-height: 26px;
+  }
+  .status-cluster,
+  .project-lockup svg {
+    display: none;
+  }
+  .project-lockup span {
+    max-width: 62vw;
+  }
+  .pane-header {
+    padding: 12px 10px 8px;
+  }
+  .pane-body {
+    padding: 3px 10px 12px;
+  }
+  .toolbar-row {
+    align-items: flex-start !important;
+  }
+  .session-status {
+    width: 100%;
+  }
+  .session-peek-toggle {
+    margin-left: 0 !important;
+  }
+  .term-peek {
+    position: absolute;
+    z-index: 20;
+    right: 10px;
+    top: 52px;
+    bottom: 10px;
+    width: min(280px, calc(100% - 20px));
+    padding: 12px;
+    border: 1px solid var(--hairline-2);
+    border-radius: var(--r-card);
+    background: var(--sheet);
+    box-shadow: 0 12px 36px rgba(3, 33, 19, 0.24);
+  }
+  .form-actions {
+    flex-wrap: wrap;
+  }
+  .onboarding-step {
+    padding: 28px 24px;
+  }
+  .onboarding-folder {
+    flex-direction: column;
+  }
+}
+
+/* ── Background-error notices ─────────────────────────────────────────────
+   The landing surface for best-effort failures (extraction, capture polls,
+   ledger refresh) that previously vanished into `void`. */
+.bg-notices {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: min(420px, calc(100vw - 28px));
+}
+.bg-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline-2);
+  border-left: 3px solid var(--warn, #b3752b);
+  border-radius: var(--r-card);
+  background: var(--sheet);
+  color: var(--ink);
+  font-size: 12.5px;
+  line-height: 1.45;
+  box-shadow: 0 10px 30px rgba(3, 33, 19, 0.18);
+}
+.bg-notice svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--warn, #b3752b);
+}
+.bg-notice span {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+.bg-notice button {
+  border: 0;
+  background: none;
+  color: var(--ink-2);
+  cursor: pointer;
+  padding: 0;
+  line-height: 0;
+}
+.bg-notice button:hover {
+  color: var(--ink);
+}
+
+/* Pane-scoped error fallback: the crashed view is replaced, the app stays up. */
+.pane-error {
+  margin: 24px auto;
+  max-width: 520px;
+  padding: 16px 18px;
+  border: 1px solid var(--hairline-2);
+  border-radius: var(--r-card);
+  background: var(--sheet-2, var(--sheet));
+  font-size: 13px;
+  line-height: 1.5;
+}
+.pane-error-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 10px;
+}
+.pane-error-actions button {
+  border: 1px solid var(--hairline-2);
+  border-radius: var(--r-btn);
+  background: none;
+  padding: 5px 12px;
+  cursor: pointer;
+  color: var(--ink);
+  font-size: 12.5px;
+}
+.pane-error-actions button:hover {
+  background: var(--wash, rgba(11, 74, 50, 0.06));
 }

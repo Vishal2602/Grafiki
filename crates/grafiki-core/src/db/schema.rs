@@ -6,7 +6,7 @@ use crate::Result;
 pub const INITIAL_SCHEMA_VERSION: i64 = 1;
 /// The newest schema version this build knows how to produce. Bump this and add
 /// a `Migration` entry whenever the schema changes.
-pub const LATEST_SCHEMA_VERSION: i64 = 5;
+pub const LATEST_SCHEMA_VERSION: i64 = 7;
 
 struct Migration {
     version: i64,
@@ -41,7 +41,33 @@ const MIGRATIONS: &[Migration] = &[
         description: "capture_cursors: durable auto-extraction progress (retry-safe)",
         sql: MIGRATION_V5_CAPTURE_CURSORS,
     },
+    Migration {
+        version: 6,
+        description: "retirement timestamps for non-destructive entity and context deletion",
+        sql: MIGRATION_V6_TRUSTED_RECORD_RETIREMENT,
+    },
+    Migration {
+        version: 7,
+        description: "candidate approval supersession restore snapshot for lossless undo",
+        sql: MIGRATION_V7_APPROVAL_RESTORE,
+    },
 ];
+
+// Approval undo must restore the exact predecessor state, not assume every old
+// decision was active or every observation was open-ended before supersession.
+const MIGRATION_V7_APPROVAL_RESTORE: &str = r#"
+ALTER TABLE extraction_candidates ADD COLUMN approval_restore TEXT;
+"#;
+
+// Trusted memory participates in audit/query history and may already have been
+// cited. Entity/context deletion therefore retires records from active retrieval
+// rather than physically erasing them. Decisions already have `status=revoked`.
+const MIGRATION_V6_TRUSTED_RECORD_RETIREMENT: &str = r#"
+ALTER TABLE entities ADD COLUMN retired_at TEXT;
+ALTER TABLE context ADD COLUMN retired_at TEXT;
+CREATE INDEX IF NOT EXISTS idx_entities_retired ON entities(retired_at);
+CREATE INDEX IF NOT EXISTS idx_context_retired ON context(retired_at);
+"#;
 
 // Auto-extraction used to gate on "events imported this pass", so a failed model
 // call permanently consumed the session (import-dedup made the retry a no-op).
@@ -630,6 +656,33 @@ mod tests {
             has_column, 1,
             "v2 migration must add capture_events.content_hash"
         );
+    }
+
+    #[test]
+    fn migration_v6_adds_trusted_record_retirement_columns() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&mut connection).unwrap();
+        for table in ["entities", "context"] {
+            let count: i64 = connection
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = 'retired_at'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{table} must support non-destructive retirement");
+        }
+        let restore_column: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('extraction_candidates')
+                 WHERE name = 'approval_restore'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restore_column, 1);
     }
 
     #[test]

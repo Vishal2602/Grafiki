@@ -5,7 +5,9 @@
 
 use std::path::PathBuf;
 
-use grafiki_core::SearchMode;
+use grafiki_core::{
+    ingest_capture_event, init_project, IngestCaptureEventOptions, InitOptions, SearchMode,
+};
 use grafiki_eval::config::EvalConfig;
 use grafiki_eval::dataset::{RedactionDataset, RetrievalDataset};
 use grafiki_eval::runner::redaction::run_redaction;
@@ -72,6 +74,23 @@ fn keyword_retrieval_is_sane() {
 }
 
 #[test]
+fn keyword_retrieval_balances_record_types_before_the_global_limit() {
+    let dataset = RetrievalDataset::load(&fixtures().join("retrieval/grafiki_type_balance_v1"))
+        .expect("load type-balance fixture");
+    let cfg = EvalConfig {
+        limit: 5,
+        ..EvalConfig::default()
+    };
+    let report =
+        run_retrieval(&dataset, &[SearchMode::Keyword], &cfg).expect("run balanced keyword search");
+
+    assert_eq!(
+        report.modes[0].overall.macro_avg["recall@5"], 1.0,
+        "entity saturation must not hide a relevant observation"
+    );
+}
+
+#[test]
 fn redaction_has_zero_leaks() {
     let dataset = RedactionDataset::load(&fixtures().join("redaction/corpus_v1.jsonl"))
         .expect("load redaction fixture");
@@ -99,4 +118,50 @@ fn redaction_has_zero_leaks() {
     );
     // Every supported secret type should have at least one positive case.
     assert!(report.positive_secret_count >= 10);
+}
+
+#[test]
+fn structured_capture_json_is_redacted_at_the_persistence_boundary() {
+    let home = tempfile::tempdir().expect("temp home");
+    init_project(InitOptions {
+        project_name: Some("eval-structured-redaction".to_owned()),
+        project_dir: home.path().to_path_buf(),
+        grafiki_home: Some(home.path().to_path_buf()),
+    })
+    .expect("init project");
+
+    let report = ingest_capture_event(IngestCaptureEventOptions {
+        project_name: Some("eval-structured-redaction".to_owned()),
+        start_dir: home.path().to_path_buf(),
+        grafiki_home: Some(home.path().to_path_buf()),
+        capture_id: None,
+        scope: "eval".to_owned(),
+        source_type: "terminal".to_owned(),
+        source: Some("eval".to_owned()),
+        title: Some("structured redaction".to_owned()),
+        text: None,
+        payload: Some(serde_json::json!({
+            "safe": "kept",
+            "nested": { "client_secret": "synthetic-value" }
+        })),
+        metadata: Some(serde_json::json!({
+            "password": "another-synthetic-value"
+        })),
+        privacy_level: Some("internal".to_owned()),
+        redacted: false,
+        captured_at: None,
+    })
+    .expect("ingest structured capture");
+
+    assert_eq!(report.event.payload.as_ref().unwrap()["safe"], "kept");
+    assert_eq!(
+        report.event.payload.as_ref().unwrap()["nested"]["client_secret"],
+        "[REDACTED_SECRET]"
+    );
+    assert_eq!(
+        report.event.metadata.as_ref().unwrap()["password"],
+        "[REDACTED_SECRET]"
+    );
+    assert!(report.event.redacted);
+    assert_eq!(report.event.privacy_level, "sensitive");
 }

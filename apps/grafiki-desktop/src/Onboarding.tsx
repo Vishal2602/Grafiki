@@ -12,7 +12,7 @@ export default function Onboarding(props: {
   const [step, setStep] = useState(0);
   const [folder, setFolder] = useState("");
   const [initializing, setInitializing] = useState(false);
-  const [captureConsent, setCaptureConsent] = useState(true);
+  const [captureConsent, setCaptureConsent] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
   const [models, setModels] = useState<string[] | null>(null);
 
@@ -47,6 +47,21 @@ export default function Onboarding(props: {
       setInitError(String(error));
     } finally {
       setInitializing(false);
+    }
+  };
+
+  const [enablingCapture, setEnablingCapture] = useState(false);
+  const enableCaptureLate = async () => {
+    const dir = folder.trim();
+    if (!dir) return;
+    setEnablingCapture(true);
+    try {
+      await updateCaptureConfig({ startDir: dir, terminal: true, terminalOutput: "full" });
+      setCaptureConsent(true);
+    } catch (error) {
+      setInitError(String(error));
+    } finally {
+      setEnablingCapture(false);
     }
   };
 
@@ -92,17 +107,23 @@ export default function Onboarding(props: {
               Pick the project folder Grafiki should remember. It creates a private memory
               database for it (you can add more projects later in Settings).
             </p>
-            <div className="onboarding-folder">
-              <input
-                value={folder}
-                onChange={(event) => setFolder(event.target.value)}
-                placeholder="/path/to/your/project"
-              />
-              <button className="button" onClick={() => void browse()}>
-                Browse…
-              </button>
+            <div className="onboarding-folder-field">
+              <label htmlFor="onboarding-project-folder">
+                Project folder
+              </label>
+              <div className="onboarding-folder">
+                <input
+                  id="onboarding-project-folder"
+                  value={folder}
+                  onChange={(event) => setFolder(event.target.value)}
+                  placeholder="/path/to/your/project"
+                />
+                <button className="button" onClick={() => void browse()}>
+                  Browse…
+                </button>
+              </div>
             </div>
-            {initError ? <p style={{ color: "var(--danger)" }}>{initError}</p> : null}
+            {initError ? <p role="alert" style={{ color: "var(--danger)" }}>{initError}</p> : null}
             <label className="onboarding-consent">
               <input
                 type="checkbox"
@@ -110,8 +131,9 @@ export default function Onboarding(props: {
                 onChange={(event) => setCaptureConsent(event.currentTarget.checked)}
               />
               <span>
-                Capture terminal output in this workspace so sessions become memory.
-                Stays on this Mac; change anytime in Settings &rarr; Capture Consent.
+                I consent to storing full terminal output from this workspace as local capture
+                events so it can become reviewable memory. This is off by default, stays on this
+                Mac, and can be changed anytime in Settings &rarr; Capture &amp; privacy.
               </span>
             </label>
             <button
@@ -162,9 +184,22 @@ export default function Onboarding(props: {
           <>
             <h1>Start your first session</h1>
             <p className="muted">
-              Work normally — Grafiki is listening. What you decide and learn shows up on Home
-              for review.
+              {captureConsent
+                ? "Terminal capture is on for this workspace. What you decide and learn can show up on Home for review."
+                : "Terminal capture is off. Your session still runs normally, and no terminal output will be stored unless you enable capture."}
             </p>
+            {!captureConsent ? (
+              // Last chance to fix the day-one failure mode: starting the first
+              // session with capture off means Grafiki remembers nothing and the
+              // product promise silently fails. One click, still explicit consent.
+              <button
+                className="button"
+                disabled={enablingCapture}
+                onClick={() => void enableCaptureLate()}
+              >
+                {enablingCapture ? "Turning on capture…" : "Turn on capture for this workspace"}
+              </button>
+            ) : null}
             <div className="agent-buttons">
               {agents.map((agent) => (
                 <button

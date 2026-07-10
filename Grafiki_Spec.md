@@ -1,6 +1,15 @@
 # Grafiki — Complete Technical Specification
 
-**Version:** 1.0
+> ⚠️ **HISTORICAL DOCUMENT — does not describe the shipped product.** This is the
+> original v1 design spec. The implementation deliberately diverged: there is a
+> **Tauri desktop app** (not in this spec) with terminal hosting, auto-capture and
+> a review queue; embeddings use **fastembed**, not candle; the HTTP daemon is
+> hand-rolled `std::net`, not axum/tokio; there is **no TUI** (§14), **no r2d2
+> pool** (§17), and the **connectors** (§25–27: Slack/Gmail/Calendar/Granola/
+> Linear/GitHub) were never built. For current architecture read `README.md`,
+> `PRD.md`, and `docs/` — when this file and the code disagree, the code wins.
+
+**Version:** 1.0 (historical)
 **Language:** Rust
 **License:** MIT
 

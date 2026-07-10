@@ -1,11 +1,19 @@
 {
   "redaction": {
     "max_leaks": 0,
-    "min_precision": 0.8666,
+    "min_precision": 0.8888,
     "min_recall": 1.0
   },
+  "memory_qa": {
+    "min_abstention_accuracy": 1.0,
+    "min_answer_contains_gold_rate": 1.0,
+    "min_ndcg@10": 1.0,
+    "min_recall@10": 1.0,
+    "primary_mode": "keyword",
+    "tolerance": 0.05
+  },
   "retrieval": {
-    "ndcg@10": 0.6562,
+    "ndcg@10": 0.7267,
     "primary_mode": "keyword",
     "recall@10": 0.8958,
     "tolerance": 0.05

@@ -34,6 +34,10 @@ Use this command for MCP clients that accept a command plus arguments:
 /path/to/Grafiki/target/debug/grafiki mcp --project grafiki --path /path/to/Grafiki
 ```
 
+MCP is read-only by default. This is the recommended mode for agent hookups. A
+trusted, user-controlled client can opt into curation tools with `--allow-write`;
+never add that flag merely to make a generated configuration more convenient.
+
 Generic MCP JSON shape:
 
 ```json
@@ -111,7 +115,7 @@ Transcript import can read a specific file or the default local history folder f
 
 ```bash
 target/debug/grafiki capture import-transcripts --agent codex --path /path/to/Grafiki --scope grafiki/core --summarize
-target/debug/grafiki capture import-transcripts --agent claude-code --input /path/to/transcript.jsonl --path /path/to/Grafiki --scope grafiki/core --summarize
+target/debug/grafiki capture import-transcripts --agent claude-code --input /path/to/Grafiki/.grafiki-imports/transcript.jsonl --path /path/to/Grafiki --scope grafiki/core --summarize
 ```
 
 Terminal, file, and git adapters capture coding metadata into the same raw ledger:
@@ -128,6 +132,8 @@ target/debug/grafiki capture shell-hook --path /path/to/Grafiki --scope grafiki/
 The shell hook prints a zsh hook you can source manually. It captures command, cwd, exit code, duration, and shell metadata. It does not capture stdout by default.
 
 Workspace capture consent is stored at `.grafiki.capture.json` in the project root. Launch-safe defaults keep git, transcript, terminal, file, IDE, and system metadata enabled; screen/browser/audio capture stay off unless the user opts in.
+
+Transcript inputs accepted by the daemon must resolve inside the daemon's immutable project root. Copy an external export into a project-owned import directory first; path traversal, symlink escapes, and arbitrary files elsewhere on the machine are rejected.
 
 ## HTTP Daemon
 
@@ -173,7 +179,7 @@ curl -X POST -H "Authorization: Bearer local-dev-token" -H 'Content-Type: applic
 curl -X POST -H "Authorization: Bearer local-dev-token" -H 'Content-Type: application/json' "http://127.0.0.1:9700/api/candidates/approve" -d '{"id":"<candidate-id>"}'
 curl -H "Authorization: Bearer local-dev-token" "http://127.0.0.1:9700/api/capture/config"
 curl -X POST -H "Authorization: Bearer local-dev-token" -H 'Content-Type: application/json' "http://127.0.0.1:9700/api/capture/config" -d '{"terminal":true,"files":true,"git":true,"add_blocked_paths":["secrets"],"terminal_output":"off"}'
-curl -X POST -H "Authorization: Bearer local-dev-token" -H 'Content-Type: application/json' "http://127.0.0.1:9700/api/capture/import-transcripts" -d '{"agent":"codex","input":"/path/to/session.jsonl","scope":"grafiki/core","summarize":true}'
+curl -X POST -H "Authorization: Bearer local-dev-token" -H 'Content-Type: application/json' "http://127.0.0.1:9700/api/capture/import-transcripts" -d '{"agent":"codex","input":"/path/to/project/.grafiki-imports/session.jsonl","scope":"grafiki/core","summarize":true}'
 curl -X POST -H "Authorization: Bearer local-dev-token" -H 'Content-Type: application/json' "http://127.0.0.1:9700/api/capture/terminal-command" -d '{"scope":"grafiki/core","command":"cargo test","cwd":"/path/to/Grafiki","exit_code":0,"duration_ms":1200,"shell":"zsh"}'
 curl -X POST -H "Authorization: Bearer local-dev-token" -H 'Content-Type: application/json' "http://127.0.0.1:9700/api/capture/watch-files" -d '{"scope":"grafiki/core","since_seconds":300,"limit":50,"summarize":true}'
 curl -X POST -H "Authorization: Bearer local-dev-token" -H 'Content-Type: application/json' "http://127.0.0.1:9700/api/capture/git-summary" -d '{"scope":"grafiki/core","summarize":true}'

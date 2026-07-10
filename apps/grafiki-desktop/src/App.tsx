@@ -24,6 +24,7 @@ import {
   Pencil,
   Plus,
   RefreshCcw,
+  Search,
   Settings,
   ShieldQuestion,
   Sparkles,
@@ -34,13 +35,12 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Terminal as XTerm } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import {
   approveCandidate,
   bulkReviewCandidates,
   chatWithMemory,
+  captureMemory,
   deleteMemoryRecord,
   editCandidate,
   exportMemoryToFile,
@@ -56,10 +56,12 @@ import {
   importMemoryFromFile,
   initializeProject,
   listCandidates,
+  listAgentActivity,
   listProjectContext,
   listProjectDecisions,
   pickProjectFolder,
   processProjectEmbeddings,
+  searchProjectMemory,
   startDaemon,
   stopDaemon,
   rejectCandidate,
@@ -72,6 +74,7 @@ import {
 } from "./api";
 import type { HomeLedgerReport, LiveTranscriptTurn, SessionDetailReport } from "./api";
 import Onboarding from "./Onboarding";
+import ErrorBoundary from "./ErrorBoundary";
 import { useModalDialog } from "./useModalDialog";
 import {
   decodeLayoutFromHash,
@@ -83,6 +86,7 @@ import {
 import type {
   CaptureConfigReport,
   CaptureSourceConfig,
+  AgentQueryLogItem,
   ChatReply,
   ContextSummary,
   DecisionItem,
@@ -94,6 +98,7 @@ import type {
   PaneState,
   ProjectSnapshot,
   SearchResult,
+  SearchMode,
   LayoutState,
 } from "./types";
 
@@ -138,6 +143,68 @@ function paneSubtitle(kind: PaneKind): string {
     default:
       return "";
   }
+}
+
+// Pane titles render as the page heading; an unbounded one (a 2,000-char ask)
+// collapsed the chat scroller to 0px. The full text still flows as `query`.
+function clampTitle(text: string, max = 90): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine;
+}
+
+// ── Background-error channel ─────────────────────────────────────────────
+// Best-effort work (capture, extraction, polls) must never disturb the pane
+// it runs behind — but its failures must land SOMEWHERE the user can see, or
+// the app silently stops learning while claiming to capture. Any code can
+// call notifyBackground(); App renders the queue as dismissible notices.
+type BackgroundNotice = { id: number; text: string };
+const backgroundNoticeListeners = new Set<(notice: BackgroundNotice) => void>();
+let backgroundNoticeSeq = 0;
+const backgroundNoticeLastShown = new Map<string, number>();
+
+function notifyBackground(text: string) {
+  // The extraction heartbeat retries every 2 minutes; dedupe identical
+  // failures so a down Ollama is one notice, not a toast storm.
+  const now = Date.now();
+  const last = backgroundNoticeLastShown.get(text) ?? 0;
+  if (now - last < 5 * 60_000) return;
+  backgroundNoticeLastShown.set(text, now);
+  const notice = { id: ++backgroundNoticeSeq, text };
+  backgroundNoticeListeners.forEach((listener) => listener(notice));
+}
+
+// Every extraction entry point funnels through here so a failure is surfaced
+// once, uniformly, instead of each call site inventing its own silence.
+async function runExtraction(
+  options: Parameters<typeof extractSessionMemory>[0],
+  source: string,
+): Promise<Awaited<ReturnType<typeof extractSessionMemory>> | null> {
+  try {
+    return await extractSessionMemory(options);
+  } catch (error) {
+    notifyBackground(`Memory extraction failed (${source}): ${String(error)}`);
+    return null;
+  }
+}
+
+function handleTablistKeyDown(event: React.KeyboardEvent<HTMLElement>) {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  const target = (event.target as HTMLElement).closest<HTMLElement>('[role="tab"]');
+  if (!target) return;
+  const tabs = Array.from(
+    event.currentTarget.querySelectorAll<HTMLElement>('[role="tab"]:not([disabled])'),
+  );
+  const index = tabs.indexOf(target);
+  if (index < 0 || tabs.length === 0) return;
+  event.preventDefault();
+  const nextIndex =
+    event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? tabs.length - 1
+        : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+  tabs[nextIndex].focus();
+  tabs[nextIndex].click();
 }
 
 const entityTypeOptions = ["concept", "module", "service", "file", "api", "tool", "library", "config", "person", "endpoint"];
@@ -220,12 +287,15 @@ export default function App() {
   const [recordDetail, setRecordDetail] = useState<MemoryRecordDetail | null>(null);
   const [recordDetailError, setRecordDetailError] = useState<string | null>(null);
   const [recordDetailLoading, setRecordDetailLoading] = useState(false);
+  const [detailRevision, setDetailRevision] = useState(0);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [onboarding, setOnboarding] = useState(
     () => !localStorage.getItem("grafiki.onboarded") && !localStorage.getItem(PROJECT_ROOT_KEY),
   );
   const reduceMotion = useReducedMotion() ?? false;
+  const snapshotRequestRef = useRef(0);
+  const ledgerRequestRef = useRef(0);
 
   const finishOnboarding = (launch: string | null) => {
     localStorage.setItem("grafiki.onboarded", "1");
@@ -245,9 +315,19 @@ export default function App() {
 
   const [homeLedger, setHomeLedger] = useState<HomeLedgerReport | null>(null);
   const refreshLedger = () => {
+    const request = ++ledgerRequestRef.current;
     getHomeLedger({ startDir: projectRoot })
-      .then(setHomeLedger)
-      .catch(() => setHomeLedger(null));
+      .then((ledger) => {
+        if (request === ledgerRequestRef.current) setHomeLedger(ledger);
+      })
+      .catch((ledgerError) => {
+        if (request === ledgerRequestRef.current) {
+          setHomeLedger(null);
+          // A blank Home is indistinguishable from "no activity this week" —
+          // say why the numbers vanished instead of letting trust erode.
+          notifyBackground(`Couldn't load the Home ledger: ${String(ledgerError)}`);
+        }
+      });
   };
   useEffect(() => {
     refreshLedger();
@@ -270,6 +350,22 @@ export default function App() {
     setSelectedResult(null);
     setRecordDetail(null);
   }, [projectRoot]);
+
+  // Background-error notices: the landing surface for best-effort failures
+  // (extraction, capture polls) that would otherwise vanish into `void`.
+  const [backgroundNotices, setBackgroundNotices] = useState<BackgroundNotice[]>([]);
+  useEffect(() => {
+    const onNotice = (notice: BackgroundNotice) => {
+      setBackgroundNotices((current) => [...current.slice(-2), notice]);
+      window.setTimeout(() => {
+        setBackgroundNotices((current) => current.filter((n) => n.id !== notice.id));
+      }, 12_000);
+    };
+    backgroundNoticeListeners.add(onNotice);
+    return () => {
+      backgroundNoticeListeners.delete(onNotice);
+    };
+  }, []);
 
   useEffect(() => {
     const pref = (localStorage.getItem(THEME_KEY) as ThemePref) ?? "light";
@@ -370,7 +466,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [detailTarget?.recordType, detailTarget?.id, detailTarget?.scope, detailTarget?.startDir]);
+  }, [detailTarget?.recordType, detailTarget?.id, detailTarget?.scope, detailTarget?.startDir, detailRevision]);
 
   function activatePane(id: string) {
     setLayout((current) => ({ ...current, activePaneId: id }));
@@ -418,9 +514,16 @@ export default function App() {
     });
   }
 
-  async function refreshSnapshot() {
-    const next = await getProjectSnapshot({ startDir: projectRoot });
-    setSnapshot(next);
+  async function refreshSnapshot(startDir = projectRoot) {
+    const request = ++snapshotRequestRef.current;
+    const next = await getProjectSnapshot({ startDir });
+    if (request === snapshotRequestRef.current) setSnapshot(next);
+    return next;
+  }
+
+  async function refreshMemory() {
+    const next = await refreshSnapshot();
+    setDetailRevision((revision) => revision + 1);
     return next;
   }
 
@@ -429,8 +532,7 @@ export default function App() {
     if (!projectDir) return;
     await initializeProject({ projectDir });
     setProjectRoot(projectDir);
-    const next = await getProjectSnapshot({ startDir: projectDir });
-    setSnapshot(next);
+    await refreshSnapshot(projectDir);
   }
 
   function updatePane(id: string, patch: Partial<PaneState>) {
@@ -501,6 +603,7 @@ export default function App() {
         activeKind={activePane?.kind ?? "home"}
         pendingCount={homeLedger?.ledger.pending_candidates ?? 0}
         onOpen={(kind) => switchPrimaryPane(kind)}
+        onOpenPalette={() => setPaletteOpen(true)}
         reduceMotion={reduceMotion}
       />
 
@@ -535,7 +638,7 @@ export default function App() {
                 onOpenResult={openResultInPane}
                 onProjectRootChange={setProjectRoot}
                 onInitializeProject={initializeCurrentProject}
-                onMemoryChanged={refreshSnapshot}
+                onMemoryChanged={refreshMemory}
                 ledger={homeLedger}
                 onRefreshLedger={refreshLedger}
                 onNavigate={switchPrimaryPane}
@@ -550,7 +653,7 @@ export default function App() {
           <CommandPalette
             onClose={() => setPaletteOpen(false)}
             onAsk={(question) =>
-              switchPrimaryPane("chat", { query: question, title: `Memory: ${question}` })
+              switchPrimaryPane("chat", { query: question, title: `Memory: ${clampTitle(question)}` })
             }
             actions={[
               { id: "home", label: "Go to Home", hint: "ledger", run: () => switchPrimaryPane("home") },
@@ -584,9 +687,14 @@ export default function App() {
                           JSON.stringify({
                             id: homeLedger.resumable!.id,
                             launch: homeLedger.resumable!.launch,
+                            captureId: homeLedger.resumable!.capture_id,
+                            captureMode: homeLedger.resumable!.capture_mode,
                           }),
                         );
-                        switchPrimaryPane("terminal");
+                        // The title patch forces a fresh pane even when Sessions
+                        // is already active — a bare switch early-returns and the
+                        // resume key would sit unadopted until some later remount.
+                        switchPrimaryPane("terminal", { title: "Sessions" });
                       },
                     },
                   ]
@@ -607,9 +715,11 @@ export default function App() {
                 label: "Extract memories now",
                 hint: "runs the local model",
                 run: () => {
-                  void extractSessionMemory({ startDir: projectRoot })
-                    .then(() => refreshLedger())
-                    .catch(() => undefined);
+                  void runExtraction({ startDir: projectRoot }, "command palette").then(
+                    (report) => {
+                      if (report) void refreshLedger();
+                    },
+                  );
                 },
               },
             ]}
@@ -629,6 +739,25 @@ export default function App() {
           />
         ) : null}
       </AnimatePresence>
+      {backgroundNotices.length > 0 ? (
+        <div className="bg-notices" role="status" aria-live="polite">
+          {backgroundNotices.map((notice) => (
+            <div key={notice.id} className="bg-notice">
+              <AlertTriangle size={14} aria-hidden />
+              <span>{notice.text}</span>
+              <button
+                type="button"
+                aria-label="Dismiss"
+                onClick={() =>
+                  setBackgroundNotices((current) => current.filter((n) => n.id !== notice.id))
+                }
+              >
+                <X size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
       </motion.div>
     </LayoutGroup>
   );
@@ -638,6 +767,7 @@ function Rail(props: {
   activeKind: PaneKind;
   pendingCount: number;
   onOpen: (kind: PaneKind) => void;
+  onOpenPalette: () => void;
   reduceMotion: boolean;
 }) {
   return (
@@ -645,6 +775,19 @@ function Rail(props: {
       <button className="brand" aria-label="Grafiki home" onClick={() => props.onOpen("home")}>
         <span className="brand-mark">G</span>
         <span className="brand-text">Grafiki</span>
+      </button>
+
+      {/* The palette is the app's fastest entry point — without a visible
+          signifier it simply doesn't exist for a new user (DESIGN.md §5). */}
+      <button
+        className="rail-search"
+        type="button"
+        onClick={props.onOpenPalette}
+        title="Search commands or ask your memory (⌘K)"
+      >
+        <Search size={14} />
+        <span>Search…</span>
+        <kbd>⌘K</kbd>
       </button>
 
       <nav className="rail-nav" aria-label="Primary">
@@ -697,18 +840,26 @@ function TopStatus(props: {
       </div>
 
       <div className="status-cluster">
-        <StatusPill tone={memoryAvailable ? "good" : "warn"} icon={memoryAvailable ? CheckCircle2 : AlertTriangle}>
-          {memoryAvailable ? "Memory online" : "Initialize needed"}
-        </StatusPill>
+        {props.snapshot?.error ? (
+          // A failing backend is NOT "not initialized" — telling a healthy
+          // project to re-initialize is the classic misdiagnosis (audit H1).
+          <StatusPill tone="warn" icon={AlertTriangle} title={props.snapshot.error}>
+            Backend error
+          </StatusPill>
+        ) : (
+          <StatusPill tone={memoryAvailable ? "good" : "warn"} icon={memoryAvailable ? CheckCircle2 : AlertTriangle}>
+            {memoryAvailable ? "Memory online" : "Initialize needed"}
+          </StatusPill>
+        )}
         {embedding && embedding.embeddable_records > 0 ? (
           <StatusPill
             tone="accent"
             icon={Sparkles}
-            title={`${embedding.fresh_records}/${embedding.embeddable_records} records embedded`}
+            title={`${embedding.fresh_records}/${embedding.embeddable_records} records embedded and searchable`}
           >
             {embedding.fresh_records >= embedding.embeddable_records
               ? "Memory up to date"
-              : `${embedding.embeddable_records - embedding.fresh_records} to embed`}
+              : `${embedding.embeddable_records - embedding.fresh_records} ${embedding.embeddable_records - embedding.fresh_records === 1 ? "memory" : "memories"} indexing`}
           </StatusPill>
         ) : null}
         <button
@@ -791,12 +942,17 @@ function MemoryPane(props: {
       ) : null}
 
       <div className={`pane-body ${pane.kind === "terminal" || pane.kind === "chat" ? "fill" : ""}`}>
+        {/* Pane-scoped boundary: one view's render crash (e.g. a malformed
+            candidate payload) must not take down the rail and a live terminal
+            with it — the app-level boundary is the last resort, not the first. */}
+        <ErrorBoundary compact>
         {pane.kind === "home" ? (
           <HomePane
             snapshot={props.snapshot}
             projectRoot={props.projectRoot}
             ledger={props.ledger}
             onNavigate={props.onNavigate}
+            onRefreshLedger={props.onRefreshLedger}
           />
         ) : null}
         {pane.kind === "session" ? (
@@ -822,6 +978,7 @@ function MemoryPane(props: {
             onUpdate={props.onUpdate}
             onOpenResult={props.onOpenResult}
             onNavigate={props.onNavigate}
+            onMemoryChanged={props.onMemoryChanged}
           />
         ) : null}
         {pane.kind === "candidates" ? (
@@ -856,6 +1013,7 @@ function MemoryPane(props: {
             onMemoryChanged={props.onMemoryChanged}
           />
         ) : null}
+        </ErrorBoundary>
       </div>
     </motion.article>
   );
@@ -983,6 +1141,7 @@ function CommandPalette(props: {
 }) {
   const [query, setQuery] = useState("");
   const [index, setIndex] = useState(0);
+  const dialogRef = useModalDialog<HTMLDivElement>(props.onClose);
 
   const q = query.trim().toLowerCase();
   const matches = props.actions.filter((action) => action.label.toLowerCase().includes(q));
@@ -1011,9 +1170,12 @@ function CommandPalette(props: {
       transition={transition.quick}
     >
       <motion.div
+        ref={dialogRef}
         className="palette"
         role="dialog"
+        aria-modal="true"
         aria-label="Command palette"
+        tabIndex={-1}
         onMouseDown={(event) => event.stopPropagation()}
         initial={{ opacity: 0, y: -8 }}
         animate={{ opacity: 1, y: 0 }}
@@ -1022,6 +1184,11 @@ function CommandPalette(props: {
         <input
           autoFocus
           aria-label="Command or question"
+          role="combobox"
+          aria-autocomplete="list"
+          aria-expanded="true"
+          aria-controls="command-palette-options"
+          aria-activedescendant={total > 0 ? `command-option-${clamped}` : undefined}
           value={query}
           placeholder="Type a command, or ask your memory…"
           onChange={(event) => {
@@ -1043,10 +1210,13 @@ function CommandPalette(props: {
             }
           }}
         />
-        <div className="palette-list">
+        <div className="palette-list" id="command-palette-options" role="listbox">
           {matches.map((action, position) => (
             <div
               key={action.id}
+              id={`command-option-${position}`}
+              role="option"
+              aria-selected={position === clamped}
               className={`palette-row ${position === clamped ? "active" : ""}`}
               onMouseEnter={() => setIndex(position)}
               onClick={() => execute(position)}
@@ -1057,6 +1227,9 @@ function CommandPalette(props: {
           ))}
           {askRow ? (
             <div
+              id={`command-option-${matches.length}`}
+              role="option"
+              aria-selected={clamped === matches.length}
               className={`palette-row ${clamped === matches.length ? "active" : ""}`}
               onMouseEnter={() => setIndex(matches.length)}
               onClick={() => execute(matches.length)}
@@ -1124,11 +1297,11 @@ function SessionDetailPane(props: {
         </div>
       </div>
 
-      <div className="seg-tabs">
-        <button className={`seg-tab ${tab === "memories" ? "active" : ""}`} onClick={() => setTab("memories")}>
+      <div className="seg-tabs" role="tablist" aria-label="Session detail" onKeyDown={handleTablistKeyDown}>
+        <button role="tab" aria-selected={tab === "memories"} className={`seg-tab ${tab === "memories" ? "active" : ""}`} onClick={() => setTab("memories")}>
           Memories ({detail.memories.length})
         </button>
-        <button className={`seg-tab ${tab === "events" ? "active" : ""}`} onClick={() => setTab("events")}>
+        <button role="tab" aria-selected={tab === "events"} className={`seg-tab ${tab === "events" ? "active" : ""}`} onClick={() => setTab("events")}>
           Raw events ({detail.events.length})
         </button>
       </div>
@@ -1240,6 +1413,7 @@ function HomePane(props: {
   projectRoot: string;
   ledger: HomeLedgerReport | null;
   onNavigate: (kind: PaneKind, patch?: Partial<PaneState>) => void;
+  onRefreshLedger: () => void;
 }) {
   const [ask, setAsk] = useState("");
   const ledger = props.ledger?.ledger;
@@ -1263,17 +1437,29 @@ function HomePane(props: {
   // with the identical symptom — an empty Home — leaving a working user
   // convinced the app was broken (2026-07-04 don-norman-design-critic, H1).
   const [pipelineIssue, setPipelineIssue] = useState<string | null>(null);
+  // Set when the issue is fixable with one click (capture off) — the hint
+  // then renders a "Turn on capture" action instead of a settings scavenger hunt.
+  const [pipelineFix, setPipelineFix] = useState<"enable-capture" | null>(null);
+  const [pipelineFixBusy, setPipelineFixBusy] = useState(false);
+  const [pipelineCheck, setPipelineCheck] = useState(0);
   useEffect(() => {
     let cancelled = false;
+    setPipelineFix(null);
     if (!props.snapshot?.memory_available) {
-      setPipelineIssue("This folder isn't initialized — set it up in Settings to start remembering.");
+      // A failing backend is not "not initialized" — don't misdiagnose (audit H1).
+      setPipelineIssue(
+        props.snapshot?.error
+          ? `Grafiki backend error — memory is temporarily unavailable: ${props.snapshot.error}`
+          : "This folder isn't initialized — set it up in Settings to start remembering.",
+      );
       return;
     }
     getCaptureConfig({ startDir: props.projectRoot })
       .then((config) => {
         if (cancelled) return;
         if (!config.config.sources.terminal || config.config.terminal_output === "off") {
-          setPipelineIssue("Terminal capture is off — turn it on in Settings → Capture Consent.");
+          setPipelineIssue("Terminal capture is off, so sessions aren't being remembered.");
+          setPipelineFix("enable-capture");
           return;
         }
         return listLocalModels().then((models) => {
@@ -1285,18 +1471,33 @@ function HomePane(props: {
           );
         });
       })
-      .catch(() => {
-        if (!cancelled) setPipelineIssue(null);
+      .catch((checkError) => {
+        // The one surface built to explain silent failure must not itself
+        // fail silently (it used to hide the banner here).
+        if (!cancelled) setPipelineIssue(`Couldn't check the capture pipeline: ${String(checkError)}`);
       });
     return () => {
       cancelled = true;
     };
-  }, [props.projectRoot, props.snapshot?.memory_available]);
+  }, [props.projectRoot, props.snapshot?.memory_available, pipelineCheck]);
+
+  const enableCaptureNow = () => {
+    setPipelineFixBusy(true);
+    updateCaptureConfig({ startDir: props.projectRoot, terminal: true, terminalOutput: "full" })
+      .then(() => {
+        setPipelineCheck((n) => n + 1);
+        props.onRefreshLedger();
+      })
+      .catch((enableError) => notifyBackground(`Couldn't turn on capture: ${String(enableError)}`))
+      .finally(() => setPipelineFixBusy(false));
+  };
 
   const submitAsk = () => {
     const question = ask.trim();
     if (!question) return;
-    props.onNavigate("chat", { query: question, title: `Memory: ${question}` });
+    // The full question still travels as `query`; only the pane TITLE is
+    // clamped — an unbounded title collapsed the chat layout to zero height.
+    props.onNavigate("chat", { query: question, title: `Memory: ${clampTitle(question)}` });
   };
 
   const resume = () => {
@@ -1305,7 +1506,12 @@ function HomePane(props: {
     // pane's attach-miss path revives from the on-disk descriptor.
     localStorage.setItem(
       terminalStorageKey(props.projectRoot),
-      JSON.stringify({ id: resumable.id, launch: resumable.launch }),
+      JSON.stringify({
+        id: resumable.id,
+        launch: resumable.launch,
+        captureId: resumable.capture_id,
+        captureMode: resumable.capture_mode,
+      }),
     );
     props.onNavigate("terminal");
   };
@@ -1329,7 +1535,24 @@ function HomePane(props: {
           {tidyPath(projectLabel)}
           {props.snapshot?.memory_available ? "" : " · initialize in Settings"}
         </p>
-        {pipelineIssue ? <p className="home-pipeline-hint">{pipelineIssue}</p> : null}
+        {pipelineIssue ? (
+          <p className="home-pipeline-hint">
+            {pipelineIssue}
+            {pipelineFix === "enable-capture" ? (
+              <>
+                {" "}
+                <button
+                  className="link-button"
+                  type="button"
+                  disabled={pipelineFixBusy}
+                  onClick={enableCaptureNow}
+                >
+                  {pipelineFixBusy ? "Turning on…" : "Turn on capture"}
+                </button>
+              </>
+            ) : null}
+          </p>
+        ) : null}
 
         <div className="stat-strip">
           <div className={`stat-card ${(ledger?.sessions_week ?? 0) === 0 ? "stat-card--muted" : ""}`}>
@@ -1453,7 +1676,8 @@ function HomePane(props: {
             <div key={group.day}>
               <div className="ledger-day">{group.day}</div>
               {group.items.map((session) => (
-                <div
+                <button
+                  type="button"
                   key={session.id}
                   className="ledger-row"
                   onClick={() =>
@@ -1488,7 +1712,7 @@ function HomePane(props: {
                     </span>
                   ) : null}
                   <span className="ledger-time">{ledgerTimeLabel(session.started_at)}</span>
-                </div>
+                </button>
               ))}
             </div>
           ))
@@ -1523,7 +1747,12 @@ function HomePane(props: {
   );
 }
 
-type TerminalSessionRef = { id: string; launch: string };
+type TerminalSessionRef = {
+  id: string;
+  launch: string;
+  captureId?: string | null;
+  captureMode?: "off" | "digest" | "full";
+};
 
 function terminalStorageKey(projectRoot: string) {
   return `grafiki-terminal:${projectRoot}`;
@@ -1594,6 +1823,13 @@ function SessionsHost(props: {
 }) {
   const [list, setList] = useState<TerminalSessionRef[]>(() => loadSessionList(props.projectRoot));
   const [activeId, setActiveId] = useState<string | null>(() => {
+    // An explicit launch request must start in launcher/spawn mode on the VERY
+    // first render — TerminalPane's spawn effect runs once on mount, so if the
+    // last tab is adopted here first, the launch (and its handoff prompt) is
+    // consumed as a no-op before the mount effect below can correct it.
+    if (props.initialLaunch !== undefined && !loadTerminalSession(props.projectRoot)) {
+      return null;
+    }
     const l = loadSessionList(props.projectRoot);
     return l.length ? l[l.length - 1].id : null;
   });
@@ -1610,8 +1846,14 @@ function SessionsHost(props: {
       if (!next.some((s) => s.id === legacy.id)) next = [...next, legacy];
       active = legacy.id;
     }
+    if (props.initialLaunch !== undefined && !legacy) {
+      // An explicit launch request (palette "Start …", Memory's "Continue this
+      // with Claude", onboarding) must open a NEW session — adopting the last
+      // tab here silently discarded the launch and its handoff prompt.
+      active = null;
+    }
     setList(next);
-    setActiveId(active ?? (props.initialLaunch !== undefined ? null : active));
+    setActiveId(active);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.projectRoot]);
 
@@ -1626,17 +1868,27 @@ function SessionsHost(props: {
     setList((prev) => (prev.some((s) => s.id === ref.id) ? prev : [...prev, ref]));
     setActiveId(ref.id);
   };
+  const handleUpdated = (ref: TerminalSessionRef) => {
+    setList((previous) => previous.map((item) => (item.id === ref.id ? ref : item)));
+  };
   const dropSession = (id: string) => {
-    setList((prev) => {
-      const next = prev.filter((s) => s.id !== id);
-      setActiveId((cur) => (cur === id ? (next.length ? next[next.length - 1].id : null) : cur));
-      return next;
+    // State updaters must stay pure (StrictMode runs them twice) — compute the
+    // next active id from current state instead of setting state inside setList.
+    setList((prev) => prev.filter((s) => s.id !== id));
+    setActiveId((cur) => {
+      if (cur !== id) return cur;
+      const remaining = list.filter((s) => s.id !== id);
+      return remaining.length ? remaining[remaining.length - 1].id : null;
     });
   };
   // Closing a tab ends that session's process (only "End session"/close kills;
   // a plain tab switch keeps it running).
   const closeTab = (id: string) => {
-    void invoke("terminal_close", { id });
+    // The tab is dropped either way (the common failure is "already exited"),
+    // but a failed close means the PTY may still be running — say so.
+    invoke("terminal_close", { id }).catch((closeError) =>
+      notifyBackground(`Couldn't end the session cleanly: ${String(closeError)}`),
+    );
     sessionStorage.removeItem(`grafiki-terminal-launched:${id}`);
     dropSession(id);
   };
@@ -1648,24 +1900,34 @@ function SessionsHost(props: {
           {list.map((s) => (
             <div
               key={s.id}
-              role="tab"
-              tabIndex={0}
-              aria-selected={s.id === activeId}
-              className={`session-tab ${s.id === activeId ? "active" : ""}`}
-              onClick={() => setActiveId(s.id)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") {
-                  event.preventDefault();
-                  setActiveId(s.id);
-                }
-              }}
+              className={`session-tab-wrap ${s.id === activeId ? "active" : ""}`}
             >
-              <span className="session-tab-glyph">{agentGlyph(s.launch)}</span>
-              <span className="session-tab-label">{sessionTabTitle(s.launch)}</span>
-              <span
+              <button
+                type="button"
+                id={`session-tab-${s.id}`}
+                role="tab"
+                tabIndex={s.id === activeId ? 0 : -1}
+                aria-selected={s.id === activeId}
+                aria-controls="active-session-panel"
+                className="session-tab"
+                onClick={() => setActiveId(s.id)}
+                onKeyDown={(event) => {
+                  const currentIndex = list.findIndex((item) => item.id === s.id);
+                  const delta = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+                  if (!delta) return;
+                  event.preventDefault();
+                  const next = list[(currentIndex + delta + list.length) % list.length];
+                  setActiveId(next.id);
+                  requestAnimationFrame(() => document.getElementById(`session-tab-${next.id}`)?.focus());
+                }}
+              >
+                <span className="session-tab-glyph">{agentGlyph(s.launch)}</span>
+                <span className="session-tab-label">{sessionTabTitle(s.launch)}</span>
+              </button>
+              <button
+                type="button"
                 className="session-tab-close"
-                role="button"
-                aria-label="Close session"
+                aria-label={`End ${sessionTabTitle(s.launch)} session`}
                 title="End this session"
                 onClick={(event) => {
                   event.stopPropagation();
@@ -1673,7 +1935,7 @@ function SessionsHost(props: {
                 }}
               >
                 <X size={12} />
-              </span>
+              </button>
             </div>
           ))}
           <button className="session-tab-new" onClick={() => setActiveId(null)} title="New session">
@@ -1681,7 +1943,12 @@ function SessionsHost(props: {
           </button>
         </div>
       ) : null}
-      <div className="sessions-host-body">
+      <div
+        className="sessions-host-body"
+        id="active-session-panel"
+        role="tabpanel"
+        aria-labelledby={activeId ? `session-tab-${activeId}` : undefined}
+      >
         <TerminalPane
           projectRoot={props.projectRoot}
           fallbackCwd={props.fallbackCwd}
@@ -1689,6 +1956,7 @@ function SessionsHost(props: {
           handoffPrompt={props.handoffPrompt}
           sessionRef={active}
           onStarted={handleStarted}
+          onUpdated={handleUpdated}
           onEnded={dropSession}
         />
       </div>
@@ -1707,6 +1975,7 @@ function TerminalPane(props: {
   // Omit these props entirely for the standalone (uncontrolled) behavior.
   sessionRef?: TerminalSessionRef | null;
   onStarted?: (ref: TerminalSessionRef) => void;
+  onUpdated?: (ref: TerminalSessionRef) => void;
   onEnded?: (id: string) => void;
 }) {
   const controlled = props.sessionRef !== undefined;
@@ -1722,6 +1991,9 @@ function TerminalPane(props: {
   // isn't an initialized Grafiki project, so nothing is being recorded).
   const [capturing, setCapturing] = useState<boolean | null>(null);
   const [captureHint, setCaptureHint] = useState<string | null>(null);
+  const [captureMode, setCaptureMode] = useState<"off" | "digest" | "full">(
+    props.sessionRef?.captureMode ?? "off",
+  );
   // Pre-launch consent check, so the launcher screen can tell the truth about
   // whether this session will be captured instead of asserting it always is
   // (2026-07-04 don-norman-design-critic: this copy was unconditionally false
@@ -1733,6 +2005,7 @@ function TerminalPane(props: {
   // Set when the launcher just created `session`, so the effect spawns instead
   // of attaching. A ref (not state): StrictMode remounts must attach, not respawn.
   const spawnRef = useRef(false);
+  const captureIdRef = useRef<string | null | undefined>(session?.captureId);
 
   // Controlled mode: when the host switches the active tab, adopt that session.
   // The big attach/detach effect below then detaches the old PTY (keeping it
@@ -1746,6 +2019,9 @@ function TerminalPane(props: {
       setEnded(false);
       setError(null);
       setCapturing(null);
+      captureIdRef.current = props.sessionRef?.captureId;
+      setCaptureMode(props.sessionRef?.captureMode ?? "off");
+      setLens("terminal"); // lens is per-session; a shell tab has no chat lens
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.sessionRef?.id]);
@@ -1784,7 +2060,6 @@ function TerminalPane(props: {
   const [peek, setPeek] = useState<ExtractionCandidate[]>([]);
   const [peekBusy, setPeekBusy] = useState<string | null>(null);
   const [peekOpen, setPeekOpen] = useState(true);
-  const sessionStartRef = useRef(new Date().toISOString());
   const loadPeek = async () => {
     try {
       const candidates = await listCandidates({
@@ -1792,8 +2067,16 @@ function TerminalPane(props: {
         scope: "",
         status: "pending",
         limit: 50,
+        captureId: captureIdRef.current ?? undefined,
       });
-      setPeek(candidates.filter((candidate) => candidate.source_type === "capture:llm"));
+      setPeek(
+        candidates.filter(
+          (candidate) =>
+            candidate.source_type === "capture:llm" &&
+            Boolean(captureIdRef.current) &&
+            candidate.source === captureIdRef.current,
+        ),
+      );
     } catch {
       /* the peek is best-effort; the terminal must never suffer for it */
     }
@@ -1807,13 +2090,14 @@ function TerminalPane(props: {
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.id]);
-  const peekNew = peek.filter((candidate) => candidate.created_at >= sessionStartRef.current);
-  const peekOlder = peek.length - peekNew.length;
+  const peekNew = peek;
+  const peekOlder = 0;
 
   // The chat LENS: the same session rendered as a conversation (Claude Code
   // only — we tail its transcript with the parser capture already uses).
   const [lens, setLens] = useState<"terminal" | "chat">("terminal");
   const [turns, setTurns] = useState<LiveTranscriptTurn[]>([]);
+  const [transcriptError, setTranscriptError] = useState<string | null>(null);
   const [composer, setComposer] = useState("");
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const chatCapable = session?.launch === "claude";
@@ -1838,17 +2122,42 @@ function TerminalPane(props: {
   const termTailRef = useRef("");
   const [pendingPrompt, setPendingPrompt] = useState(false);
   useEffect(() => {
+    setTurns([]);
+    setTranscriptError(null);
+    termTailRef.current = "";
+    setPendingPrompt(false);
+    setPeek([]);
+  }, [session?.id]);
+  useEffect(() => {
     if (!session || lens !== "chat") {
       setPendingPrompt(false);
       return;
     }
     let cancelled = false;
     const load = () =>
-      getLiveTranscript({ startDir: props.projectRoot || props.fallbackCwd })
+      getLiveTranscript({
+        startDir: props.projectRoot || props.fallbackCwd,
+        terminalId: session.id,
+      })
         .then((next) => {
-          if (!cancelled) setTurns(next);
+          if (!cancelled) {
+            // Keep the previous array when nothing changed — a fresh array
+            // every 3s re-renders the entire bubble list of a long session.
+            setTurns((previous) =>
+              previous.length === next.length &&
+              JSON.stringify(previous[previous.length - 1] ?? null) ===
+                JSON.stringify(next[next.length - 1] ?? null)
+                ? previous
+                : next,
+            );
+            setTranscriptError(null);
+          }
         })
-        .catch(() => undefined);
+        .catch((transcriptLoadError) => {
+          if (!cancelled) {
+            setTranscriptError(`Chat view unavailable: ${String(transcriptLoadError)}`);
+          }
+        });
     void load();
     const timer = window.setInterval(() => {
       void load();
@@ -1869,11 +2178,15 @@ function TerminalPane(props: {
       scroller.scrollTop = scroller.scrollHeight;
     }
   }, [turns.length]);
-  const sendComposer = () => {
+  const sendComposer = async () => {
     const text = composer.trim();
-    if (!text || !session) return;
-    void invoke("terminal_write", { id: session.id, data: `${text}\r` });
-    setComposer("");
+    if (!text || !session || ended) return;
+    try {
+      await invoke("terminal_write", { id: session.id, data: `${text}\r` });
+      setComposer("");
+    } catch (writeError) {
+      setError(`Message was not sent: ${String(writeError)}`);
+    }
   };
 
   const reviewPeek = async (candidate: ExtractionCandidate, accept: boolean) => {
@@ -1885,8 +2198,12 @@ function TerminalPane(props: {
         await rejectCandidate({ startDir: props.projectRoot, id: candidate.id, rationale: "" });
       }
       await loadPeek();
-    } catch {
-      /* surfaced in Review if it matters */
+    } catch (peekError) {
+      // It was NOT surfaced anywhere before — the tick just un-spun and the
+      // candidate stayed put while the user believed it was approved.
+      notifyBackground(
+        `Couldn't ${accept ? "approve" : "dismiss"} "${candidateTitle(candidate)}": ${String(peekError)}`,
+      );
     } finally {
       setPeekBusy(null);
     }
@@ -1902,12 +2219,18 @@ function TerminalPane(props: {
       setError("The hosted terminal needs the desktop app — this is a browser preview.");
       return;
     }
+    let disposed = false;
+    let cleanup: (() => void) | undefined;
+    void Promise.all([import("@xterm/xterm"), import("@xterm/addon-fit")])
+      .then(([{ Terminal }, { FitAddon }]) => {
+    if (disposed || !containerRef.current) return;
     const id = session.id;
     const launch = session.launch;
-    const term = new XTerm({
+    const term = new Terminal({
       fontFamily: '"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace',
       fontSize: 13,
       cursorBlink: true,
+      screenReaderMode: true,
       scrollback: 5000,
       theme: { background: "#16181c", foreground: "#e8e6e0", cursor: "#ff7a33" },
     });
@@ -1921,9 +2244,14 @@ function TerminalPane(props: {
     channel.onmessage = (bytes) => {
       const chunk = new Uint8Array(bytes);
       term.write(chunk);
-      termTailRef.current = (termTailRef.current + tailDecoder.decode(chunk, { stream: true })).slice(
-        -4000,
-      );
+      const text = tailDecoder.decode(chunk, { stream: true });
+      // Backend exit sentinel (terminal.rs GRAFIKI_EXIT_SENTINEL): the child
+      // died while we were attached — flip the header/composer to "ended"
+      // instead of leaving a live dot over a dead PTY.
+      if (text.includes("\x1b]7777;grafiki-session-exited\x07")) {
+        setEnded(true);
+      }
+      termTailRef.current = (termTailRef.current + text).slice(-4000);
     };
 
     const resize = () => {
@@ -1970,12 +2298,23 @@ function TerminalPane(props: {
     };
 
     let cancelled = false;
+    // This session's capture id, pinned to THIS effect run. The shared
+    // captureIdRef is overwritten by the adoption effect before cleanup runs
+    // on a tab switch, so cleanup reading the ref would extract the WRONG
+    // (incoming) session's capture instead of the departing one.
+    let effectCaptureId: string | null | undefined = captureIdRef.current;
     const connect = async () => {
       try {
         if (spawnRef.current) {
           spawnRef.current = false;
           // Spawn the login shell (full PATH); the agent is typed in after.
-          const opened = await invoke<{ id: string; capturing: boolean; capture_hint: string | null }>("terminal_open", {
+          const opened = await invoke<{
+            id: string;
+            capturing: boolean;
+            capture_hint: string | null;
+            capture_id: string | null;
+            capture_mode: "off" | "digest" | "full";
+          }>("terminal_open", {
             id,
             cwd: props.projectRoot || props.fallbackCwd,
             command: "",
@@ -1987,6 +2326,16 @@ function TerminalPane(props: {
           if (!cancelled) {
             setCapturing(opened.capturing);
             setCaptureHint(opened.capture_hint);
+            setCaptureMode(opened.capture_mode);
+            captureIdRef.current = opened.capture_id;
+            effectCaptureId = opened.capture_id;
+            const nextRef = {
+              ...session,
+              captureId: opened.capture_id,
+              captureMode: opened.capture_mode,
+            };
+            setSession(nextRef);
+            props.onUpdated?.(nextRef);
             window.setTimeout(resize, 350); // refit after the pane settles
             scheduleType(launch);
             scheduleHandoff();
@@ -1999,6 +2348,8 @@ function TerminalPane(props: {
           cwd: string;
           capturing: boolean;
           capture_hint: string | null;
+          capture_id: string | null;
+          capture_mode: "off" | "digest" | "full";
         }>("terminal_attach", { id, onOutput: channel });
         if (cancelled) {
           return;
@@ -2012,6 +2363,8 @@ function TerminalPane(props: {
             cwd: string;
             capturing: boolean;
             capture_hint: string | null;
+            capture_id: string | null;
+            capture_mode: "off" | "digest" | "full";
           }>("terminal_revive", { id, rows: term.rows, cols: term.cols, onOutput: channel });
           if (cancelled) {
             return;
@@ -2029,12 +2382,32 @@ function TerminalPane(props: {
           }
           setCapturing(revive.capturing);
           setCaptureHint(revive.capture_hint);
+          setCaptureMode(revive.capture_mode);
+          captureIdRef.current = revive.capture_id;
+          effectCaptureId = revive.capture_id;
+          const revivedRef = {
+            ...session,
+            captureId: revive.capture_id,
+            captureMode: revive.capture_mode,
+          };
+          setSession(revivedRef);
+          props.onUpdated?.(revivedRef);
           // Resume the agent's own session where supported; otherwise relaunch it.
           scheduleType(revive.launch === "claude" ? "claude --continue" : revive.launch);
           return;
         }
         setCapturing(reply.capturing);
         setCaptureHint(reply.capture_hint);
+        setCaptureMode(reply.capture_mode);
+        captureIdRef.current = reply.capture_id;
+        effectCaptureId = reply.capture_id;
+        const attachedRef = {
+          ...session,
+          captureId: reply.capture_id,
+          captureMode: reply.capture_mode,
+        };
+        setSession(attachedRef);
+        props.onUpdated?.(attachedRef);
         if (reply.exited) {
           setEnded(true);
           return;
@@ -2060,13 +2433,16 @@ function TerminalPane(props: {
     term.focus();
 
     // The Granola heartbeat: periodically turn this session's captured output
-    // into Review candidates (backend is single-flight; silent — extraction
-    // must never disturb the terminal).
+    // into Review candidates (backend is single-flight; extraction must never
+    // disturb the terminal, but its failures surface as background notices).
     const extractTimer = window.setInterval(() => {
-      extractSessionMemory({ startDir: props.projectRoot }).catch(() => undefined);
+      void runExtraction(
+        { startDir: props.projectRoot, captureId: effectCaptureId },
+        "session heartbeat",
+      );
     }, 120_000);
 
-    return () => {
+    cleanup = () => {
       cancelled = true;
       if (launchTimer) {
         window.clearTimeout(launchTimer);
@@ -2080,10 +2456,22 @@ function TerminalPane(props: {
       // Detach ONLY — the session (and the agent) keeps running in the pool.
       void invoke("terminal_detach", { id });
       term.dispose();
-      // One more pass on the way out, so Review is fresh when the user lands there.
-      extractSessionMemory({ startDir: props.projectRoot }).catch(() => undefined);
+      // One more pass on the way out, so Review is fresh when the user lands
+      // there — pinned to the DEPARTING session's capture id (see above).
+      void runExtraction(
+        { startDir: props.projectRoot, captureId: effectCaptureId },
+        "session end",
+      );
     };
-  }, [session, props.projectRoot]);
+      })
+      .catch((loadError) => {
+        if (!disposed) setError(`Could not load the terminal renderer: ${String(loadError)}`);
+      });
+    return () => {
+      disposed = true;
+      cleanup?.();
+    };
+  }, [session?.id, props.projectRoot]);
 
   const endSession = () => {
     if (session) {
@@ -2099,6 +2487,12 @@ function TerminalPane(props: {
     setEnded(false);
     setError(null);
     setCapturing(null);
+    setCaptureMode("off");
+    // The lens is per-session state: without this reset the NEXT session opens
+    // straight into the Chat lens with the terminal (and its trust prompts)
+    // invisible — the pane never remounts across end→start.
+    setLens("terminal");
+    captureIdRef.current = null;
   };
 
   const startSession = (cmd: string) => {
@@ -2113,6 +2507,8 @@ function TerminalPane(props: {
     setEnded(false);
     setError(null);
     setCapturing(null);
+    setLens("terminal");
+    captureIdRef.current = null;
     setSession(next);
   };
 
@@ -2166,23 +2562,35 @@ function TerminalPane(props: {
           >
             {tidyPath(props.projectRoot || props.fallbackCwd || "this project")}
           </span>
-          {capturing === true ? <span className="chip chip-live">Capturing</span> : null}
+          {capturing === true ? (
+            <span className="chip chip-live">Capturing · {captureMode}</span>
+          ) : null}
           {capturing === false ? (
-            <span className="chip chip-warn" title={captureHint ?? "initialize this folder in Settings"}>
+            <span
+              className="chip chip-warn"
+              title={
+                (captureHint ?? "Turn on Terminal capture in Settings → Capture & privacy") +
+                " — capture is decided when a session starts, so it applies to the next session."
+              }
+            >
               Not capturing
             </span>
           ) : null}
         </div>
         {chatCapable ? (
-          <span className="seg-tabs lens-tabs">
+          <span className="seg-tabs lens-tabs" role="tablist" aria-label="Session view" onKeyDown={handleTablistKeyDown}>
             <button
               className={`seg-tab ${lens === "terminal" ? "active" : ""}`}
+              role="tab"
+              aria-selected={lens === "terminal"}
               onClick={() => setLens("terminal")}
             >
               Terminal
             </button>
             <button
               className={`seg-tab ${lens === "chat" ? "active" : ""}`}
+              role="tab"
+              aria-selected={lens === "chat"}
               onClick={() => setLens("chat")}
             >
               Chat
@@ -2206,6 +2614,8 @@ function TerminalPane(props: {
       <div style={{ flex: 1, minHeight: 0, display: "flex", gap: 10 }}>
         <div
           ref={containerRef}
+          role="region"
+          aria-label={`${sessionTabTitle(session.launch)} interactive terminal`}
           style={{
             flex: 1,
             minHeight: 0,
@@ -2228,6 +2638,11 @@ function TerminalPane(props: {
               </div>
             ) : null}
             <div className="chat-lens-scroll" ref={chatScrollRef}>
+              {transcriptError ? (
+                <div className="notice compact" role="alert">
+                  {transcriptError}
+                </div>
+              ) : null}
               {visibleTurns.length === 0 ? (
                 <p className="muted" style={{ margin: "auto", textAlign: "center" }}>
                   Waiting for the conversation… (the transcript appears after Claude's first
@@ -2242,16 +2657,19 @@ function TerminalPane(props: {
             <div className="search-box">
               <input
                 value={composer}
+                aria-label="Message the live Claude session"
                 placeholder="Message Claude… (sent to the live session)"
                 onChange={(event) => setComposer(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
                     event.preventDefault();
-                    sendComposer();
+                    void sendComposer();
                   }
                 }}
               />
-              <button onClick={sendComposer}>Send</button>
+              <button onClick={() => void sendComposer()} disabled={ended || !composer.trim()}>
+                Send
+              </button>
             </div>
           </div>
         ) : null}
@@ -2260,10 +2678,19 @@ function TerminalPane(props: {
             <div className="term-peek-title">Learned this session</div>
             {peekNew.length === 0 ? (
               <div className="peek-empty">
-                <p className="subtle">
-                  No durable memories captured yet. Grafiki is watching this session for
-                  decisions, fixes, and commands worth keeping.
-                </p>
+                {capturing === true ? (
+                  <p className="subtle">
+                    No durable memories captured yet. Grafiki is watching this session for
+                    decisions, fixes, and commands worth keeping.
+                  </p>
+                ) : capturing === false ? (
+                  <p className="subtle">
+                    Capture is off for this folder, so nothing is being learned from this
+                    session. Turn on Terminal capture in Settings → Capture &amp; privacy.
+                  </p>
+                ) : (
+                  <p className="subtle">No durable memories captured yet.</p>
+                )}
                 {capturing === true ? (
                   <ul className="watch-list">
                     <li>
@@ -2328,6 +2755,7 @@ function ChatPane(props: {
   onUpdate: (patch: Partial<PaneState>) => void;
   onOpenResult: (result: SearchResult) => void;
   onNavigate: (kind: PaneKind, patch?: Partial<PaneState>) => void;
+  onMemoryChanged: () => Promise<ProjectSnapshot>;
 }) {
   const [question, setQuestion] = useState("");
   const [scope, setScope] = useState(props.pane.scope ?? props.snapshot?.scope ?? "");
@@ -2339,23 +2767,116 @@ function ChatPane(props: {
     Array<{ question: string; reply: ChatReply | null; error: string | null }>
   >([]);
   const [sending, setSending] = useState(false);
-  const [memTab, setMemTab] = useState<"chat" | "decisions" | "context">("chat");
+  const [memTab, setMemTab] = useState<
+    "chat" | "search" | "decisions" | "context" | "activity"
+  >("chat");
   const [decisions, setDecisions] = useState<DecisionItem[] | null>(null);
   const [contexts, setContexts] = useState<ContextSummary[] | null>(null);
+  const [activity, setActivity] = useState<AgentQueryLogItem[] | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchMode, setSearchMode] = useState<SearchMode>("keyword");
+  const [searchRecordType, setSearchRecordType] = useState("all");
+  const [searchResults, setSearchResults] = useState<SearchResult[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [surfaceError, setSurfaceError] = useState<string | null>(null);
+  const [surfaceMessage, setSurfaceMessage] = useState<string | null>(null);
+  const [manualOpen, setManualOpen] = useState(false);
+  const [manualType, setManualType] = useState<"decision" | "context">("decision");
+  const [manualTitle, setManualTitle] = useState("");
+  const [manualContent, setManualContent] = useState("");
+  const [manualBusy, setManualBusy] = useState(false);
 
   useEffect(() => {
-    if (memTab === "decisions" && decisions === null) {
+    let cancelled = false;
+    if (memTab === "decisions") {
+      setDecisions(null);
       listProjectDecisions({ startDir: props.projectRoot, scope })
-        .then(setDecisions)
-        .catch(() => setDecisions([]));
+        .then((items) => {
+          if (!cancelled) setDecisions(items);
+        })
+        .catch(() => {
+          if (!cancelled) setDecisions([]);
+        });
     }
-    if (memTab === "context" && contexts === null) {
+    if (memTab === "context") {
+      setContexts(null);
       listProjectContext({ startDir: props.projectRoot, scope })
-        .then(setContexts)
-        .catch(() => setContexts([]));
+        .then((items) => {
+          if (!cancelled) setContexts(items);
+        })
+        .catch(() => {
+          if (!cancelled) setContexts([]);
+        });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [memTab]);
+    if (memTab === "activity") {
+      setActivity(null);
+      listAgentActivity({ startDir: props.projectRoot, scope, limit: 100 })
+        .then((items) => {
+          if (!cancelled) setActivity(items);
+        })
+        .catch((activityError) => {
+          if (!cancelled) {
+            setActivity([]);
+            setSurfaceError(String(activityError));
+          }
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [memTab, props.projectRoot, scope]);
+
+  async function runTrustedSearch() {
+    const query = searchQuery.trim();
+    if (!query || searching) return;
+    setSearching(true);
+    setSurfaceError(null);
+    try {
+      const report = await searchProjectMemory({
+        startDir: props.projectRoot,
+        query,
+        mode: searchMode,
+        scope,
+        recordType: searchRecordType,
+        limit: 100,
+      });
+      setSearchResults(report.results);
+      if (report.fallback) setSurfaceMessage(report.fallback);
+    } catch (searchError) {
+      setSurfaceError(String(searchError));
+      setSearchResults([]);
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  async function createManualMemory(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!manualTitle.trim() || !manualContent.trim() || manualBusy) return;
+    setManualBusy(true);
+    setSurfaceError(null);
+    setSurfaceMessage(null);
+    try {
+      const result = await captureMemory({
+        startDir: props.projectRoot,
+        captureType: manualType,
+        title: manualTitle.trim(),
+        content: manualContent.trim(),
+        scope,
+        category: manualType === "context" ? "reference" : undefined,
+      });
+      setSurfaceMessage(result.message);
+      setManualTitle("");
+      setManualContent("");
+      setManualOpen(false);
+      await props.onMemoryChanged();
+      setMemTab(manualType === "decision" ? "decisions" : "context");
+    } catch (captureError) {
+      setSurfaceError(String(captureError));
+    } finally {
+      setManualBusy(false);
+    }
+  }
 
   // A question routed in from Home's ask bar starts the conversation.
   const askedInitial = useRef(false);
@@ -2428,30 +2949,180 @@ function ChatPane(props: {
       className="view-stack chat-view"
       style={{ display: "flex", flexDirection: "column", height: "100%", gap: 12 }}
     >
-      <div className="seg-tabs">
-        <button className={`seg-tab ${memTab === "chat" ? "active" : ""}`} onClick={() => setMemTab("chat")}>
+      <div className="seg-tabs" role="tablist" aria-label="Memory views" onKeyDown={handleTablistKeyDown}>
+        <button role="tab" aria-selected={memTab === "chat"} className={`seg-tab ${memTab === "chat" ? "active" : ""}`} onClick={() => setMemTab("chat")}>
           Ask
         </button>
         <button
+          role="tab"
+          aria-selected={memTab === "search"}
+          className={`seg-tab ${memTab === "search" ? "active" : ""}`}
+          onClick={() => setMemTab("search")}
+        >
+          Search
+        </button>
+        <button
           className={`seg-tab ${memTab === "decisions" ? "active" : ""}`}
+          role="tab"
+          aria-selected={memTab === "decisions"}
           onClick={() => setMemTab("decisions")}
         >
           Decisions
         </button>
         <button
           className={`seg-tab ${memTab === "context" ? "active" : ""}`}
+          role="tab"
+          aria-selected={memTab === "context"}
           onClick={() => setMemTab("context")}
         >
           Context
+        </button>
+        <button
+          role="tab"
+          aria-selected={memTab === "activity"}
+          className={`seg-tab ${memTab === "activity" ? "active" : ""}`}
+          onClick={() => setMemTab("activity")}
+        >
+          Agent activity
+        </button>
+      </div>
+      <div className="memory-surface-actions">
+        <button className="button primary btn-sm" type="button" onClick={() => setManualOpen((open) => !open)}>
+          <Plus size={14} /> New memory
         </button>
       </div>
       <p className="mem-caption">
         {memTab === "chat"
           ? "Answers come only from your approved memory — always with sources."
-          : memTab === "decisions"
-            ? "Durable project choices Grafiki can recall later — approved from review candidates."
-            : "Project context imported automatically from CLAUDE.md, git history, transcripts, and files."}
+          : memTab === "search"
+            ? "Search trusted memory exactly or semantically, scoped to the project area you choose."
+            : memTab === "decisions"
+              ? "Browse durable project choices Grafiki can recall later."
+              : memTab === "context"
+                ? "Browse trusted context imported or created for this project."
+                : "See which questions agents asked Grafiki and which memory records were returned."}
       </p>
+      {surfaceMessage ? <section className="notice compact good" role="status" aria-live="polite">{surfaceMessage}</section> : null}
+      {surfaceError ? <section className="notice compact" role="alert">{surfaceError}</section> : null}
+      {manualOpen ? (
+        <form className="manual-memory-form settings-editor" onSubmit={createManualMemory}>
+          <strong>Create trusted memory manually</strong>
+          <p className="muted">Use this for a decision or context you are intentionally recording yourself.</p>
+          <div className="settings-duo">
+            <label className="field-label">
+              <span>Memory type</span>
+              <select value={manualType} onChange={(event) => setManualType(event.target.value as "decision" | "context")}>
+                <option value="decision">Decision</option>
+                <option value="context">Context</option>
+              </select>
+            </label>
+            <label className="field-label">
+              <span>Scope</span>
+              <input value={scope} onChange={(event) => setScope(event.target.value)} placeholder="All memory" />
+            </label>
+          </div>
+          <label className="field-label">
+            <span>Title</span>
+            <input required value={manualTitle} onChange={(event) => setManualTitle(event.target.value)} />
+          </label>
+          <label className="field-label">
+            <span>{manualType === "decision" ? "Reasoning" : "Context"}</span>
+            <textarea required value={manualContent} onChange={(event) => setManualContent(event.target.value)} />
+          </label>
+          <div className="form-actions">
+            <button type="button" className="button secondary" onClick={() => setManualOpen(false)}>Cancel</button>
+            <button className="button primary" disabled={manualBusy || !manualTitle.trim() || !manualContent.trim()}>
+              {manualBusy ? "Saving…" : "Save memory"}
+            </button>
+          </div>
+        </form>
+      ) : null}
+      {memTab === "search" ? (
+        <div className="mem-tab-panel" role="tabpanel">
+          <form
+            className="trusted-search-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void runTrustedSearch();
+            }}
+          >
+            <label className="field-label trusted-search-query">
+              <span>Search trusted memory</span>
+              <input
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                placeholder="Exact words, decision, file, or concept"
+              />
+            </label>
+            <label className="compact-select">
+              <span>Match</span>
+              <select value={searchMode} onChange={(event) => setSearchMode(event.target.value as SearchMode)}>
+                <option value="keyword">Exact / keyword</option>
+                <option value="semantic">Semantic</option>
+                <option value="hybrid">Hybrid</option>
+              </select>
+            </label>
+            <label className="compact-select">
+              <span>Type</span>
+              <select value={searchRecordType} onChange={(event) => setSearchRecordType(event.target.value)}>
+                <option value="all">All trusted memory</option>
+                <option value="decision">Decisions</option>
+                <option value="context">Context</option>
+                <option value="state">State</option>
+                <option value="entity">Entities</option>
+                <option value="observation">Observations</option>
+                <option value="session">Sessions</option>
+              </select>
+            </label>
+            <label className="field-label">
+              <span>Scope</span>
+              <input value={scope} onChange={(event) => setScope(event.target.value)} placeholder="All scopes" />
+            </label>
+            <button className="button primary" disabled={searching || !searchQuery.trim()}>
+              {searching ? "Searching…" : "Search"}
+            </button>
+          </form>
+          {searchResults === null ? (
+            <EmptyRecordList text="Enter a query to search trusted memory." />
+          ) : searchResults.length === 0 ? (
+            <EmptyRecordList text="No trusted memory matched this query and scope." />
+          ) : (
+            <div className="dense-list" aria-label="Trusted memory search results">
+              {searchResults.map((result) => (
+                <button
+                  type="button"
+                  key={`${result.record_type}-${result.id}`}
+                  className="data-row data-row-button"
+                  onClick={() => props.onOpenResult(result)}
+                >
+                  <span className="record-type">{result.record_type}</span>
+                  <b>{result.title}</b>
+                  <span className="subtle">{typeof result.score === "number" ? result.score.toFixed(3) : result.scope || "global"}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      ) : null}
+      {memTab === "activity" ? (
+        <div className="mem-tab-panel" role="tabpanel">
+          {activity === null ? (
+            <p className="muted" role="status">Loading agent activity…</p>
+          ) : activity.length === 0 ? (
+            <EmptyRecordList text="No agent memory queries have been recorded for this scope." />
+          ) : (
+            <div className="dense-list" aria-label="Agent activity">
+              {activity.map((item) => (
+                <div className="data-row agent-activity-row" key={item.id}>
+                  <span className="record-type">{item.agent}</span>
+                  <span>{item.question}</span>
+                  <code>{item.returned_ids.length} records · {item.latency_ms} ms</code>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ) : null}
       {memTab === "decisions" ? (
         <div className="mem-tab-panel">
           {decisions === null ? (
@@ -2470,9 +3141,10 @@ function ChatPane(props: {
           ) : (
             <div className="dense-list">
               {decisions.map((decision) => (
-              <div
+              <button
+                type="button"
                 key={decision.id}
-                className="data-row"
+                className="data-row data-row-button"
                 style={{ cursor: "pointer" }}
                 onClick={() =>
                   props.onOpenResult({
@@ -2489,7 +3161,7 @@ function ChatPane(props: {
                 <span className="subtle" style={{ marginLeft: "auto" }}>
                   {decision.status}
                 </span>
-              </div>
+              </button>
               ))}
             </div>
           )}
@@ -2513,9 +3185,10 @@ function ChatPane(props: {
           ) : (
             <div className="dense-list">
               {contexts.map((context) => (
-                <div
+                <button
+                  type="button"
                   key={context.key}
-                  className="data-row"
+                  className="data-row data-row-button"
                   style={{ cursor: "pointer" }}
                   onClick={() =>
                     props.onOpenResult({
@@ -2532,7 +3205,7 @@ function ChatPane(props: {
                   <span className="subtle" style={{ marginLeft: "auto" }}>
                     {context.category}
                   </span>
-                </div>
+                </button>
               ))}
             </div>
           )}
@@ -2717,6 +3390,7 @@ function CandidatesPane(props: {
   const [evidencePreview, setEvidencePreview] = useState<EvidenceLink | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const loadRequestRef = useRef(0);
   // Undo affordance for approve — the highest-blast-radius action in the queue
   // (it briefs future agent sessions) previously had no way back at all
   // (2026-07-04 don-norman-design-critic, H3). Cleared after a short window.
@@ -2727,9 +3401,17 @@ function CandidatesPane(props: {
   // (narrower) fetch — free-text scope was a source of silent empty queues.
   const [knownScopes, setKnownScopes] = useState<string[]>([]);
   useEffect(() => {
+    let cancelled = false; // a slow reply must not write the OLD project's scopes
     listCandidates({ startDir: props.startDir, scope: "", status: "all", limit: 200 })
-      .then((all) => setKnownScopes(Array.from(new Set(all.map((c) => c.scope))).sort()))
+      .then((all) => {
+        if (!cancelled) {
+          setKnownScopes(Array.from(new Set(all.map((c) => c.scope))).sort());
+        }
+      })
       .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
   }, [props.startDir]);
 
   function armUndo(ids: string[], label: string) {
@@ -2761,6 +3443,7 @@ function CandidatesPane(props: {
   const candidateGroups = useMemo(() => groupCandidates(visibleCandidates), [visibleCandidates]);
 
   async function load() {
+    const request = ++loadRequestRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -2770,6 +3453,7 @@ function CandidatesPane(props: {
         status,
         limit: 100,
       });
+      if (request !== loadRequestRef.current) return;
       setCandidates(nextCandidates);
       setSelectedIds((ids) =>
         ids.filter((id) => nextCandidates.some((candidate) => candidate.id === id && candidate.status === "pending")),
@@ -2779,27 +3463,28 @@ function CandidatesPane(props: {
         return nextCandidates.find((candidate) => candidate.status === "pending")?.id ?? nextCandidates[0]?.id ?? null;
       });
     } catch (listError) {
-      setError(String(listError));
+      if (request === loadRequestRef.current) setError(String(listError));
     } finally {
-      setLoading(false);
+      if (request === loadRequestRef.current) setLoading(false);
     }
   }
 
   useEffect(() => {
     load();
-  }, [props.startDir, props.snapshot, scope, status]);
+    // totalPendingCount doubles as a staleness signal: candidates created or
+    // resolved OUTSIDE this pane (heartbeat extraction, terminal peek) used to
+    // leave the list showing stale rows until a manual refresh.
+  }, [props.startDir, props.snapshot, scope, status, props.totalPendingCount]);
 
   // Opening Review runs one extraction pass over anything captured since the
   // last one (terminal output, transcripts), so fresh candidates are waiting.
   useEffect(() => {
     let cancelled = false;
-    extractSessionMemory({ startDir: props.startDir })
-      .then((report) => {
-        if (!cancelled && report && report.proposed > 0) {
-          void load();
-        }
-      })
-      .catch(() => undefined);
+    void runExtraction({ startDir: props.startDir }, "opening Review").then((report) => {
+      if (!cancelled && report && report.proposed > 0) {
+        void load();
+      }
+    });
     return () => {
       cancelled = true;
     };
@@ -2812,6 +3497,11 @@ function CandidatesPane(props: {
       // pressing `a`/`r` while reading another pane would silently mutate
       // trusted memory. Also ignore shortcuts while a prompt modal is open,
       // otherwise a keystroke could act on the candidate hidden behind it.
+      // System chords must pass through untouched — ⌘A is select-all, not
+      // approve; there is no native menu to intercept them first.
+      if (event.metaKey || event.ctrlKey || event.altKey) {
+        return;
+      }
       if (!props.active || promptModal) {
         return;
       }
@@ -3043,6 +3733,13 @@ function CandidatesPane(props: {
       setError(String(parseError));
       return;
     }
+    // Approval requires a title later; failing here beats saving a candidate
+    // that "updates successfully" and then dead-ends at Approve with a raw
+    // backend error.
+    if (typeof payload.title === "string" && !payload.title.trim()) {
+      setError("Title can't be empty — it's required when this candidate is approved.");
+      return;
+    }
 
     setBusyId(candidate.id);
     setMessage(null);
@@ -3220,7 +3917,10 @@ function CandidatesPane(props: {
             ))}
           </select>
         </label>
-        <label className="compact-input confidence-filter">
+        <label
+          className="compact-input confidence-filter"
+          title="How sure Grafiki was about an extraction (0–1). Candidates below this are hidden; 0 shows everything."
+        >
           <span>Min Confidence</span>
           <input
             type="number"
@@ -3247,8 +3947,9 @@ function CandidatesPane(props: {
           type="button"
           onClick={selectLowConfidence}
           disabled={!candidates.some((candidate) => candidate.status === "pending" && candidateIsNoisy(candidate))}
+          title="Select pending candidates that look like noise (low confidence or thin content)"
         >
-          Select low-signal
+          Select low-value
         </button>
         {candidates.length > 0 && visibleCandidates.length === 0 && minConfidenceValue > 0 ? (
           <span className="subtle">
@@ -3492,12 +4193,14 @@ function CandidatesPane(props: {
                 disabled={extracting}
                 onClick={() => {
                   setExtracting(true);
-                  void extractSessionMemory({ startDir: props.startDir })
+                  setError(null);
+                  extractSessionMemory({ startDir: props.startDir })
                     .then(() => load())
+                    .catch((extractError) => setError(String(extractError)))
                     .finally(() => setExtracting(false));
                 }}
               >
-                {extracting ? "Extracting…" : "Extract now"}
+                {extracting ? "Checking sessions…" : "Check sessions for new memories"}
               </button>
             }
           />
@@ -3550,46 +4253,75 @@ function SettingsPane(props: {
         .catch(() => setLocalModels([]));
     }
   }, [settingsTab, localModels]);
-  const copyToClipboard = (text: string, label: string) => {
-    void navigator.clipboard?.writeText(text);
-    setMessage(`${label} copied to clipboard.`);
+  const copyToClipboard = async (text: string, label: string) => {
+    setError(null);
+    try {
+      if (!navigator.clipboard) throw new Error("Clipboard access is unavailable.");
+      await navigator.clipboard.writeText(text);
+      setMessage(`${label} copied to clipboard.`);
+    } catch (clipboardError) {
+      setMessage(null);
+      setError(`Could not copy ${label.toLowerCase()}: ${String(clipboardError)}`);
+    }
   };
   // Only sources an actual capture path checks (2026-07-04 don-norman-design-critic:
   // ide/system/screen/browser/audio rendered as live-looking checkboxes that wrote
   // to the config file but gated nothing — false affordances in a consent surface
   // are worse than clutter). Re-add here the day each one gets a real producer.
+  // Terminal is deliberately absent here: capture only happens when the
+  // terminal source AND an output mode are both on, so the "Terminal capture"
+  // dropdown below is the single control that drives both fields — two
+  // controls for one effective state contradicted each other on screen.
   const captureSourceLabels: Array<[keyof CaptureSourceConfig, string]> = [
     ["git", "Git"],
     ["transcripts", "Transcripts"],
-    ["terminal", "Terminal"],
     ["files", "Files"],
   ];
+  const effectiveTerminalCapture: "off" | "digest" | "full" =
+    captureConfig && captureConfig.config.sources.terminal
+      ? captureConfig.config.terminal_output
+      : "off";
 
   useEffect(() => {
     setDraftRoot(props.projectRoot || snapshot?.start_dir || "");
   }, [props.projectRoot, snapshot?.start_dir]);
 
   useEffect(() => {
-    refreshDaemonStatus();
-    refreshCaptureConfig();
+    // Pass the fresh root explicitly: this effect runs in the same commit as
+    // the setDraftRoot above, so the functions' closures still hold the OLD
+    // project's draftRoot and would show the previous project's config.
+    const freshDir = props.projectRoot || snapshot?.start_dir || "";
+    refreshDaemonStatus(freshDir);
+    refreshCaptureConfig(freshDir);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.projectRoot, snapshot?.project?.project]);
 
-  async function refreshDaemonStatus() {
-    setDaemonBusy("status");
+  // The daemon can die (or be killed) outside this app; without a live check
+  // Settings kept saying "Running" indefinitely. Poll quietly while open.
+  useEffect(() => {
+    const timer = window.setInterval(() => refreshDaemonStatus(undefined, { silent: true }), 20_000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.projectRoot]);
+
+  async function refreshDaemonStatus(dir?: string, opts?: { silent?: boolean }) {
+    if (!opts?.silent) setDaemonBusy("status");
     try {
-      const next = await getDaemonStatus({ startDir: draftRoot || props.projectRoot || snapshot?.start_dir || "" });
+      const next = await getDaemonStatus({
+        startDir: dir ?? (draftRoot || props.projectRoot || snapshot?.start_dir || ""),
+      });
       setDaemonStatus(next);
       if (next.host) setDaemonHost(next.host);
       if (next.port) setDaemonPort(next.port);
     } catch (daemonError) {
-      setError(String(daemonError));
+      if (!opts?.silent) setError(String(daemonError));
     } finally {
-      setDaemonBusy(null);
+      if (!opts?.silent) setDaemonBusy(null);
     }
   }
 
-  async function refreshCaptureConfig() {
-    const startDir = draftRoot || props.projectRoot || snapshot?.start_dir || "";
+  async function refreshCaptureConfig(dir?: string) {
+    const startDir = dir ?? (draftRoot || props.projectRoot || snapshot?.start_dir || "");
     if (!startDir.trim()) return;
     setCaptureConfigBusy(true);
     try {
@@ -3761,9 +4493,16 @@ function SettingsPane(props: {
     }
   }
 
-  const mcpAddCommand = `claude mcp add grafiki -- grafiki mcp --path "${draftRoot || "."}"`;
+  const mcpAddCommand = `claude mcp add grafiki -- grafiki mcp --read-only --path "${draftRoot || "."}"`;
   const cursorJson = JSON.stringify(
-    { mcpServers: { grafiki: { command: "grafiki", args: ["mcp", "--path", draftRoot || "."] } } },
+    {
+      mcpServers: {
+        grafiki: {
+          command: "grafiki",
+          args: ["mcp", "--read-only", "--path", draftRoot || "."],
+        },
+      },
+    },
     null,
     2,
   );
@@ -3771,20 +4510,20 @@ function SettingsPane(props: {
 
   return (
     <div className="view-stack settings-stack">
-      <div className="seg-tabs">
-        <button className={`seg-tab ${settingsTab === "projects" ? "active" : ""}`} onClick={() => setSettingsTab("projects")}>
+      <div className="seg-tabs" role="tablist" aria-label="Settings sections" onKeyDown={handleTablistKeyDown}>
+        <button role="tab" aria-selected={settingsTab === "projects"} className={`seg-tab ${settingsTab === "projects" ? "active" : ""}`} onClick={() => setSettingsTab("projects")}>
           Projects
         </button>
-        <button className={`seg-tab ${settingsTab === "capture" ? "active" : ""}`} onClick={() => setSettingsTab("capture")}>
+        <button role="tab" aria-selected={settingsTab === "capture"} className={`seg-tab ${settingsTab === "capture" ? "active" : ""}`} onClick={() => setSettingsTab("capture")}>
           Capture & privacy
         </button>
-        <button className={`seg-tab ${settingsTab === "local-ai" ? "active" : ""}`} onClick={() => setSettingsTab("local-ai")}>
+        <button role="tab" aria-selected={settingsTab === "local-ai"} className={`seg-tab ${settingsTab === "local-ai" ? "active" : ""}`} onClick={() => setSettingsTab("local-ai")}>
           Local AI
         </button>
-        <button className={`seg-tab ${settingsTab === "hookups" ? "active" : ""}`} onClick={() => setSettingsTab("hookups")}>
+        <button role="tab" aria-selected={settingsTab === "hookups"} className={`seg-tab ${settingsTab === "hookups" ? "active" : ""}`} onClick={() => setSettingsTab("hookups")}>
           Agent hookups
         </button>
-        <button className={`seg-tab ${settingsTab === "about" ? "active" : ""}`} onClick={() => setSettingsTab("about")}>
+        <button role="tab" aria-selected={settingsTab === "about"} className={`seg-tab ${settingsTab === "about" ? "active" : ""}`} onClick={() => setSettingsTab("about")}>
           About
         </button>
       </div>
@@ -3861,11 +4600,16 @@ function SettingsPane(props: {
               <label className="field-label">
                 <span>Terminal capture</span>
                 <select
-                  value={captureConfig?.config.terminal_output ?? "off"}
+                  // key remounts the native select when the loaded value arrives or
+                  // changes — the embedded WebKit select can skip repainting its
+                  // label when only the bound value updates, showing a stale option.
+                  key={`terminal-capture-${captureConfig ? "ready" : "loading"}-${effectiveTerminalCapture}`}
+                  value={effectiveTerminalCapture}
                   disabled={captureConfigBusy || !captureConfig}
-                  onChange={(event) =>
-                    patchCaptureConfig({ terminalOutput: event.currentTarget.value as "off" | "digest" | "full" })
-                  }
+                  onChange={(event) => {
+                    const next = event.currentTarget.value as "off" | "digest" | "full";
+                    patchCaptureConfig({ terminalOutput: next, terminal: next !== "off" });
+                  }}
                 >
                   <option value="off">Off</option>
                   <option value="digest">Digest only</option>
@@ -3875,6 +4619,7 @@ function SettingsPane(props: {
               <label className="field-label">
                 <span>Screenshots</span>
                 <select
+                  key={`screen-policy-${captureConfig ? "ready" : "loading"}-${captureConfig?.config.screen_policy ?? "manual"}`}
                   value={captureConfig?.config.screen_policy ?? "manual"}
                   disabled={captureConfigBusy || !captureConfig}
                   onChange={(event) =>
@@ -3896,7 +4641,7 @@ function SettingsPane(props: {
               />
             </label>
             <div className="maintenance-actions">
-              <button className="button secondary" type="button" onClick={refreshCaptureConfig} disabled={captureConfigBusy || !draftRoot.trim()}>
+              <button className="button secondary" type="button" onClick={() => void refreshCaptureConfig()} disabled={captureConfigBusy || !draftRoot.trim()}>
                 <RefreshCcw size={15} />
                 Refresh
               </button>
@@ -4037,6 +4782,8 @@ function SettingsPane(props: {
               <label className="field-label">
                 <span>Token</span>
                 <input
+                  type="password"
+                  autoComplete="off"
                   value={daemonToken}
                   onChange={(event) => setDaemonToken(event.target.value)}
                   placeholder="auto-generated on Start"
@@ -4053,7 +4800,7 @@ function SettingsPane(props: {
               <div className="maintenance-actions">
                 <button
                   className="button secondary"
-                  onClick={refreshDaemonStatus}
+                  onClick={() => void refreshDaemonStatus()}
                   disabled={daemonBusy !== null || !draftRoot.trim()}
                 >
                   <RefreshCcw size={15} />
@@ -4238,10 +4985,16 @@ function DetailPane(props: {
     const isRelation = recordType === "relation";
     const needsTitle = recordType !== "observation" && !isRelation;
     const needsBody = recordType === "decision" || recordType === "observation" || recordType === "context";
-    if ((needsTitle && !editTitle.trim()) || (needsBody && !editBody.trim())) return;
+    if ((needsTitle && !editTitle.trim()) || (needsBody && !editBody.trim())) {
+      setActionError("Complete the required title and content fields before saving.");
+      return;
+    }
     const weight = Number(editWeight);
     const confidence = Number(editConfidence);
-    if (isRelation && (Number.isNaN(weight) || Number.isNaN(confidence))) return;
+    if (isRelation && (Number.isNaN(weight) || Number.isNaN(confidence))) {
+      setActionError("Relation weight and confidence must be valid numbers.");
+      return;
+    }
 
     setBusy(true);
     setMessage(null);
@@ -4594,6 +5347,20 @@ function Inspector(props: {
   const selectedType = detail?.record_type ?? props.selectedResult?.record_type;
   const selectedBody = detail?.body ?? props.selectedResult?.snippet;
   const selectedId = detail?.id ?? props.selectedResult?.id;
+  const [copyFeedback, setCopyFeedback] = useState<{ text: string; error: boolean } | null>(null);
+
+  useEffect(() => setCopyFeedback(null), [selectedId]);
+
+  const copySelectedId = async () => {
+    if (!selectedId) return;
+    try {
+      if (!navigator.clipboard) throw new Error("Clipboard access is unavailable.");
+      await navigator.clipboard.writeText(selectedId);
+      setCopyFeedback({ text: "Record ID copied.", error: false });
+    } catch (clipboardError) {
+      setCopyFeedback({ text: `Could not copy the record ID: ${String(clipboardError)}`, error: true });
+    }
+  };
 
   return (
     <motion.aside
@@ -4620,8 +5387,13 @@ function Inspector(props: {
           <code>{selectedId}</code>
           <div className="inspector-actions">
             <button onClick={props.onOpenDetail}>Detail</button>
-            {selectedId ? <button onClick={() => navigator.clipboard?.writeText(selectedId)}>Copy ID</button> : null}
+            {selectedId ? <button onClick={() => void copySelectedId()}>Copy ID</button> : null}
           </div>
+          {copyFeedback ? (
+            <p role={copyFeedback.error ? "alert" : "status"} aria-live="polite">
+              {copyFeedback.text}
+            </p>
+          ) : null}
         </section>
       ) : (
         <section className="inspector-section">
@@ -4973,4 +5745,3 @@ function Setting({ label, value, mono = false }: { label: string; value: string;
     </div>
   );
 }
-

@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use crate::config::EvalConfig;
 use crate::metrics::ir::AggregateScores;
 use crate::metrics::stats;
+use crate::runner::memory_qa::{report_mode, MemoryQaReport};
 use crate::runner::redaction::RedactionReport;
 use crate::runner::retrieval::{mode_label, RetrievalReport};
 use crate::runner::supersession::SupersessionReport;
@@ -215,6 +216,146 @@ pub fn retrieval_md(report: &RetrievalReport, cfg: &EvalConfig) -> String {
         "\n_Cost: ingest {} ms · search {} ms total._",
         report.ingest_ms, report.search_ms
     );
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Memory QA
+// ---------------------------------------------------------------------------
+
+pub fn memory_qa_json(report: &MemoryQaReport, cfg: &EvalConfig) -> Value {
+    let outcomes: Vec<Value> = report
+        .outcomes
+        .iter()
+        .map(|outcome| {
+            json!({
+                "question_id": outcome.question_id,
+                "question_type": outcome.question_type,
+                "abstain_expected": outcome.abstain_expected,
+                "abstained": outcome.abstained,
+                "answer_contains_gold": outcome.answer_contains_gold,
+                "gold_evidence": outcome.gold_evidence,
+                "retrieved_evidence": outcome.retrieved_evidence,
+            })
+        })
+        .collect();
+    let mut per_type = serde_json::Map::new();
+    for (question_type, scores) in &report.per_question_type {
+        per_type.insert(question_type.clone(), macro_only(scores));
+    }
+    json!({
+        "provenance": provenance(cfg, "configured local provider", None),
+        "arm": "memory-qa",
+        "dataset": report.dataset_name,
+        "mode": report_mode(report),
+        "approver": report.approver.label(),
+        "session_count": report.session_count,
+        "question_count": report.question_count,
+        "candidates": {
+            "proposed": report.candidate_count,
+            "approved": report.approved_count,
+            "rejected": report.rejected_count,
+        },
+        "semantic_available": report.semantic_available,
+        "fallback_count": report.fallback_count,
+        "answerable": aggregate_with_ci(&report.answerable, cfg),
+        "per_question_type": Value::Object(per_type),
+        "abstention_accuracy": report.abstention_accuracy,
+        "answer_contains_gold_rate": report.answer_contains_gold_rate,
+        "per_question": outcomes,
+        "cost": { "ingest_ms": report.ingest_ms, "search_ms": report.search_ms },
+    })
+}
+
+pub fn memory_qa_md(report: &MemoryQaReport, cfg: &EvalConfig) -> String {
+    let mut s = String::new();
+    let recall = report
+        .answerable
+        .macro_avg
+        .get("recall@10")
+        .copied()
+        .unwrap_or(0.0);
+    let ndcg = report
+        .answerable
+        .macro_avg
+        .get("ndcg@10")
+        .copied()
+        .unwrap_or(0.0);
+    let recall_ci = stats::bootstrap_ci(
+        &report.answerable.per_query_vector("recall@10"),
+        cfg.bootstrap,
+        cfg.seed,
+    );
+    let _ = writeln!(
+        s,
+        "# Grafiki eval — memory QA (`{}`)\n",
+        report.dataset_name
+    );
+    let _ = writeln!(
+        s,
+        "{} sessions · {} questions · mode `{}` · approver `{}`\n",
+        report.session_count,
+        report.question_count,
+        report_mode(report),
+        report.approver.label()
+    );
+    let _ = writeln!(s, "## Headline\n");
+    let _ = writeln!(s, "| metric | value |");
+    let _ = writeln!(s, "|---|---|");
+    let _ = writeln!(s, "| evidence nDCG@10 | {ndcg:.4} |");
+    let _ = writeln!(
+        s,
+        "| evidence Recall@10 | {recall:.4} [{:.4}, {:.4}] |",
+        recall_ci.ci_low, recall_ci.ci_high
+    );
+    let _ = writeln!(
+        s,
+        "| abstention accuracy | {:.4} |",
+        report.abstention_accuracy
+    );
+    let _ = writeln!(
+        s,
+        "| normalized gold-answer containment | {:.4} |",
+        report.answer_contains_gold_rate
+    );
+    let _ = writeln!(
+        s,
+        "| candidates proposed / approved / rejected | {} / {} / {} |",
+        report.candidate_count, report.approved_count, report.rejected_count
+    );
+    let _ = writeln!(s, "| retrieval fallbacks | {} |", report.fallback_count);
+
+    let _ = writeln!(s, "\n## Per question\n");
+    let _ = writeln!(
+        s,
+        "| question | type | gold evidence | retrieved evidence | abstain | answer match |"
+    );
+    let _ = writeln!(s, "|---|---|---|---|---|---|");
+    for outcome in &report.outcomes {
+        let abstain = if outcome.abstain_expected {
+            if outcome.abstained {
+                "✓"
+            } else {
+                "miss"
+            }
+        } else {
+            "n/a"
+        };
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} | {} | {} |",
+            outcome.question_id,
+            outcome.question_type,
+            outcome.gold_evidence.join(", "),
+            outcome.retrieved_evidence.join(", "),
+            abstain,
+            if outcome.answer_contains_gold {
+                "✓"
+            } else {
+                "·"
+            }
+        );
+    }
     s
 }
 
@@ -457,6 +598,7 @@ pub fn supersession_md(report: &SupersessionReport) -> String {
 pub fn check_regressions(
     baseline: &Value,
     retrieval: Option<&RetrievalReport>,
+    memory_qa: Option<&MemoryQaReport>,
     redaction: Option<&RedactionReport>,
     supersession: Option<&SupersessionReport>,
 ) -> Vec<String> {
@@ -472,6 +614,9 @@ pub fn check_regressions(
     if baseline.get("redaction").is_some() && redaction.is_none() {
         failures
             .push("baseline declares a `redaction` gate but the redaction arm was not run".into());
+    }
+    if baseline.get("memory_qa").is_some() && memory_qa.is_none() {
+        failures.push("baseline declares a `memory_qa` gate but that arm was not run".into());
     }
     if baseline.get("supersession").is_some() && supersession.is_none() {
         failures.push(
@@ -551,6 +696,55 @@ pub fn check_regressions(
         }
     }
 
+    if let (Some(rb), Some(rep)) = (baseline.get("memory_qa"), memory_qa) {
+        let expected_mode = rb
+            .get("primary_mode")
+            .and_then(|value| value.as_str())
+            .unwrap_or("keyword");
+        if report_mode(rep) != expected_mode {
+            failures.push(format!(
+                "baseline expects memory-QA mode '{expected_mode}' but '{}' was reported",
+                report_mode(rep)
+            ));
+        }
+        let tolerance = rb
+            .get("tolerance")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.05);
+        for (metric, baseline_key) in [("ndcg@10", "min_ndcg@10"), ("recall@10", "min_recall@10")] {
+            if let Some(floor) = rb.get(baseline_key).and_then(|value| value.as_f64()) {
+                let got = rep.answerable.macro_avg.get(metric).copied().unwrap_or(0.0);
+                if got < floor - tolerance {
+                    failures.push(format!(
+                        "memory-QA {metric} = {got:.4} < baseline {floor:.4} − tol {tolerance:.4}"
+                    ));
+                }
+            }
+        }
+        if let Some(floor) = rb
+            .get("min_abstention_accuracy")
+            .and_then(|value| value.as_f64())
+        {
+            if rep.abstention_accuracy < floor {
+                failures.push(format!(
+                    "memory-QA abstention accuracy = {:.4} < min {floor:.4}",
+                    rep.abstention_accuracy
+                ));
+            }
+        }
+        if let Some(floor) = rb
+            .get("min_answer_contains_gold_rate")
+            .and_then(|value| value.as_f64())
+        {
+            if rep.answer_contains_gold_rate < floor {
+                failures.push(format!(
+                    "memory-QA gold-answer containment = {:.4} < min {floor:.4}",
+                    rep.answer_contains_gold_rate
+                ));
+            }
+        }
+    }
+
     if let (Some(rb), Some(rep)) = (baseline.get("redaction"), redaction) {
         let max_leaks = rb.get("max_leaks").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         if rep.leaks.len() > max_leaks {
@@ -589,6 +783,7 @@ pub fn check_regressions(
 /// Build a `baseline.json` from a fresh run (used by `--write-baseline`).
 pub fn build_baseline(
     retrieval: Option<&RetrievalReport>,
+    memory_qa: Option<&MemoryQaReport>,
     redaction: Option<&RedactionReport>,
     supersession: Option<&SupersessionReport>,
     tolerance: f64,
@@ -611,6 +806,19 @@ pub fn build_baseline(
             }
             obj.insert("retrieval".into(), Value::Object(r));
         }
+    }
+    if let Some(rep) = memory_qa {
+        obj.insert(
+            "memory_qa".into(),
+            json!({
+                "primary_mode": report_mode(rep),
+                "tolerance": tolerance,
+                "min_ndcg@10": floor4(rep.answerable.macro_avg.get("ndcg@10").copied().unwrap_or(0.0)),
+                "min_recall@10": floor4(rep.answerable.macro_avg.get("recall@10").copied().unwrap_or(0.0)),
+                "min_abstention_accuracy": floor4(rep.abstention_accuracy),
+                "min_answer_contains_gold_rate": floor4(rep.answer_contains_gold_rate),
+            }),
+        );
     }
     if let Some(rep) = redaction {
         // max_leaks is hard-coded to 0: a secret leak is never an acceptable

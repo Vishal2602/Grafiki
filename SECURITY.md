@@ -24,7 +24,10 @@ Do not publish exploit details for:
 - Local-first storage under `~/.grafiki`.
 - No telemetry by default.
 - Non-local HTTP binds require explicit token configuration.
-- Capture ingest redacts obvious secrets before persistence.
+- HTTP daemons are project-bound, bounded before authentication, and reject filesystem escapes.
+- MCP is read-only by default; mutation requires explicit opt-in.
+- Capture ingest recursively redacts text and structured secret fields before persistence.
+- Passive capture workers re-check workspace consent on every pass.
 - Screen capture is explicit/manual in the desktop app.
 - Agent queries are logged locally for audit.
 

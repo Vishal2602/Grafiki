@@ -73,7 +73,14 @@ const q = {
     browser.waitUntil(() => q.exists(sel), {
       timeoutMsg: timeoutMsg ?? `${sel} never appeared`,
     }),
+  activeWithin: (sel) =>
+    browser.execute((s) => {
+      const root = document.querySelector(s);
+      return Boolean(root && document.activeElement && root.contains(document.activeElement));
+    }, sel),
 };
+
+const isolatedProject = `/tmp/grafiki-e2e-${Date.now()}`;
 
 /// First-run profiles boot into onboarding; configured ones restore whatever
 /// pane was persisted. Either way, land on Home.
@@ -87,7 +94,7 @@ async function landOnHome() {
   if (await q.exists(".onboarding")) {
     await q.clickByText("button", "Get started");
     await q.waitFor(".onboarding-folder input");
-    await q.setValue(".onboarding-folder input", `/tmp/grafiki-e2e-${Date.now()}`);
+    await q.setValue(".onboarding-folder input", isolatedProject);
     await q.clickByText("button", "Create memory here");
     await browser.waitUntil(
       async () => ((await q.text(".onboarding-step h1")) ?? "").includes("Local AI"),
@@ -104,7 +111,28 @@ async function landOnHome() {
   await q.waitFor(".home-title", "Home never rendered");
 }
 
+async function ensureIsolatedProject() {
+  const currentProject = await browser.execute(() =>
+    localStorage.getItem("grafiki.desktop.projectRoot"),
+  );
+  if (currentProject === isolatedProject) return;
+
+  await q.clickByText(".rail-item", "Settings");
+  await q.waitFor(".settings-grid");
+  await q.setValue(".settings-grid .field-label input", isolatedProject);
+  await q.clickByText(".settings-grid button", "Initialize");
+  await browser.waitUntil(
+    async () => ((await q.text(".notice.good")) ?? "").includes("initialized"),
+    { timeoutMsg: "isolated E2E project did not initialize" },
+  );
+}
+
 describe("Grafiki desktop", () => {
+  before(async () => {
+    await landOnHome();
+    await ensureIsolatedProject();
+  });
+
   it("boots to the Home ledger", async () => {
     await landOnHome();
     // "Today" only when a real today-group of sessions exists; a fresh
@@ -112,6 +140,9 @@ describe("Grafiki desktop", () => {
     // (2026-07-04 fix — the title used to lie and always say "Today").
     const title = await q.text(".home-title");
     if (title !== "Today" && title !== "Home") throw new Error(`home title was ${title}`);
+    await browser.waitUntil(async () => (await q.count(".stat-card")) === 3, {
+      timeoutMsg: "the outgoing animated Home pane did not unmount",
+    });
     const cards = await q.count(".stat-card");
     if (cards !== 3) throw new Error(`expected 3 stat cards, got ${cards}`);
     if (!(await q.exists(".ask-bar-wrap input"))) {
@@ -146,6 +177,77 @@ describe("Grafiki desktop", () => {
     await q.setValue(".palette input", "what did we decide about testing");
     await browser.keys(["Enter"]);
     await q.waitFor(".chat-view", "Memory chat did not open from the palette");
+  });
+
+  it("keeps keyboard focus inside the accessible command palette", async () => {
+    await landOnHome();
+    await browser.keys(["Meta", "k"]);
+    await q.waitFor('.palette[role="dialog"][aria-modal="true"]');
+    if (!(await q.activeWithin(".palette"))) {
+      throw new Error("palette did not move focus inside the dialog");
+    }
+    for (let index = 0; index < 12; index += 1) {
+      await browser.keys(["Tab"]);
+      if (!(await q.activeWithin(".palette"))) {
+        throw new Error(`focus escaped the palette after ${index + 1} Tab presses`);
+      }
+    }
+    await browser.keys(["Escape"]);
+    await browser.waitUntil(async () => !(await q.exists(".palette")), {
+      timeoutMsg: "Escape did not close the palette",
+    });
+  });
+
+  it("exposes trusted search, agent activity, and manual memory capture", async () => {
+    await landOnHome();
+    await q.clickByText(".rail-item", "Memory");
+    await q.waitFor(".chat-view");
+
+    await q.clickByText(".memory-surface-actions button", "New memory");
+    await q.waitFor(".manual-memory-form");
+    if (!(await q.exists('.manual-memory-form option[value="decision"]'))) {
+      throw new Error("manual decision capture is missing");
+    }
+    if (!(await q.exists('.manual-memory-form option[value="context"]'))) {
+      throw new Error("manual context capture is missing");
+    }
+
+    const title = `E2E decision ${Date.now()}`;
+    await q.setValue('.manual-memory-form input:not([placeholder="All memory"])', title);
+    await q.setValue(".manual-memory-form textarea", "Keep this unique decision as trusted memory.");
+    await q.clickByText(".manual-memory-form button", "Save memory");
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (expected) =>
+            [...document.querySelectorAll(".data-row-button")].some((row) =>
+              (row.textContent ?? "").includes(expected),
+            ),
+          title,
+        ),
+      { timeoutMsg: "the IPC-created decision did not reappear in the Decisions list" },
+    );
+
+    await q.clickByText('[role="tab"]', "Search");
+    await q.waitFor(".trusted-search-form");
+    const modes = await q.count('.trusted-search-form select option');
+    if (modes < 6) throw new Error(`trusted search filters missing; found ${modes} options`);
+    await q.setValue(".trusted-search-query input", title);
+    await q.clickByText(".trusted-search-form button", "Search");
+    await browser.waitUntil(
+      () =>
+        browser.execute(
+          (expected) =>
+            [...document.querySelectorAll(".data-row-button")].some((row) =>
+              (row.textContent ?? "").includes(expected),
+            ),
+          title,
+        ),
+      { timeoutMsg: "the IPC-created decision was not returned by exact search" },
+    );
+
+    await q.clickByText('[role="tab"]', "Agent activity");
+    await q.waitFor('.mem-tab-panel[role="tabpanel"]');
   });
 
   it("Review advertises its keyboard triage", async () => {

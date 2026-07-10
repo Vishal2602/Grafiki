@@ -235,6 +235,36 @@ pub fn load_capture_config(options: CaptureConfigOptions) -> Result<CaptureConfi
     })
 }
 
+/// Load capture consent without creating or repairing the configuration file.
+///
+/// Passive/background capture calls this fail-closed entry point on every pass:
+/// deleting, corrupting, or making the consent file unreadable must stop capture,
+/// never recreate an opt-in default behind the user's back.
+pub(crate) fn load_existing_capture_config(
+    options: CaptureConfigOptions,
+) -> Result<CaptureConfigReport> {
+    let project = resolve_project(ProjectResolveOptions {
+        project_name: options.project_name,
+        start_dir: options.start_dir,
+        grafiki_home: options.grafiki_home,
+    })?;
+    let config_path = capture_config_path(&project.project_dir);
+    if !config_path.is_file() {
+        return Err(GrafikiError::InvalidCaptureConfig(format!(
+            "passive capture requires an existing consent file at {}",
+            config_path.display()
+        )));
+    }
+    let config = read_capture_config(&config_path)?;
+    Ok(CaptureConfigReport {
+        project: project.project,
+        project_dir: project.project_dir,
+        config_path,
+        created: false,
+        config,
+    })
+}
+
 pub fn update_capture_config(options: UpdateCaptureConfigOptions) -> Result<CaptureConfigReport> {
     let project = resolve_project(ProjectResolveOptions {
         project_name: options.project_name,
@@ -514,6 +544,23 @@ pub fn resolve_project(options: ProjectResolveOptions) -> Result<ProjectContext>
         marker_path,
         db_path,
     })
+}
+
+/// Canonicalize `candidate` and require it to remain within canonical `root`.
+/// This is the shared filesystem trust boundary for callers that accept paths
+/// from IPC/HTTP; canonicalization closes both `..` traversal and symlink escape.
+pub fn canonical_descendant(root: &Path, candidate: &Path) -> Result<PathBuf> {
+    let root = root.canonicalize()?;
+    let candidate = candidate.canonicalize()?;
+    if candidate == root || candidate.starts_with(&root) {
+        Ok(candidate)
+    } else {
+        Err(GrafikiError::InvalidCaptureConfig(format!(
+            "path {} is outside project root {}",
+            candidate.display(),
+            root.display()
+        )))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -832,10 +879,32 @@ mod tests {
     use std::fs;
 
     use super::{
-        init_project, load_capture_config, resolve_project, update_capture_config,
-        CaptureConfigOptions, CaptureSourceUpdates, InitOptions, ProjectResolveOptions,
-        UpdateCaptureConfigOptions,
+        canonical_descendant, init_project, load_capture_config, resolve_project,
+        update_capture_config, CaptureConfigOptions, CaptureSourceUpdates, InitOptions,
+        ProjectResolveOptions, UpdateCaptureConfigOptions,
     };
+
+    #[test]
+    fn canonical_descendant_rejects_traversal_and_symlink_escape() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let outside = temp.path().join("outside.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("inside.txt"), "ok").unwrap();
+        fs::write(&outside, "secret").unwrap();
+
+        assert_eq!(
+            canonical_descendant(&root, &root.join("inside.txt")).unwrap(),
+            root.join("inside.txt").canonicalize().unwrap()
+        );
+        assert!(canonical_descendant(&root, &root.join("..").join("outside.txt")).is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.join("escape.txt")).unwrap();
+            assert!(canonical_descendant(&root, &root.join("escape.txt")).is_err());
+        }
+    }
 
     #[test]
     fn init_creates_marker_and_database() {

@@ -145,8 +145,9 @@ curl -fsS -X POST "http://127.0.0.1:$PORT/api/capture/auto" -H 'Content-Type: ap
 curl -fsS -X POST "http://127.0.0.1:$PORT/api/capture/start" -H 'Content-Type: application/json' -d '{"scope":"http/core","source_app":"codex"}' > "$TMP/http-capture-start.json"
 HTTP_CAPTURE_ID="$(node -e "const fs=require('fs'); console.log(JSON.parse(fs.readFileSync(process.argv[1], 'utf8')).capture.id)" "$TMP/http-capture-start.json")"
 curl -fsS -X POST "http://127.0.0.1:$PORT/api/capture/ingest" -H 'Content-Type: application/json' -d "{\"capture\":\"$HTTP_CAPTURE_ID\",\"scope\":\"http/core\",\"source_type\":\"screen\",\"source\":\"desktop\",\"title\":\"Review pane visible\",\"text\":\"Screen showed Grafiki memory review during HTTP smoke.\"}" > "$TMP/http-capture-ingest.json"
-printf '{"timestamp":"2026-05-31T00:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"Import my HTTP transcript."}}\n{"timestamp":"2026-05-31T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"HTTP transcript import keeps coding-agent history reviewable."}}\n' > "$TMP/http-codex-transcript.jsonl"
-curl -fsS -X POST "http://127.0.0.1:$PORT/api/capture/import-transcripts" -H 'Content-Type: application/json' -d "{\"scope\":\"http/core\",\"agent\":\"codex\",\"input\":\"$TMP/http-codex-transcript.jsonl\",\"summarize\":true}" > "$TMP/http-transcript-import.json"
+HTTP_TRANSCRIPT="$HTTP_DIR/http-codex-transcript.jsonl"
+printf '{"timestamp":"2026-05-31T00:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"Import my HTTP transcript."}}\n{"timestamp":"2026-05-31T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"HTTP transcript import keeps coding-agent history reviewable."}}\n' > "$HTTP_TRANSCRIPT"
+curl -fsS -X POST "http://127.0.0.1:$PORT/api/capture/import-transcripts" -H 'Content-Type: application/json' -d "{\"scope\":\"http/core\",\"agent\":\"codex\",\"input\":\"$HTTP_TRANSCRIPT\",\"summarize\":true}" > "$TMP/http-transcript-import.json"
 curl -fsS -X POST "http://127.0.0.1:$PORT/api/capture/terminal-command" -H 'Content-Type: application/json' -d '{"scope":"http/core","command":"npm run build","cwd":"'"$HTTP_DIR"'","exit_code":0,"duration_ms":55,"shell":"zsh"}' > "$TMP/http-terminal-command.json"
 curl -fsS -X POST "http://127.0.0.1:$PORT/api/capture/watch-files" -H 'Content-Type: application/json' -d '{"scope":"http/core","since_seconds":86400,"limit":10,"summarize":true}' > "$TMP/http-watch-files.json"
 curl -fsS -X POST "http://127.0.0.1:$PORT/api/capture/git-summary" -H 'Content-Type: application/json' -d '{"scope":"http/core","summarize":true}' > "$TMP/http-git-summary.json"
@@ -259,6 +260,11 @@ echo "== mcp =="
 printf 'MCP smoke rotates refresh tokens in this repo.\n' > "$HTTP_DIR/mcp.md"
 printf '{"timestamp":"2026-05-31T00:00:00Z","type":"event_msg","payload":{"type":"user_message","message":"Import my MCP transcript."}}\n{"timestamp":"2026-05-31T00:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"MCP transcript import keeps agent history reviewable."}}\n' > "$HTTP_DIR/mcp-codex-transcript.jsonl"
 printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"grafiki_start","arguments":{"goal":"Blocked MCP write","scope":"mcp/core"}}}' \
+  | GRAFIKI_HOME="$HOME_DIR" cargo run -q -p grafiki-cli -- mcp --project http --path "$HTTP_DIR" > "$TMP/mcp-read-only.out"
+grep -q 'running in read-only mode' "$TMP/mcp-read-only.out"
+
+printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"grafiki_start","arguments":{"goal":"Smoke MCP","scope":"mcp/core"}}}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"grafiki_handoff","arguments":{}}}' \
@@ -284,7 +290,7 @@ printf '%s\n' \
   "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"tools/call\",\"params\":{\"name\":\"grafiki_capture_terminal_command\",\"arguments\":{\"scope\":\"mcp/core\",\"command\":\"cargo fmt\",\"cwd\":\"$HTTP_DIR\",\"exit_code\":0,\"duration_ms\":10,\"shell\":\"zsh\"}}}" \
   '{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"grafiki_capture_watch_files","arguments":{"scope":"mcp/core","since_seconds":86400,"limit":10,"summarize":true}}}' \
   '{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"grafiki_capture_git_summary","arguments":{"scope":"mcp/core","summarize":true}}}' \
-  | GRAFIKI_HOME="$HOME_DIR" cargo run -q -p grafiki-cli -- mcp --project http --path "$HTTP_DIR" > "$TMP/mcp.out"
+  | GRAFIKI_HOME="$HOME_DIR" cargo run -q -p grafiki-cli -- mcp --project http --path "$HTTP_DIR" --allow-write > "$TMP/mcp.out"
 
 grep -q 'required' "$TMP/mcp.out"
 grep -q 'Grafiki Handoff' "$TMP/mcp.out"

@@ -1223,8 +1223,26 @@ pub fn handoff_session(options: HandoffOptions) -> Result<HandoffReport> {
     )?;
     let parent_session_id = match options.session_id {
         Some(id) => ensure_session_exists(&connection, &id)?,
-        None => latest_active_session(&connection, &project.project)?
-            .ok_or(GrafikiError::NoActiveSession)?,
+        // The natural flow is `end` then `handoff` — but `end` clears the
+        // active session, so a bare handoff used to dead-end here and demand
+        // a copy-pasted ULID. Fall back to the most recently ENDED session:
+        // that's the one whose summary/accomplishments the handoff needs.
+        None => match latest_active_session(&connection, &project.project)? {
+            Some(id) => id,
+            None => connection
+                .query_row(
+                    "
+                    SELECT id FROM sessions
+                    WHERE project = ?1 AND status = 'completed'
+                    ORDER BY ended_at DESC, id DESC
+                    LIMIT 1
+                    ",
+                    params![project.project],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or(GrafikiError::NoActiveSession)?,
+        },
     };
     let parent = load_session_snapshot(&connection, &parent_session_id)?;
     let scope = Scope::new(&parent.scope)?;
@@ -1380,8 +1398,10 @@ pub fn log_decision(options: LogDecisionOptions) -> Result<DecisionReport> {
     )?;
     let active_session = latest_active_session(&connection, &project.project)?;
     let decision_id = new_ulid();
-    let title = options.title.trim().to_owned();
-    let reasoning = options.reasoning;
+    let title = clamp_field(options.title.trim(), MAX_TITLE_CHARS);
+    let reasoning = options
+        .reasoning
+        .map(|value| clamp_field(&value, MAX_BODY_CHARS));
     let decision_embedding_text = format!("{} {}", title, reasoning.as_deref().unwrap_or(""));
 
     let tx = connection.transaction()?;
@@ -1494,7 +1514,7 @@ pub fn list_decisions(options: DecisionListOptions) -> Result<Vec<DecisionItem>>
             "
             SELECT id, title, status, scope, reasoning
             FROM decisions
-            WHERE scope IN ({scopes})
+            WHERE status != 'revoked' AND scope IN ({scopes})
             ORDER BY updated_at DESC, created_at DESC, id DESC
             ",
             &scope_chain,
@@ -1572,12 +1592,13 @@ pub fn delete_decision(options: DeleteDecisionOptions) -> Result<DecisionItem> {
     )?;
     let existing = load_decision_item(&connection, &options.id)?;
     let tx = connection.transaction()?;
+    delete_embedding_records(&tx, "decision", &options.id)?;
     tx.execute(
-        "UPDATE decisions SET superseded_by = NULL WHERE superseded_by = ?1",
+        "UPDATE decisions
+         SET status = 'revoked', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+         WHERE id = ?1",
         [&options.id],
     )?;
-    delete_embedding_records(&tx, "decision", &options.id)?;
-    tx.execute("DELETE FROM decisions WHERE id = ?1", [&options.id])?;
     tx.commit()?;
     Ok(existing)
 }
@@ -1717,8 +1738,13 @@ pub fn save_entity(options: SaveEntityOptions) -> Result<SaveEntityReport> {
         options.grafiki_home,
     )?;
     let active_session = latest_active_session(&connection, &project.project)?;
-    let entity_id = slugify(&options.name);
-    let entity_name = options.name.trim().to_owned();
+    let entity_name = clamp_field(options.name.trim(), MAX_TITLE_CHARS);
+    if entity_name.is_empty() {
+        return Err(GrafikiError::InvalidCandidate(
+            "entity name is required".to_owned(),
+        ));
+    }
+    let entity_id = entity_id_for_name(&connection, &entity_name)?;
     let entity_embedding_text = format!("{entity_name} {entity_type}");
     let created = entity_exists(&connection, &entity_id)?.not();
     let relation = options
@@ -1742,6 +1768,7 @@ pub fn save_entity(options: SaveEntityOptions) -> Result<SaveEntityReport> {
             name = excluded.name,
             entity_type = excluded.entity_type,
             scope = excluded.scope,
+            retired_at = NULL,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
         ",
         params![entity_id, entity_name, entity_type, scope.as_str()],
@@ -1780,7 +1807,7 @@ pub fn save_entity(options: SaveEntityOptions) -> Result<SaveEntityReport> {
     let observation_id = match options.observe {
         Some(content) => {
             let observation_id = new_ulid();
-            let observation_content = content.trim().to_owned();
+            let observation_content = clamp_field(content.trim(), MAX_BODY_CHARS);
             tx.execute(
                 "
                 INSERT INTO observations (id, entity_id, content, category, source)
@@ -1821,22 +1848,27 @@ pub fn save_entity(options: SaveEntityOptions) -> Result<SaveEntityReport> {
 
     let relation_id = match relation {
         Some((target_id, relation_type)) => {
-            let relation_id = new_ulid();
-            tx.execute(
+            let proposed_relation_id = new_ulid();
+            // `RETURNING id` yields the existing row's id on conflict. Returning
+            // the newly generated (discarded) id created dangling API reports and
+            // audit targets whenever the relation was an upsert.
+            let relation_id: String = tx.query_row(
                 "
                 INSERT INTO relations (id, from_entity, to_entity, relation, source)
                 VALUES (?1, ?2, ?3, ?4, ?5)
                 ON CONFLICT(from_entity, to_entity, relation) DO UPDATE SET
                     source = excluded.source,
                     valid_to = NULL
+                RETURNING id
                 ",
                 params![
-                    relation_id,
+                    proposed_relation_id,
                     entity_id,
                     target_id,
                     relation_type,
                     active_session.as_ref().map(|id| format!("session:{id}"))
                 ],
+                |row| row.get(0),
             )?;
             tx.execute(
                 "
@@ -1883,7 +1915,7 @@ pub fn list_entities(options: EntityListOptions) -> Result<Vec<GraphEntity>> {
                 "
                 SELECT id, name, entity_type, scope
                 FROM entities
-                WHERE entity_type = ? AND scope IN ({scopes})
+                WHERE retired_at IS NULL AND entity_type = ? AND scope IN ({scopes})
                 ORDER BY updated_at DESC, id ASC
                 ",
                 scope_chain.len(),
@@ -1903,7 +1935,7 @@ pub fn list_entities(options: EntityListOptions) -> Result<Vec<GraphEntity>> {
             "
             SELECT id, name, entity_type, scope
             FROM entities
-            WHERE scope IN ({scopes})
+            WHERE retired_at IS NULL AND scope IN ({scopes})
             ORDER BY updated_at DESC, id ASC
             ",
             &scope_chain,
@@ -1977,7 +2009,25 @@ pub fn delete_entity(options: DeleteEntityOptions) -> Result<GraphEntity> {
         delete_embedding_records(&tx, "observation", &observation_id)?;
     }
     delete_embedding_records(&tx, "entity", &options.id)?;
-    tx.execute("DELETE FROM entities WHERE id = ?1", [&options.id])?;
+    tx.execute(
+        "UPDATE observations
+         SET valid_to = COALESCE(valid_to, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+         WHERE entity_id = ?1",
+        [&options.id],
+    )?;
+    tx.execute(
+        "UPDATE relations
+         SET valid_to = COALESCE(valid_to, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+         WHERE from_entity = ?1 OR to_entity = ?1",
+        [&options.id],
+    )?;
+    tx.execute(
+        "UPDATE entities
+         SET retired_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+         WHERE id = ?1",
+        [&options.id],
+    )?;
     tx.commit()?;
     Ok(existing)
 }
@@ -1999,7 +2049,8 @@ pub fn list_observations(options: ObservationListOptions) -> Result<Vec<Observat
                 SELECT o.id, o.entity_id, e.name, o.content, o.category, o.confidence, e.scope
                 FROM observations o
                 JOIN entities e ON e.id = o.entity_id
-                WHERE o.valid_to IS NULL AND o.category = ? AND e.scope IN ({scopes})
+                WHERE o.valid_to IS NULL AND e.retired_at IS NULL
+                  AND o.category = ? AND e.scope IN ({scopes})
                 ORDER BY o.created_at DESC, o.id DESC
                 ",
                 scope_chain.len(),
@@ -2020,7 +2071,7 @@ pub fn list_observations(options: ObservationListOptions) -> Result<Vec<Observat
             SELECT o.id, o.entity_id, e.name, o.content, o.category, o.confidence, e.scope
             FROM observations o
             JOIN entities e ON e.id = o.entity_id
-            WHERE o.valid_to IS NULL AND e.scope IN ({scopes})
+            WHERE o.valid_to IS NULL AND e.retired_at IS NULL AND e.scope IN ({scopes})
             ORDER BY o.created_at DESC, o.id DESC
             ",
             &scope_chain,
@@ -2042,7 +2093,10 @@ pub fn update_observation(options: UpdateObservationOptions) -> Result<Observati
     )?;
     let active_session = latest_active_session(&connection, &project.project)?;
     let existing = load_observation_item(&connection, &options.id)?;
-    let content = options.content.unwrap_or(existing.content);
+    let content = options
+        .content
+        .map(|value| clamp_field(&value, MAX_BODY_CHARS))
+        .unwrap_or(existing.content);
     let category = category.unwrap_or(existing.category);
 
     let tx = connection.transaction()?;
@@ -2133,6 +2187,8 @@ pub fn list_relations(options: RelationListOptions) -> Result<Vec<GraphRelation>
         JOIN entities t ON t.id = r.to_entity
         WHERE r.valid_to IS NULL
           AND r.relation = ?
+          AND f.retired_at IS NULL
+          AND t.retired_at IS NULL
           AND f.scope IN ({placeholders})
           AND t.scope IN ({placeholders})
         ORDER BY r.created_at DESC, r.id DESC
@@ -2485,13 +2541,13 @@ pub fn ask_memory(options: AskMemoryOptions) -> Result<AgentMemoryBriefing> {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "unknown".to_owned());
     let limit = options.limit.clamp(1, 20);
-    let status = get_status(StatusOptions {
+    let mut status = get_status(StatusOptions {
         project_name: options.project_name.clone(),
         start_dir: options.start_dir.clone(),
         grafiki_home: options.grafiki_home.clone(),
         scope: scope.clone(),
     })?;
-    let search = search_memory(SearchMemoryOptions {
+    let mut search = search_memory(SearchMemoryOptions {
         project_name: options.project_name.clone(),
         start_dir: options.start_dir.clone(),
         grafiki_home: options.grafiki_home.clone(),
@@ -2502,6 +2558,15 @@ pub fn ask_memory(options: AskMemoryOptions) -> Result<AgentMemoryBriefing> {
         limit,
         temporal_weight: options.temporal_weight,
     })?;
+    status.active_state =
+        crate::context_budget::budget_ranked_strings(status.active_state, 1_200, 400);
+    status.active_sessions =
+        crate::context_budget::budget_ranked_strings(status.active_sessions, 900, 350);
+    status.recent_decisions =
+        crate::context_budget::budget_ranked_strings(status.recent_decisions, 1_000, 350);
+    status.recent_events =
+        crate::context_budget::budget_ranked_strings(status.recent_events, 700, 300);
+    search.results = budget_search_results(search.results, 4_800);
     let pending_candidates = list_candidates(ListCandidatesOptions {
         project_name: options.project_name.clone(),
         start_dir: options.start_dir.clone(),
@@ -2513,7 +2578,10 @@ pub fn ask_memory(options: AskMemoryOptions) -> Result<AgentMemoryBriefing> {
     })?
     .len();
 
-    let answer = format_agent_memory_answer(&status, &search, pending_candidates);
+    let answer = crate::context_budget::truncate_chars(
+        &format_agent_memory_answer(&status, &search, pending_candidates),
+        crate::context_budget::DEFAULT_CONTEXT_BUDGET_CHARS,
+    );
     let returned_ids = search
         .results
         .iter()
@@ -2655,8 +2723,46 @@ pub fn chat_with_provider(
             suspicious: crate::injection::is_suspicious(&result.snippet),
         })
         .collect();
+    let memories = crate::chat::budget_grounded_memories(
+        &memories,
+        crate::context_budget::DEFAULT_CONTEXT_BUDGET_CHARS
+            .saturating_sub(question.chars().count().min(1_000) + 32),
+    );
     let flagged_injection = memories.iter().any(|memory| memory.suspicious);
+
+    // Relevance gate for providers that can't judge it themselves (the
+    // extractive floor): retrieval matching one generic word used to present
+    // an unrelated memory as a confident, cited answer — the exact
+    // "confidently wrong" failure this product exists to prevent.
+    if !provider.judges_relevance()
+        && crate::chat::question_term_coverage(&question, &memories) < 0.5
+    {
+        return Ok(ChatReply {
+            question,
+            scope,
+            answer: NO_MEMORY_ANSWER.to_owned(),
+            citations: Vec::new(),
+            used_memory: false,
+            flagged_injection,
+        });
+    }
+
     let answer = provider.generate(&question, &memories)?;
+
+    // Abstention contract: an abstaining reply must not claim memory use or
+    // attach citations — the UI used to render "nothing in memory" WITH a
+    // citation chip pointing at an irrelevant record.
+    if answer.trim() == NO_MEMORY_ANSWER {
+        return Ok(ChatReply {
+            question,
+            scope,
+            answer: NO_MEMORY_ANSWER.to_owned(),
+            citations: Vec::new(),
+            used_memory: false,
+            flagged_injection,
+        });
+    }
+
     let citations = memories
         .iter()
         .map(|memory| Citation {
@@ -2735,8 +2841,9 @@ fn format_agent_memory_answer(
                     .join(", ")
             };
             lines.push(format!(
-                "- [{}] {} ({}) — {} Evidence: {}",
+                "- [{}:{}] {} ({}) — {} Evidence: {}",
                 result.record_type,
+                result.id,
                 result.title,
                 display_scope(&result.scope),
                 result.snippet,
@@ -2757,6 +2864,29 @@ fn format_agent_memory_answer(
     );
 
     lines.join("\n")
+}
+
+fn budget_search_results(results: Vec<SearchResult>, total_chars: usize) -> Vec<SearchResult> {
+    let mut remaining = total_chars;
+    let mut kept = Vec::new();
+    for mut result in results {
+        let fixed = format!("[{}:{}] {} ", result.record_type, result.id, result.title);
+        let fixed_chars = fixed.chars().count();
+        if remaining <= fixed_chars {
+            break;
+        }
+        let snippet_cap = remaining
+            .saturating_sub(fixed_chars)
+            .min(crate::context_budget::DEFAULT_ITEM_BUDGET_CHARS);
+        result.snippet = crate::context_budget::truncate_chars(&result.snippet, snippet_cap);
+        result.evidence.truncate(2);
+        for evidence in &mut result.evidence {
+            evidence.excerpt = crate::context_budget::truncate_chars(&evidence.excerpt, 240);
+        }
+        remaining = remaining.saturating_sub(fixed_chars + result.snippet.chars().count() + 1);
+        kept.push(result);
+    }
+    kept
 }
 
 fn record_agent_query(
@@ -3043,7 +3173,7 @@ fn count_runtime_embedding_vectors(
 fn embedding_vector_backend_label() -> &'static str {
     #[cfg(feature = "sqlite-vec")]
     {
-        return "json+sqlite-vec";
+        "json+sqlite-vec"
     }
     #[cfg(not(feature = "sqlite-vec"))]
     {
@@ -3089,6 +3219,7 @@ pub fn process_embedding_jobs(
     let enqueued = if options.rebuild && !scope_chain.is_empty() {
         // An explicit rebuild revives previously-failed jobs so they are not
         // permanent dead-letters; the user asked to retry.
+        sweep_orphan_embedding_records(&mut connection, &scope_chain)?;
         requeue_failed_embedding_jobs(&connection, &scope_chain)?;
         enqueue_embeddable_records(&mut connection, &scope_chain)?
     } else {
@@ -3269,6 +3400,7 @@ pub fn import_memory(options: ImportOptions) -> Result<ImportReport> {
                 name = excluded.name,
                 entity_type = excluded.entity_type,
                 scope = excluded.scope,
+                retired_at = NULL,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             ",
             params![entity.id, entity.name, entity.entity_type, entity.scope],
@@ -3454,6 +3586,7 @@ pub fn import_memory(options: ImportOptions) -> Result<ImportReport> {
                 scope = excluded.scope,
                 version = excluded.version,
                 checksum = excluded.checksum,
+                retired_at = NULL,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             ",
             params![
@@ -3651,7 +3784,7 @@ fn detect_structural_conflict(
     use crate::conflict::{normalize_predicate, slot_conflict, ConflictVerdict, Slot};
 
     let entity_sql = scoped_query(
-        "SELECT id FROM entities WHERE name = ? AND scope IN ({scopes}) LIMIT 1",
+        "SELECT id FROM entities WHERE retired_at IS NULL AND name = ? AND scope IN ({scopes}) LIMIT 1",
         scope_chain.len(),
     );
     let mut entity_params: Vec<&dyn rusqlite::ToSql> = vec![&entity_name];
@@ -3704,7 +3837,7 @@ fn detect_observation_conflict(
     const THRESHOLD: f32 = 0.55;
 
     let entity_sql = scoped_query(
-        "SELECT id FROM entities WHERE name = ? AND scope IN ({scopes}) LIMIT 1",
+        "SELECT id FROM entities WHERE retired_at IS NULL AND name = ? AND scope IN ({scopes}) LIMIT 1",
         scope_chain.len(),
     );
     let mut entity_params: Vec<&dyn rusqlite::ToSql> = vec![&entity_name];
@@ -3766,7 +3899,7 @@ pub fn propose_candidate(options: ProposeCandidateOptions) -> Result<CandidateMu
         ));
     }
 
-    let (_project, connection) = resolve_and_open(
+    let (_project, mut connection) = resolve_and_open(
         options.project_name,
         options.start_dir,
         options.grafiki_home,
@@ -3845,7 +3978,11 @@ pub fn propose_candidate(options: ProposeCandidateOptions) -> Result<CandidateMu
         redact_sensitive_text(&mut value);
         value
     });
-    connection.execute(
+    // Candidate and provenance are one logical write. Invalid evidence or any
+    // later insert failure must roll the candidate back instead of leaving a
+    // pending, evidence-less row in the review queue.
+    let tx = connection.transaction()?;
+    tx.execute(
         "
         INSERT INTO extraction_candidates
             (id, source_type, source, proposed_record_type, payload, scope, confidence, rationale)
@@ -3862,7 +3999,8 @@ pub fn propose_candidate(options: ProposeCandidateOptions) -> Result<CandidateMu
             rationale
         ],
     )?;
-    insert_candidate_evidence(&connection, &id, &options.evidence)?;
+    insert_candidate_evidence(&tx, &id, &options.evidence)?;
+    tx.commit()?;
 
     let candidate = load_extraction_candidate(&connection, &id)?;
     Ok(CandidateMutationReport {
@@ -3992,72 +4130,318 @@ pub fn approve_candidate(options: ApproveCandidateOptions) -> Result<CandidateMu
             candidate.id
         )));
     }
-    let candidate = load_extraction_candidate(&connection, &options.id)?;
+    let candidate = match load_extraction_candidate(&connection, &options.id) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            drop(connection);
+            release_candidate_approval_claim(&options);
+            return Err(error);
+        }
+    };
+    if let Err(error) = snapshot_candidate_supersession(&connection, &candidate) {
+        drop(connection);
+        release_candidate_approval_claim(&options);
+        return Err(error);
+    }
     drop(connection);
 
-    let payload_outcome = approve_candidate_payload(
-        &candidate,
-        options.project_name.clone(),
-        options.start_dir.clone(),
-        options.grafiki_home.clone(),
-    );
-    let (trusted_record_type, trusted_record_id) = match payload_outcome {
-        Ok(created) => created,
-        Err(error) => {
-            // Release the claim so the candidate returns to the review queue.
-            if let Ok((_project, connection)) = resolve_and_open(
+    // A previous attempt may have created the trusted row and failed before the
+    // final candidate/evidence transaction. Reuse its provisional pointer rather
+    // than duplicating trusted memory on retry.
+    let existing_pointer = match (
+        candidate.trusted_record_type.clone(),
+        candidate.trusted_record_id.clone(),
+    ) {
+        (Some(record_type), Some(record_id)) => Some((record_type, record_id)),
+        (None, None) => None,
+        _ => {
+            release_candidate_approval_claim(&options);
+            return Err(GrafikiError::InvalidCandidate(format!(
+                "candidate {} has an incomplete approval recovery pointer",
+                candidate.id
+            )));
+        }
+    };
+    let (trusted_record_type, trusted_record_id) = match existing_pointer {
+        Some(pointer) => pointer,
+        None => {
+            let created = match approve_candidate_payload(
+                &candidate,
                 options.project_name.clone(),
                 options.start_dir.clone(),
                 options.grafiki_home.clone(),
             ) {
-                let _ = connection.execute(
-                    "UPDATE extraction_candidates SET reviewed_at = NULL \
-                     WHERE id = ?1 AND status = 'pending'",
-                    params![&options.id],
-                );
+                Ok(created) => created,
+                Err(error) => {
+                    release_candidate_approval_claim(&options);
+                    return Err(error);
+                }
+            };
+            // Persist a recovery pointer immediately after creation. This cannot
+            // be fully atomic with the trusted write while record APIs open their
+            // own connections. An OS/process crash or database failure in the few
+            // instructions after `approve_candidate_payload` commits and before
+            // this UPDATE can still orphan one trusted row; eliminating that final
+            // window requires the record writers to accept a caller-owned
+            // transaction. Once the pointer lands, every ordinary error/retry is
+            // idempotent.
+            let pointer_result = (|| -> Result<()> {
+                let (_project, pointer_connection) = resolve_and_open(
+                    options.project_name.clone(),
+                    options.start_dir.clone(),
+                    options.grafiki_home.clone(),
+                )?;
+                let recorded = pointer_connection.execute(
+                    "UPDATE extraction_candidates
+                     SET trusted_record_type = ?1, trusted_record_id = ?2
+                     WHERE id = ?3 AND status = 'pending' AND reviewed_at IS NOT NULL",
+                    params![&created.0, &created.1, &options.id],
+                )?;
+                if recorded == 0 {
+                    return Err(GrafikiError::InvalidCandidate(format!(
+                        "candidate {} changed while approval created {} {}; recovery pointer could not be recorded",
+                        options.id, created.0, created.1
+                    )));
+                }
+                Ok(())
+            })();
+            if let Err(error) = pointer_result {
+                release_candidate_approval_claim(&options);
+                return Err(error);
             }
-            return Err(error);
+            created
         }
     };
 
-    let (_project, mut connection) = resolve_and_open(
-        options.project_name,
-        options.start_dir,
-        options.grafiki_home,
-    )?;
+    let (_project, mut connection) = match resolve_and_open(
+        options.project_name.clone(),
+        options.start_dir.clone(),
+        options.grafiki_home.clone(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            release_candidate_approval_claim(&options);
+            return Err(error);
+        }
+    };
     // Flip the candidate status and promote its evidence atomically so a failure
     // between the two cannot leave evidence pointing at a not-yet-approved
     // candidate. (The trusted record was created above; the pending-status guard
     // makes re-approval a no-op, preventing duplicates on the common retry path.)
-    let tx = connection.transaction()?;
-    let approved = tx.execute(
-        "
-        UPDATE extraction_candidates
-        SET status = 'approved',
-            trusted_record_type = ?1,
-            trusted_record_id = ?2,
-            reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-        WHERE id = ?3 AND status = 'pending'
-        ",
-        params![&trusted_record_type, &trusted_record_id, &options.id],
-    )?;
-    if approved == 0 {
-        // The candidate was reviewed by someone else while the trusted record
-        // was being created (e.g. rejected mid-flight). Do not overwrite their
-        // decision — surface what happened instead.
-        return Err(GrafikiError::InvalidCandidate(format!(
-            "candidate {} was reviewed concurrently during approval; created {} {} — \
-             review it manually",
-            options.id, trusted_record_type, trusted_record_id
-        )));
+    let finalize = (|| -> Result<()> {
+        let tx = connection.transaction()?;
+        let approved = tx.execute(
+            "
+            UPDATE extraction_candidates
+            SET status = 'approved',
+                trusted_record_type = ?1,
+                trusted_record_id = ?2,
+                reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            WHERE id = ?3 AND status = 'pending'
+            ",
+            params![&trusted_record_type, &trusted_record_id, &options.id],
+        )?;
+        if approved == 0 {
+            return Err(GrafikiError::InvalidCandidate(format!(
+                "candidate {} changed concurrently during approval; recovery pointer is {} {}",
+                options.id, trusted_record_type, trusted_record_id
+            )));
+        }
+        promote_candidate_evidence(&tx, &options.id, &trusted_record_type, &trusted_record_id)?;
+        tx.commit()?;
+        Ok(())
+    })();
+    if let Err(error) = finalize {
+        release_candidate_approval_claim(&options);
+        return Err(error);
     }
-    promote_candidate_evidence(&tx, &options.id, &trusted_record_type, &trusted_record_id)?;
-    tx.commit()?;
     let candidate = load_extraction_candidate(&connection, &options.id)?;
     Ok(CandidateMutationReport {
         candidate,
         message: "Candidate approved into trusted memory.".to_owned(),
     })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ApprovalRestoreSnapshot {
+    record_type: String,
+    record_id: String,
+    prior_status: Option<String>,
+    prior_superseded_by: Option<String>,
+    prior_valid_to: Option<String>,
+}
+
+/// Persist the predecessor's exact state before approval mutates it. The snapshot
+/// lives on the candidate so approval retry and later undo share one durable,
+/// auditable restoration source.
+fn snapshot_candidate_supersession(
+    connection: &Connection,
+    candidate: &ExtractionCandidate,
+) -> Result<()> {
+    let already_snapshotted: bool = connection.query_row(
+        "SELECT approval_restore IS NOT NULL FROM extraction_candidates WHERE id = ?1",
+        [&candidate.id],
+        |row| row.get(0),
+    )?;
+    if already_snapshotted {
+        return Ok(());
+    }
+    let Some(record_id) = candidate_payload_optional_string(&candidate.payload, &["supersedes"])
+    else {
+        return Ok(());
+    };
+    let snapshot = match candidate.record_type.as_str() {
+        "decision" => connection
+            .query_row(
+                "SELECT status, superseded_by FROM decisions WHERE id = ?1",
+                [&record_id],
+                |row| {
+                    Ok(ApprovalRestoreSnapshot {
+                        record_type: "decision".to_owned(),
+                        record_id: record_id.clone(),
+                        prior_status: Some(row.get(0)?),
+                        prior_superseded_by: row.get(1)?,
+                        prior_valid_to: None,
+                    })
+                },
+            )
+            .optional()?,
+        "observation" => connection
+            .query_row(
+                "SELECT valid_to FROM observations WHERE id = ?1",
+                [&record_id],
+                |row| {
+                    Ok(ApprovalRestoreSnapshot {
+                        record_type: "observation".to_owned(),
+                        record_id: record_id.clone(),
+                        prior_status: None,
+                        prior_superseded_by: None,
+                        prior_valid_to: row.get(0)?,
+                    })
+                },
+            )
+            .optional()?,
+        _ => None,
+    };
+    if let Some(snapshot) = snapshot {
+        connection.execute(
+            "UPDATE extraction_candidates SET approval_restore = ?1 WHERE id = ?2",
+            params![serde_json::to_string(&snapshot)?, candidate.id],
+        )?;
+    }
+    Ok(())
+}
+
+fn release_candidate_approval_claim(options: &ApproveCandidateOptions) {
+    if let Ok((_project, connection)) = resolve_and_open(
+        options.project_name.clone(),
+        options.start_dir.clone(),
+        options.grafiki_home.clone(),
+    ) {
+        let _ = connection.execute(
+            "UPDATE extraction_candidates
+             SET reviewed_at = NULL,
+                 approval_restore = CASE
+                     WHEN trusted_record_id IS NULL THEN NULL
+                     ELSE approval_restore
+                 END
+             WHERE id = ?1 AND status = 'pending'",
+            params![&options.id],
+        );
+    }
+}
+
+fn restore_candidate_supersession(
+    tx: &rusqlite::Transaction<'_>,
+    candidate_id: &str,
+    trusted_record_type: &str,
+    trusted_record_id: &str,
+) -> Result<()> {
+    let snapshot: Option<String> = tx.query_row(
+        "SELECT approval_restore FROM extraction_candidates WHERE id = ?1",
+        [candidate_id],
+        |row| row.get(0),
+    )?;
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    let snapshot: ApprovalRestoreSnapshot = serde_json::from_str(&snapshot)?;
+    match snapshot.record_type.as_str() {
+        "decision" if trusted_record_type == "decision" => {
+            let Some(prior_status) = snapshot.prior_status else {
+                return Ok(());
+            };
+            let restored = tx.execute(
+                "UPDATE decisions
+                 SET status = ?1, superseded_by = ?2,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                 WHERE id = ?3 AND status = 'superseded' AND superseded_by = ?4",
+                params![
+                    prior_status,
+                    snapshot.prior_superseded_by,
+                    snapshot.record_id,
+                    trusted_record_id
+                ],
+            )?;
+            if restored > 0 && prior_status != "revoked" {
+                if let Some((scope, content)) = tx
+                    .query_row(
+                        "SELECT scope, title || ' ' || coalesce(reasoning, '')
+                         FROM decisions WHERE id = ?1",
+                        [&snapshot.record_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()?
+                {
+                    enqueue_embedding_job(tx, "decision", &snapshot.record_id, &scope, &content)?;
+                }
+            }
+        }
+        "observation" if trusted_record_type == "observation" => {
+            let new_valid_from: Option<String> = tx
+                .query_row(
+                    "SELECT valid_from FROM observations WHERE id = ?1",
+                    [trusted_record_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let current_valid_to: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT valid_to FROM observations WHERE id = ?1",
+                    [&snapshot.record_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current_valid_to.flatten() == new_valid_from {
+                tx.execute(
+                    "UPDATE observations SET valid_to = ?1 WHERE id = ?2",
+                    params![snapshot.prior_valid_to, snapshot.record_id],
+                )?;
+                if snapshot.prior_valid_to.is_none() {
+                    if let Some((scope, content)) = tx
+                        .query_row(
+                            "SELECT e.scope, o.content
+                             FROM observations o JOIN entities e ON e.id = o.entity_id
+                             WHERE o.id = ?1 AND e.retired_at IS NULL",
+                            [&snapshot.record_id],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        )
+                        .optional()?
+                    {
+                        enqueue_embedding_job(
+                            tx,
+                            "observation",
+                            &snapshot.record_id,
+                            &scope,
+                            &content,
+                        )?;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Undo a wrong approve: delete the trusted record it created and return the
@@ -4067,17 +4451,10 @@ pub fn approve_candidate(options: ApproveCandidateOptions) -> Result<CandidateMu
 /// be called from a short-lived "Undo" affordance right after approval, not as
 /// a general-purpose retraction long after the fact (the trusted record may by
 /// then have been read, cited, or superseded by other memory).
-///
-/// KNOWN LIMITATION (2026-07-04 adversarial review): if the approval this
-/// undoes had `supersedes` set (a decision/observation candidate explicitly
-/// superseding an older one — not something the LLM extractor currently
-/// produces), reverting deletes the new record but does NOT restore the OLD
-/// record's prior status/`valid_to` — it stays `superseded`/invalidated. Full
-/// bitemporal restore is real future work, not done here.
 pub fn revert_candidate_approval(
     options: RevertApprovalOptions,
 ) -> Result<CandidateMutationReport> {
-    let (_project, connection) = resolve_and_open(
+    let (_project, mut connection) = resolve_and_open(
         options.project_name.clone(),
         options.start_dir.clone(),
         options.grafiki_home.clone(),
@@ -4133,7 +4510,8 @@ pub fn revert_candidate_approval(
     // can no longer wedge the candidate forever: once this succeeds the
     // candidate IS correctly reverted, and cleaning up the underlying record
     // below is best-effort.
-    let claimed = connection.execute(
+    let tx = connection.transaction()?;
+    let claimed = tx.execute(
         "
         UPDATE extraction_candidates
         SET status = 'pending',
@@ -4145,6 +4523,7 @@ pub fn revert_candidate_approval(
         params![&options.id],
     )?;
     if claimed == 0 {
+        drop(tx);
         let candidate = load_extraction_candidate(&connection, &options.id)?;
         return Err(GrafikiError::InvalidCandidate(format!(
             "candidate {} was reviewed concurrently; now {}",
@@ -4152,7 +4531,7 @@ pub fn revert_candidate_approval(
         )));
     }
     // Un-promote evidence back to candidate-only (mirrors promote_candidate_evidence).
-    connection.execute(
+    tx.execute(
         "
         UPDATE evidence_links
         SET trusted_record_type = NULL, trusted_record_id = NULL
@@ -4160,6 +4539,12 @@ pub fn revert_candidate_approval(
         ",
         params![&options.id],
     )?;
+    restore_candidate_supersession(&tx, &options.id, &trusted_record_type, &trusted_record_id)?;
+    tx.execute(
+        "UPDATE extraction_candidates SET approval_restore = NULL WHERE id = ?1",
+        [&options.id],
+    )?;
+    tx.commit()?;
     drop(connection);
 
     // Best-effort delete of the underlying trusted record. The candidate is
@@ -4264,6 +4649,12 @@ pub fn edit_candidate(options: EditCandidateOptions) -> Result<CandidateMutation
             candidate.id, candidate.status
         )));
     }
+    if candidate.reviewed_at.is_some() {
+        return Err(GrafikiError::InvalidCandidate(format!(
+            "candidate {} is being approved and cannot be edited",
+            candidate.id
+        )));
+    }
 
     let record_type = options
         .record_type
@@ -4299,7 +4690,7 @@ pub fn edit_candidate(options: EditCandidateOptions) -> Result<CandidateMutation
         })
         .or(candidate.rationale);
 
-    connection.execute(
+    let updated = connection.execute(
         "
         UPDATE extraction_candidates
         SET proposed_record_type = ?1,
@@ -4307,7 +4698,7 @@ pub fn edit_candidate(options: EditCandidateOptions) -> Result<CandidateMutation
             scope = ?3,
             confidence = ?4,
             rationale = ?5
-        WHERE id = ?6
+        WHERE id = ?6 AND status = 'pending' AND reviewed_at IS NULL
         ",
         params![
             record_type,
@@ -4318,6 +4709,12 @@ pub fn edit_candidate(options: EditCandidateOptions) -> Result<CandidateMutation
             &options.id
         ],
     )?;
+    if updated == 0 {
+        return Err(GrafikiError::InvalidCandidate(format!(
+            "candidate {} changed while it was being edited",
+            options.id
+        )));
+    }
 
     let candidate = load_extraction_candidate(&connection, &options.id)?;
     Ok(CandidateMutationReport {
@@ -4339,17 +4736,29 @@ pub fn reject_candidate(options: RejectCandidateOptions) -> Result<CandidateMuta
             candidate.id, candidate.status
         )));
     }
+    if candidate.reviewed_at.is_some() {
+        return Err(GrafikiError::InvalidCandidate(format!(
+            "candidate {} is being approved and cannot be rejected",
+            candidate.id
+        )));
+    }
     let rationale = options.rationale.or(candidate.rationale);
-    connection.execute(
+    let rejected = connection.execute(
         "
         UPDATE extraction_candidates
         SET status = 'rejected',
             rationale = ?1,
             reviewed_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-        WHERE id = ?2
+        WHERE id = ?2 AND status = 'pending' AND reviewed_at IS NULL
         ",
         params![rationale, options.id],
     )?;
+    if rejected == 0 {
+        return Err(GrafikiError::InvalidCandidate(format!(
+            "candidate {} changed while it was being rejected",
+            options.id
+        )));
+    }
     let candidate = load_extraction_candidate(&connection, &options.id)?;
     Ok(CandidateMutationReport {
         candidate,
@@ -4533,14 +4942,13 @@ pub fn ingest_capture_event(options: IngestCaptureEventOptions) -> Result<Captur
     );
     let mut title = options.title;
     let mut text = options.text;
-    let mut payload = options
-        .payload
-        .map(|payload| serde_json::to_string(&payload))
-        .transpose()?;
-    let mut metadata = options
-        .metadata
-        .map(|metadata| serde_json::to_string(&metadata))
-        .transpose()?;
+    // Structured fields must be redacted while they are still structured. A
+    // serialized blob loses the key/value relationship, so values such as
+    // `{ "client_secret": "plain-value" }` evade assignment-style text
+    // detection. Preserve JSON shape, apply the capture session's profile at
+    // every depth, and only then serialize for storage.
+    let mut payload_value = options.payload;
+    let mut metadata_value = options.metadata;
     let mut redacted = options.redacted;
     if let Some(value) = title.as_mut() {
         if redact_text_with_profile(value, redaction_profile) {
@@ -4552,16 +4960,22 @@ pub fn ingest_capture_event(options: IngestCaptureEventOptions) -> Result<Captur
             redacted = true;
         }
     }
-    if let Some(value) = payload.as_mut() {
-        if redact_text_with_profile(value, redaction_profile) {
+    if let Some(value) = payload_value.as_mut() {
+        if redact_json_value_with_profile(value, redaction_profile) {
             redacted = true;
         }
     }
-    if let Some(value) = metadata.as_mut() {
-        if redact_text_with_profile(value, redaction_profile) {
+    if let Some(value) = metadata_value.as_mut() {
+        if redact_json_value_with_profile(value, redaction_profile) {
             redacted = true;
         }
     }
+    let payload = payload_value
+        .map(|payload| serde_json::to_string(&payload))
+        .transpose()?;
+    let metadata = metadata_value
+        .map(|metadata| serde_json::to_string(&metadata))
+        .transpose()?;
     let privacy_level = if redacted && matches!(privacy_level.as_str(), "public" | "internal") {
         "sensitive".to_owned()
     } else {
@@ -5244,7 +5658,7 @@ pub fn extract_capture_memory(options: ExtractCaptureOptions) -> Result<CaptureE
             .collect()
     };
 
-    let evidence = events
+    let all_evidence = events
         .iter()
         .take(30)
         .map(evidence_from_capture_event)
@@ -5253,6 +5667,51 @@ pub fn extract_capture_memory(options: ExtractCaptureOptions) -> Result<CaptureE
         .capture_id
         .clone()
         .unwrap_or_else(|| "recent-capture".to_owned());
+
+    // Per-candidate provenance: attach the events this item plausibly came
+    // from (word overlap with the item's title+content), not the whole batch.
+    // Attaching all 30 events to every candidate made citations point at trust
+    // screens and smalltalk — for a product whose pitch is auditable memory,
+    // evidence that points at the wrong source is worse than less evidence.
+    let evidence_for_item = |item: &crate::extract::ExtractedMemory| -> Vec<EvidenceInput> {
+        let item_text = format!("{} {}", item.title, item.content).to_lowercase();
+        let item_words: std::collections::HashSet<&str> = item_text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| word.chars().count() >= 4)
+            .collect();
+        let mut scored: Vec<(usize, usize)> = events
+            .iter()
+            .take(30)
+            .enumerate()
+            .map(|(index, event)| {
+                let event_text = format!(
+                    "{} {}",
+                    event.title.as_deref().unwrap_or(""),
+                    event.text.as_deref().unwrap_or("")
+                )
+                .to_lowercase();
+                let overlap = event_text
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|word| word.chars().count() >= 4)
+                    .collect::<std::collections::HashSet<&str>>()
+                    .intersection(&item_words)
+                    .count();
+                (index, overlap)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let matched: Vec<EvidenceInput> = scored
+            .iter()
+            .filter(|(_, overlap)| *overlap >= 2)
+            .take(5)
+            .map(|(index, _)| all_evidence[*index].clone())
+            .collect();
+        if matched.is_empty() {
+            all_evidence.clone() // no clear match: keep full provenance over none
+        } else {
+            matched
+        }
+    };
 
     let mut proposed = 0;
     for item in &items {
@@ -5285,7 +5744,7 @@ pub fn extract_capture_memory(options: ExtractCaptureOptions) -> Result<CaptureE
                 "Auto-extracted from your coding session by the local model; review before trusting."
                     .to_owned(),
             ),
-            evidence: evidence.clone(),
+            evidence: evidence_for_item(item),
         })?;
         proposed += 1;
     }
@@ -5340,16 +5799,23 @@ fn list_unextracted_session_events(
         .optional()?
         .unwrap_or_default();
 
+    // The root (empty) scope resolves to an empty chain; `scope IN ()` is always
+    // false in SQLite, which would silently hide every default-scope event from
+    // extraction (the same guard list_capture_events applies above).
+    let scope_clause = if scope_chain.is_empty() {
+        "scope LIKE '%'".to_owned()
+    } else {
+        format!("scope IN ({})", placeholders(scope_chain.len()))
+    };
     let sql = format!(
         "
         SELECT id, capture_session, source_type, source, title, text, payload, metadata,
                privacy_level, redacted, scope, captured_at, created_at
         FROM capture_events
-        WHERE scope IN ({}) AND source_type IN ('transcript', 'terminal') AND id > ?
+        WHERE {scope_clause} AND source_type IN ('transcript', 'terminal') AND id > ?
         ORDER BY id ASC
         LIMIT ?
-        ",
-        placeholders(scope_chain.len())
+        "
     );
     let mut params: Vec<&dyn rusqlite::ToSql> = scope_chain
         .iter()
@@ -5416,6 +5882,22 @@ pub struct CaptureWatchReport {
 /// background daemon worker (`spawn_capture_worker`). It NEVER trusts anything —
 /// extracted items land in the candidate review gate.
 pub fn run_capture_watch(options: RunCaptureWatchOptions) -> Result<CaptureWatchReport> {
+    // Re-read consent on EVERY tick. This is intentionally before transcript
+    // discovery/import and uses the non-creating loader: disabling capture,
+    // deleting the consent file, or corrupting it takes effect immediately and
+    // cannot fail open into passive collection.
+    let capture_config =
+        crate::project::load_existing_capture_config(crate::project::CaptureConfigOptions {
+            project_name: options.project_name.clone(),
+            start_dir: options.start_dir.clone(),
+            grafiki_home: options.grafiki_home.clone(),
+        })?;
+    if !capture_config.config.sources.transcripts {
+        return Err(GrafikiError::InvalidCaptureConfig(
+            "passive transcript capture is disabled for this project".to_owned(),
+        ));
+    }
+
     // Scope Claude Code auto-discovery to THIS project's transcript directory, so
     // the watcher never imports other projects' sessions.
     let input = match (options.input, options.agent.as_str()) {
@@ -5522,10 +6004,10 @@ pub fn upsert_state(options: UpsertStateOptions) -> Result<StateReport> {
         params![
             id,
             options.key.trim(),
-            options.title.trim(),
+            clamp_field(options.title.trim(), MAX_TITLE_CHARS),
             status,
             options.owner,
-            options.details,
+            options.details.map(|value| clamp_field(&value, MAX_BODY_CHARS)),
             json_array(&options.blockers)?,
             json_array(&options.depends_on)?,
             scope.as_str(),
@@ -5593,7 +6075,7 @@ pub fn list_state(options: StateListOptions) -> Result<Vec<StateItem>> {
             "
             SELECT key, title, status, priority, owner, scope, details, blockers, depends_on
             FROM state
-            WHERE scope IN ({scopes})
+            WHERE status != 'abandoned' AND scope IN ({scopes})
             ORDER BY updated_at DESC
             ",
             &scope_chain,
@@ -5609,10 +6091,15 @@ pub fn delete_state(options: DeleteStateOptions) -> Result<StateReport> {
         options.grafiki_home,
     )?;
     let active_session = latest_active_session(&connection, &project.project)?;
-    let existing = load_state_report(&connection, &options.key)?;
+    let mut existing = load_state_report(&connection, &options.key)?;
 
     let tx = connection.transaction()?;
-    tx.execute("DELETE FROM state WHERE key = ?1", [&options.key])?;
+    tx.execute(
+        "UPDATE state
+         SET status = 'abandoned', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+         WHERE key = ?1",
+        [&options.key],
+    )?;
     tx.execute(
         "
         INSERT INTO events (id, event_type, source_session, target_type, target_id, scope, summary)
@@ -5623,11 +6110,12 @@ pub fn delete_state(options: DeleteStateOptions) -> Result<StateReport> {
             active_session,
             options.key,
             existing.scope,
-            format!("Deleted state {}", existing.key)
+            format!("Retired state {} as abandoned", existing.key)
         ],
     )?;
     tx.commit()?;
 
+    existing.status = "abandoned".to_owned();
     Ok(existing)
 }
 
@@ -5771,18 +6259,26 @@ pub fn add_context(options: AddContextOptions) -> Result<ContextReport> {
     let active_session = latest_active_session(&connection, &project.project)?;
     let id = new_ulid();
     let key = options.key.trim().to_owned();
-    let title = options.title.trim().to_owned();
-    let checksum = checksum(&options.content);
-    let context_embedding_text = format!("{} {}", title, options.content.trim());
+    let title = clamp_field(options.title.trim(), MAX_TITLE_CHARS);
+    // Clamp BEFORE the checksum so the stored checksum matches the stored body.
+    let content = clamp_field(&options.content, MAX_BODY_CHARS);
+    let checksum = checksum(&content);
+    let context_embedding_text = format!("{} {}", title, content.trim());
 
     // `context.key` is globally UNIQUE. Re-adding an existing key UPSERTS (bumps
     // the version) instead of failing the constraint — "add" is create-or-update,
     // mirroring `upsert_state`. This also turns the candidate-approval path
     // (`approve_candidate_payload`'s `context` arm) into a graceful update rather
     // than a crash on a colliding key.
-    let existing = load_context_document(&connection, &key).ok();
-    let (version, event_type, verb) = match &existing {
-        Some(doc) => (doc.version + 1, "context_updated", "Updated"),
+    let existing_version: Option<i64> = connection
+        .query_row(
+            "SELECT version FROM context WHERE key = ?1",
+            [&key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let (version, event_type, verb) = match existing_version {
+        Some(version) => (version + 1, "context_updated", "Updated"),
         None => (1, "context_added", "Added"),
     };
 
@@ -5798,13 +6294,14 @@ pub fn add_context(options: AddContextOptions) -> Result<ContextReport> {
             scope = excluded.scope,
             checksum = excluded.checksum,
             version = context.version + 1,
+            retired_at = NULL,
             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
         ",
         params![
             id,
             key,
             title,
-            options.content,
+            content,
             category,
             scope.as_str(),
             checksum
@@ -6134,7 +6631,7 @@ pub fn list_context(options: ContextListOptions) -> Result<Vec<ContextSummary>> 
                 "
                 SELECT key, title, category, scope, version
                 FROM context
-                WHERE category = ? AND scope IN ({scopes})
+                WHERE retired_at IS NULL AND category = ? AND scope IN ({scopes})
                 ORDER BY updated_at DESC
                 ",
                 scope_chain.len(),
@@ -6154,7 +6651,7 @@ pub fn list_context(options: ContextListOptions) -> Result<Vec<ContextSummary>> 
             "
             SELECT key, title, category, scope, version
             FROM context
-            WHERE scope IN ({scopes})
+            WHERE retired_at IS NULL AND scope IN ({scopes})
             ORDER BY updated_at DESC
             ",
             &scope_chain,
@@ -6177,12 +6674,18 @@ pub fn update_context(options: UpdateContextOptions) -> Result<ContextReport> {
     )?;
     let active_session = latest_active_session(&connection, &project.project)?;
     let existing = load_context_document(&connection, &options.key)?;
-    let title = options.title.unwrap_or(existing.title);
+    let title = options
+        .title
+        .map(|value| clamp_field(&value, MAX_TITLE_CHARS))
+        .unwrap_or(existing.title);
     let category = category.unwrap_or(existing.category);
     let scope = scope
         .map(|scope| scope.as_str().to_owned())
         .unwrap_or(existing.scope);
-    let content = options.content.unwrap_or(existing.content);
+    let content = options
+        .content
+        .map(|value| clamp_field(&value, MAX_BODY_CHARS))
+        .unwrap_or(existing.content);
     let checksum = checksum(&content);
     let next_version = existing.version + 1;
     let context_embedding_text = format!("{} {}", title.trim(), content.trim());
@@ -6251,7 +6754,14 @@ pub fn delete_context(options: DeleteContextOptions) -> Result<ContextReport> {
     let existing = load_context_document(&connection, &options.key)?;
 
     let tx = connection.transaction()?;
-    tx.execute("DELETE FROM context WHERE key = ?1", [&options.key])?;
+    delete_embedding_records(&tx, "context", &options.key)?;
+    tx.execute(
+        "UPDATE context
+         SET retired_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+         WHERE key = ?1",
+        [&options.key],
+    )?;
     tx.execute(
         "
         INSERT INTO events (id, event_type, source_session, target_type, target_id, scope, summary)
@@ -6323,7 +6833,7 @@ fn ensure_session_exists(connection: &Connection, session_id: &str) -> Result<St
 
 fn entity_exists(connection: &Connection, entity_id: &str) -> Result<bool> {
     let count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM entities WHERE id = ?1",
+        "SELECT COUNT(*) FROM entities WHERE id = ?1 AND retired_at IS NULL",
         [entity_id],
         |row| row.get(0),
     )?;
@@ -6385,7 +6895,7 @@ fn load_observation_item(connection: &Connection, id: &str) -> Result<Observatio
             SELECT o.id, o.entity_id, e.name, o.content, o.category, o.confidence, e.scope
             FROM observations o
             JOIN entities e ON e.id = o.entity_id
-            WHERE o.id = ?1 AND o.valid_to IS NULL
+            WHERE o.id = ?1 AND o.valid_to IS NULL AND e.retired_at IS NULL
             ",
             [id],
             observation_item_from_row,
@@ -6673,7 +7183,7 @@ fn load_context_document(connection: &Connection, key: &str) -> Result<ContextDo
             "
             SELECT key, title, category, scope, version, content
             FROM context
-            WHERE key = ?1
+            WHERE key = ?1 AND retired_at IS NULL
             ",
             [key],
             |row| {
@@ -6911,7 +7421,11 @@ fn list_evidence_for_candidate(
                line_start, line_end, captured_at, created_at
         FROM evidence_links
         WHERE candidate_id = ?1
-        ORDER BY created_at ASC, id ASC
+        ORDER BY coalesce(captured_at, created_at) ASC,
+                 line_start IS NULL ASC, line_start ASC,
+                 byte_start IS NULL ASC, byte_start ASC,
+                 coalesce(source, '') ASC, coalesce(uri, '') ASC,
+                 excerpt ASC, id ASC
         ",
     )?;
     let rows = collect_rows(statement.query_map([candidate_id], evidence_link_from_row)?)?;
@@ -6930,7 +7444,11 @@ fn list_evidence_for_record(
                line_start, line_end, captured_at, created_at
         FROM evidence_links
         WHERE trusted_record_type = ?1 AND trusted_record_id = ?2
-        ORDER BY created_at ASC, id ASC
+        ORDER BY coalesce(captured_at, created_at) ASC,
+                 line_start IS NULL ASC, line_start ASC,
+                 byte_start IS NULL ASC, byte_start ASC,
+                 coalesce(source, '') ASC, coalesce(uri, '') ASC,
+                 excerpt ASC, id ASC
         ",
     )?;
     let rows = collect_rows(
@@ -7521,8 +8039,7 @@ fn key_looks_secret(key: &str) -> bool {
 /// path); the two cover both primary secret sinks.
 pub fn redact_json(value: &serde_json::Value) -> (serde_json::Value, bool) {
     let mut redacted = value.clone();
-    redact_json_value(&mut redacted);
-    let changed = redacted != *value;
+    let changed = redact_json_value(&mut redacted);
     (redacted, changed)
 }
 
@@ -7531,11 +8048,83 @@ fn redact_sensitive_text(text: &mut String) -> bool {
     let mut redacted = redact_assignment_like_secrets(&original);
     redacted = redact_private_key_blocks(&redacted);
     redacted = redact_token_prefixes(&redacted);
+    redacted = redact_keyword_adjacent_entropy(&redacted);
     let changed = redacted != original;
     if changed {
         *text = redacted;
     }
     changed
+}
+
+/// Catch bare high-entropy secrets with no known prefix and no `key=value`
+/// shape — "the webhook signing key is a3f9c2e8…" leaked verbatim while the
+/// JWT beside it was caught. Scoped to lines that NAME a secret-ish word, and
+/// to tokens that look like key material (≥24 chars of alnum/base64 charset
+/// with both letters and digits), so prose and identifiers survive.
+fn redact_keyword_adjacent_entropy(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for line in input.split_inclusive('\n') {
+        if line_names_secret(line) {
+            out.push_str(&redact_entropy_runs(line));
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+fn line_names_secret(line: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "key",
+        "keys",
+        "secret",
+        "secrets",
+        "token",
+        "tokens",
+        "password",
+        "passwords",
+        "passwd",
+        "credential",
+        "credentials",
+        "apikey",
+        "bearer",
+        "passphrase",
+    ];
+    let lower = line.to_ascii_lowercase();
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| KEYWORDS.contains(&word))
+}
+
+fn redact_entropy_runs(line: &str) -> String {
+    fn is_run_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-')
+    }
+    fn looks_like_key_material(run: &str) -> bool {
+        run.chars().count() >= 24
+            && run.chars().any(|c| c.is_ascii_digit())
+            && run.chars().any(|c| c.is_ascii_alphabetic())
+    }
+    fn flush(run: &mut String, out: &mut String) {
+        if looks_like_key_material(run) {
+            out.push_str("[REDACTED_SECRET]");
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut run = String::new();
+    for c in line.chars() {
+        if is_run_char(c) {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
 }
 
 /// The redaction policy for a capture session (C13). Stored per `capture_session`
@@ -7666,34 +8255,82 @@ fn is_valid_email_domain(domain: &[u8]) -> bool {
 
 /// Recursively redact secrets from every string value in a JSON document,
 /// preserving structure. Used for candidate payloads before persistence.
-fn redact_json_value(value: &mut serde_json::Value) {
+fn redact_json_value(value: &mut serde_json::Value) -> bool {
+    redact_json_value_with_profile(value, RedactionProfile::Default)
+}
+
+/// Profile-aware structured redaction used by raw capture payloads/metadata.
+/// Secret-named keys redact scalar values even when the value alone has no
+/// recognizable token shape; nested arrays/objects retain their JSON shape.
+fn redact_json_value_with_profile(
+    value: &mut serde_json::Value,
+    profile: RedactionProfile,
+) -> bool {
+    if profile == RedactionProfile::None {
+        return false;
+    }
+
     match value {
         serde_json::Value::String(text) => {
             let mut owned = std::mem::take(text);
-            redact_sensitive_text(&mut owned);
+            let mut changed = redact_sensitive_text(&mut owned);
+            if profile == RedactionProfile::Strict {
+                let strict = redact_emails(&owned);
+                if strict != owned {
+                    owned = strict;
+                    changed = true;
+                }
+            }
             *text = owned;
+            changed
         }
         serde_json::Value::Array(items) => {
+            let mut changed = false;
             for item in items.iter_mut() {
-                redact_json_value(item);
+                changed |= redact_json_value_with_profile(item, profile);
             }
+            changed
         }
         serde_json::Value::Object(map) => {
+            let mut changed = false;
             for (key, item) in map.iter_mut() {
                 // Key-aware: a string value under a secret-named key (e.g.
                 // "client_secret", "password") is redacted whole, even when the
                 // value alone carries no `=`/`:`/token-prefix the text passes
                 // would catch. This closes a leak on the candidate-payload path.
                 if key_looks_secret(key) {
-                    if let serde_json::Value::String(_) = item {
-                        *item = serde_json::Value::String("[REDACTED_SECRET]".to_owned());
-                        continue;
-                    }
+                    changed |= redact_secret_json_value(item);
+                } else {
+                    changed |= redact_json_value_with_profile(item, profile);
                 }
-                redact_json_value(item);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// Redact every scalar below a secret-named key while preserving container
+/// shape. This covers structured credentials such as arrays of tokens or nested
+/// `{ "credentials": { "value": ... } }` objects.
+fn redact_secret_json_value(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.values_mut().fold(false, |changed, item| {
+            redact_secret_json_value(item) | changed
+        }),
+        serde_json::Value::Array(items) => items.iter_mut().fold(false, |changed, item| {
+            redact_secret_json_value(item) | changed
+        }),
+        serde_json::Value::Null => false,
+        _ => {
+            let replacement = serde_json::Value::String("[REDACTED_SECRET]".to_owned());
+            if *value == replacement {
+                false
+            } else {
+                *value = replacement;
+                true
             }
         }
-        _ => {}
     }
 }
 
@@ -8034,6 +8671,123 @@ fn delete_embedding_records(
         "DELETE FROM embedding_metadata WHERE record_type = ?1 AND record_id = ?2",
         params![record_type, record_id],
     )?;
+    delete_sqlite_vec_records(tx, record_type, record_id)?;
+    Ok(())
+}
+
+#[cfg(feature = "sqlite-vec")]
+fn sqlite_vec_tables(connection: &Connection) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT name FROM sqlite_schema
+         WHERE type = 'table'
+           AND name LIKE 'embedding_vec_%'
+           AND sql LIKE 'CREATE VIRTUAL TABLE%'",
+    )?;
+    let rows = statement.query_map([], |row| row.get(0))?;
+    collect_rows(rows)
+}
+
+#[cfg(feature = "sqlite-vec")]
+fn delete_sqlite_vec_records(
+    connection: &Connection,
+    record_type: &str,
+    record_id: &str,
+) -> Result<()> {
+    for table in sqlite_vec_tables(connection)? {
+        // Names come only from sqlite_schema and are generated internally as
+        // `embedding_vec_<hex>`, never from caller input.
+        connection.execute(
+            &format!("DELETE FROM {table} WHERE record_type = ?1 AND record_id = ?2"),
+            params![record_type, record_id],
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "sqlite-vec"))]
+fn delete_sqlite_vec_records(
+    _connection: &Connection,
+    _record_type: &str,
+    _record_id: &str,
+) -> Result<()> {
+    Ok(())
+}
+
+/// Remove index rows whose trusted source no longer participates in active
+/// retrieval. Rebuild calls this before enqueueing live records, covering stale
+/// rows left by legacy builds as well as current explicit retire/delete paths.
+fn sweep_orphan_embedding_records(
+    connection: &mut Connection,
+    scope_chain: &[String],
+) -> Result<usize> {
+    let mut candidates: HashSet<(String, String)> = HashSet::new();
+    for table in ["embedding_jobs", "embedding_vectors", "embedding_metadata"] {
+        let sql = if table == "embedding_metadata" {
+            format!("SELECT DISTINCT record_type, record_id FROM {table}")
+        } else {
+            let scoped = scoped_query(
+                &format!(
+                    "SELECT DISTINCT record_type, record_id FROM {table} WHERE scope IN ({{scopes}})"
+                ),
+                scope_chain.len(),
+            );
+            let mut statement = connection.prepare(&scoped)?;
+            let rows = statement.query_map(params_from_iter(scope_chain.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            candidates.extend(collect_rows(rows)?);
+            continue;
+        };
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        candidates.extend(collect_rows(rows)?);
+    }
+
+    let mut stale = Vec::new();
+    for (record_type, record_id) in candidates {
+        if load_embeddable_record(connection, &record_type, &record_id)?.is_none() {
+            stale.push((record_type, record_id));
+        }
+    }
+    let tx = connection.transaction()?;
+    for (record_type, record_id) in &stale {
+        delete_embedding_records(&tx, record_type, record_id)?;
+    }
+    tx.commit()?;
+    sweep_sqlite_vec_orphans(connection, scope_chain)?;
+    Ok(stale.len())
+}
+
+#[cfg(feature = "sqlite-vec")]
+fn sweep_sqlite_vec_orphans(connection: &Connection, scope_chain: &[String]) -> Result<()> {
+    for table in sqlite_vec_tables(connection)? {
+        let rows: Vec<(String, String, String)> = {
+            let mut statement = connection.prepare(&format!(
+                "SELECT record_type, record_id, scope FROM {table}"
+            ))?;
+            let rows = collect_rows(
+                statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?,
+            )?;
+            rows
+        };
+        for (record_type, record_id, scope) in rows {
+            if scope_chain.iter().any(|allowed| allowed == &scope)
+                && load_embeddable_record(connection, &record_type, &record_id)?.is_none()
+            {
+                connection.execute(
+                    &format!("DELETE FROM {table} WHERE record_type = ?1 AND record_id = ?2"),
+                    params![record_type, record_id],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "sqlite-vec"))]
+fn sweep_sqlite_vec_orphans(_connection: &Connection, _scope_chain: &[String]) -> Result<()> {
     Ok(())
 }
 
@@ -8322,7 +9076,7 @@ fn load_embeddable_record(
                 "
                 SELECT id, scope, name || ' ' || entity_type
                 FROM entities
-                WHERE id = ?1
+                WHERE id = ?1 AND retired_at IS NULL
                 ",
                 [record_id],
                 |row| {
@@ -8342,7 +9096,7 @@ fn load_embeddable_record(
                 SELECT o.id, e.scope, o.content
                 FROM observations o
                 JOIN entities e ON e.id = o.entity_id
-                WHERE o.id = ?1 AND o.valid_to IS NULL
+                WHERE o.id = ?1 AND o.valid_to IS NULL AND e.retired_at IS NULL
                 ",
                 [record_id],
                 |row| {
@@ -8361,7 +9115,7 @@ fn load_embeddable_record(
                 "
                 SELECT id, scope, title || ' ' || coalesce(reasoning, '')
                 FROM decisions
-                WHERE id = ?1
+                WHERE id = ?1 AND status != 'revoked'
                 ",
                 [record_id],
                 |row| {
@@ -8380,7 +9134,7 @@ fn load_embeddable_record(
                 "
                 SELECT key, scope, title || ' ' || content
                 FROM context
-                WHERE key = ?1
+                WHERE key = ?1 AND retired_at IS NULL
                 ",
                 [record_id],
                 |row| {
@@ -8409,7 +9163,7 @@ fn load_embeddable_records(
         "
         SELECT id, scope, name || ' ' || entity_type
         FROM entities
-        WHERE scope IN ({scopes})
+        WHERE retired_at IS NULL AND scope IN ({scopes})
         ORDER BY updated_at ASC, id ASC
         ",
         scope_chain,
@@ -8428,7 +9182,7 @@ fn load_embeddable_records(
         SELECT o.id, e.scope, o.content
         FROM observations o
         JOIN entities e ON e.id = o.entity_id
-        WHERE o.valid_to IS NULL AND e.scope IN ({scopes})
+        WHERE o.valid_to IS NULL AND e.retired_at IS NULL AND e.scope IN ({scopes})
         ORDER BY o.created_at ASC, o.id ASC
         ",
         scope_chain,
@@ -8446,7 +9200,7 @@ fn load_embeddable_records(
         "
         SELECT id, scope, title || ' ' || coalesce(reasoning, '')
         FROM decisions
-        WHERE scope IN ({scopes})
+        WHERE status != 'revoked' AND scope IN ({scopes})
         ORDER BY created_at ASC, id ASC
         ",
         scope_chain,
@@ -8464,7 +9218,7 @@ fn load_embeddable_records(
         "
         SELECT key, scope, title || ' ' || content
         FROM context
-        WHERE scope IN ({scopes})
+        WHERE retired_at IS NULL AND scope IN ({scopes})
         ORDER BY updated_at ASC, key ASC
         ",
         scope_chain,
@@ -8485,6 +9239,24 @@ fn checksum(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Hard per-field ceilings at the write boundary. The HTTP layer caps the whole
+/// request body, but a single multi-megabyte field sails under that cap and then
+/// pollutes every downstream artifact verbatim — the briefing used to render a
+/// 10MB decision title in full. Agents feed this system; oversized fields are a
+/// matter of course, not an edge case. Truncation is marked so a clipped record
+/// stays honest about being clipped.
+pub(crate) const MAX_TITLE_CHARS: usize = 500;
+pub(crate) const MAX_BODY_CHARS: usize = 20_000;
+const TRUNCATION_MARK: &str = " …[truncated]";
+
+pub(crate) fn clamp_field(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    let clipped: String = value.chars().take(max_chars).collect();
+    format!("{clipped}{TRUNCATION_MARK}")
 }
 
 fn parse_relation_spec(raw: &str) -> Result<(String, String)> {
@@ -8522,6 +9294,50 @@ pub(crate) fn slugify(name: &str) -> String {
     }
 
     slug.trim_matches('-').to_owned()
+}
+
+/// Resolve a stable readable entity id without overwriting an unrelated entity
+/// whose name happens to have the same ASCII slug. Unicode-only names receive a
+/// deterministic hash-backed id instead of the unsafe empty string.
+fn entity_id_for_name(connection: &Connection, name: &str) -> Result<String> {
+    let slug = slugify(name);
+    let needs_hash = slug.is_empty();
+    let base = if needs_hash {
+        "entity".to_owned()
+    } else {
+        slug
+    };
+    let existing_name: Option<String> = connection
+        .query_row("SELECT name FROM entities WHERE id = ?1", [&base], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    if !needs_hash
+        && existing_name
+            .as_deref()
+            .is_none_or(|existing| existing == name)
+    {
+        return Ok(base);
+    }
+
+    let digest = checksum(name);
+    let candidate = format!("{base}-{}", &digest[..10]);
+    let collision: Option<String> = connection
+        .query_row(
+            "SELECT name FROM entities WHERE id = ?1",
+            [&candidate],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if collision
+        .as_deref()
+        .is_some_and(|existing| existing != name)
+    {
+        // A SHA-256 prefix collision is extraordinarily unlikely, but never
+        // allow it to become a destructive upsert.
+        return Ok(format!("{base}-{digest}"));
+    }
+    Ok(candidate)
 }
 
 fn scoped_query(template: &str, scope_count: usize) -> String {
@@ -8586,28 +9402,44 @@ fn search_keyword_memory(
     scope_chain: &[String],
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
-    let mut results = Vec::new();
+    let mut ranked_types: Vec<VecDeque<SearchResult>> = Vec::new();
     let fts_query = fts5_terms_query(query);
     if let Some(fts_query) = fts_query.as_deref() {
         if matches!(record_type, "all" | "entities") {
-            results.extend(search_entities(connection, fts_query, scope_chain, limit)?);
+            ranked_types.push(search_entities(connection, fts_query, scope_chain, limit)?.into());
         }
         if matches!(record_type, "all" | "observations") {
-            results.extend(search_observations(
-                connection,
-                fts_query,
-                scope_chain,
-                limit,
-            )?);
+            ranked_types
+                .push(search_observations(connection, fts_query, scope_chain, limit)?.into());
         }
         if matches!(record_type, "all" | "decisions") {
-            results.extend(search_decisions(connection, fts_query, scope_chain, limit)?);
+            ranked_types.push(search_decisions(connection, fts_query, scope_chain, limit)?.into());
         }
         if matches!(record_type, "all" | "context") {
-            results.extend(search_context(connection, fts_query, scope_chain, limit)?);
+            ranked_types.push(search_context(connection, fts_query, scope_chain, limit)?.into());
         }
     }
-    results.truncate(limit);
+
+    // A global append-then-truncate lets the first type consume the entire
+    // result window (six entity hits could hide an exact observation). Preserve
+    // every type-local relevance order, then fairly interleave the ranked arms.
+    // The arm order is stable, so identical databases produce identical output.
+    let mut results = Vec::with_capacity(limit);
+    while results.len() < limit {
+        let mut advanced = false;
+        for arm in &mut ranked_types {
+            if let Some(result) = arm.pop_front() {
+                results.push(result);
+                advanced = true;
+                if results.len() == limit {
+                    break;
+                }
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
     Ok(results)
 }
 
@@ -8827,6 +9659,8 @@ fn load_scope_subgraph(connection: &Connection, scopes: &[String]) -> Result<cra
         JOIN entities ef ON ef.id = r.from_entity
         JOIN entities et ON et.id = r.to_entity
         WHERE r.valid_to IS NULL
+          AND ef.retired_at IS NULL
+          AND et.retired_at IS NULL
           AND ef.scope IN ({placeholders}) AND et.scope IN ({placeholders})
         ORDER BY r.from_entity, r.to_entity, r.relation
         "
@@ -8899,8 +9733,8 @@ pub fn run_reflection(
     let mut skipped_existing = 0usize;
     let mut skipped_too_large = 0usize;
 
-    let mut name_stmt =
-        connection.prepare("SELECT name FROM entities WHERE id = ?1 AND scope = ?2")?;
+    let mut name_stmt = connection
+        .prepare("SELECT name FROM entities WHERE id = ?1 AND scope = ?2 AND retired_at IS NULL")?;
     let mut obs_stmt = connection.prepare(
         "SELECT id, content, category, confidence FROM observations \
          WHERE entity_id = ?1 AND valid_to IS NULL ORDER BY id",
@@ -9012,7 +9846,7 @@ pub fn run_reflection(
         // re-propose a fresh review.
         let context_hit: Option<i64> = connection
             .query_row(
-                "SELECT 1 FROM context WHERE key = ?1 LIMIT 1",
+                "SELECT 1 FROM context WHERE key = ?1 AND retired_at IS NULL LIMIT 1",
                 [&context_key],
                 |row| row.get(0),
             )
@@ -9192,7 +10026,7 @@ fn graph_search_results(
     for (entity_id, _score) in ranked {
         let entity: Option<(String, String, String)> = connection
             .query_row(
-                "SELECT name, entity_type, scope FROM entities WHERE id = ?1",
+                "SELECT name, entity_type, scope FROM entities WHERE id = ?1 AND retired_at IS NULL",
                 [&entity_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -9590,7 +10424,7 @@ fn load_search_result(
                 "
                 SELECT id, name, entity_type, scope
                 FROM entities
-                WHERE id = ?1
+                WHERE id = ?1 AND retired_at IS NULL
                 ",
                 [record_id],
                 |row| {
@@ -9613,7 +10447,7 @@ fn load_search_result(
                 SELECT o.id, e.id, o.content, e.scope
                 FROM observations o
                 JOIN entities e ON e.id = o.entity_id
-                WHERE o.id = ?1 AND o.valid_to IS NULL
+                WHERE o.id = ?1 AND o.valid_to IS NULL AND e.retired_at IS NULL
                 ",
                 [record_id],
                 |row| {
@@ -9635,7 +10469,7 @@ fn load_search_result(
                 "
                 SELECT id, title, coalesce(reasoning, ''), scope
                 FROM decisions
-                WHERE id = ?1
+                WHERE id = ?1 AND status != 'revoked'
                 ",
                 [record_id],
                 |row| {
@@ -9657,7 +10491,7 @@ fn load_search_result(
                 "
                 SELECT key, title, content, scope
                 FROM context
-                WHERE key = ?1
+                WHERE key = ?1 AND retired_at IS NULL
                 ",
                 [record_id],
                 |row| {
@@ -9693,7 +10527,7 @@ fn search_entities(
         SELECT e.id, e.name, e.entity_type, e.scope
         FROM entities_fts f
         JOIN entities e ON e.rowid = f.rowid
-        WHERE entities_fts MATCH ? AND e.scope IN ({scopes})
+        WHERE entities_fts MATCH ? AND e.retired_at IS NULL AND e.scope IN ({scopes})
         ORDER BY rank
         LIMIT ?
         ",
@@ -9728,7 +10562,8 @@ fn search_observations(
         FROM observations_fts f
         JOIN observations o ON o.rowid = f.rowid
         JOIN entities e ON e.id = o.entity_id
-        WHERE observations_fts MATCH ? AND o.valid_to IS NULL AND e.scope IN ({scopes})
+        WHERE observations_fts MATCH ? AND o.valid_to IS NULL
+          AND e.retired_at IS NULL AND e.scope IN ({scopes})
         ORDER BY rank
         LIMIT ?
         ",
@@ -9762,7 +10597,7 @@ fn search_decisions(
         SELECT d.id, d.title, coalesce(d.reasoning, ''), d.scope
         FROM decisions_fts f
         JOIN decisions d ON d.rowid = f.rowid
-        WHERE decisions_fts MATCH ? AND d.scope IN ({scopes})
+        WHERE decisions_fts MATCH ? AND d.status != 'revoked' AND d.scope IN ({scopes})
         ORDER BY rank
         LIMIT ?
         ",
@@ -9796,7 +10631,7 @@ fn search_context(
         SELECT c.key, c.title, c.content, c.scope
         FROM context_fts f
         JOIN context c ON c.rowid = f.rowid
-        WHERE context_fts MATCH ? AND c.scope IN ({scopes})
+        WHERE context_fts MATCH ? AND c.retired_at IS NULL AND c.scope IN ({scopes})
         ORDER BY rank
         LIMIT ?
         ",
@@ -9865,7 +10700,7 @@ fn load_graph_entity(connection: &Connection, entity_id: &str) -> Result<GraphEn
             "
             SELECT id, name, entity_type, scope
             FROM entities
-            WHERE id = ?1
+            WHERE id = ?1 AND retired_at IS NULL
             ",
             [entity_id],
             |row| {
@@ -9897,7 +10732,7 @@ fn graph_relation_from_row(row: &Row<'_>) -> rusqlite::Result<GraphRelation> {
 fn count_scoped_entities(connection: &Connection, scope_chain: &[String]) -> Result<i64> {
     query_scoped_count(
         connection,
-        "SELECT COUNT(*) FROM entities WHERE scope IN ({scopes})",
+        "SELECT COUNT(*) FROM entities WHERE retired_at IS NULL AND scope IN ({scopes})",
         scope_chain,
     )
 }
@@ -9911,6 +10746,8 @@ fn count_scoped_relations(connection: &Connection, scope_chain: &[String]) -> Re
         JOIN entities f ON f.id = r.from_entity
         JOIN entities t ON t.id = r.to_entity
         WHERE r.valid_to IS NULL
+          AND f.retired_at IS NULL
+          AND t.retired_at IS NULL
           AND f.scope IN ({placeholders})
           AND t.scope IN ({placeholders})
         "
@@ -9937,7 +10774,7 @@ fn count_scoped_observations(connection: &Connection, scope_chain: &[String]) ->
 fn count_scoped_decisions(connection: &Connection, scope_chain: &[String]) -> Result<i64> {
     query_scoped_count(
         connection,
-        "SELECT COUNT(*) FROM decisions WHERE scope IN ({scopes})",
+        "SELECT COUNT(*) FROM decisions WHERE status != 'revoked' AND scope IN ({scopes})",
         scope_chain,
     )
 }
@@ -9972,7 +10809,7 @@ fn query_god_nodes(
         SELECT e.id, e.name, e.entity_type, e.scope, COUNT(r.id) AS degree
         FROM entities e
         LEFT JOIN relations r ON r.valid_to IS NULL AND (r.from_entity = e.id OR r.to_entity = e.id)
-        WHERE e.scope IN ({scopes})
+        WHERE e.retired_at IS NULL AND e.scope IN ({scopes})
         GROUP BY e.id
         HAVING degree > 0
         ORDER BY degree DESC, e.id ASC
@@ -9994,7 +10831,7 @@ fn query_orphan_entities(
         SELECT e.id, e.name, e.entity_type, e.scope, COUNT(r.id) AS degree
         FROM entities e
         LEFT JOIN relations r ON r.valid_to IS NULL AND (r.from_entity = e.id OR r.to_entity = e.id)
-        WHERE e.scope IN ({scopes})
+        WHERE e.retired_at IS NULL AND e.scope IN ({scopes})
         GROUP BY e.id
         HAVING degree <= 1
         ORDER BY degree ASC, e.id ASC
@@ -10103,7 +10940,7 @@ fn validate_import_scopes(bundle: &ExportBundle) -> Result<()> {
 
 fn entity_exists_in_tx(tx: &rusqlite::Transaction<'_>, entity_id: &str) -> Result<bool> {
     let exists: i64 = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM entities WHERE id = ?1)",
+        "SELECT EXISTS(SELECT 1 FROM entities WHERE id = ?1 AND retired_at IS NULL)",
         [entity_id],
         |row| row.get(0),
     )?;
@@ -10116,7 +10953,7 @@ fn export_entities(connection: &Connection, scope_chain: &[String]) -> Result<Ve
         "
         SELECT id, name, entity_type, scope
         FROM entities
-        WHERE scope IN ({scopes})
+        WHERE retired_at IS NULL AND scope IN ({scopes})
         ORDER BY id ASC
         ",
         scope_chain,
@@ -10140,6 +10977,8 @@ fn export_relations(connection: &Connection, scope_chain: &[String]) -> Result<V
         JOIN entities f ON f.id = r.from_entity
         JOIN entities t ON t.id = r.to_entity
         WHERE r.valid_to IS NULL
+          AND f.retired_at IS NULL
+          AND t.retired_at IS NULL
           AND f.scope IN ({placeholders})
           AND t.scope IN ({placeholders})
         ORDER BY r.created_at ASC, r.id ASC
@@ -10161,7 +11000,7 @@ fn export_observations(
         SELECT o.id, o.entity_id, o.content, o.category, o.confidence, e.scope
         FROM observations o
         JOIN entities e ON e.id = o.entity_id
-        WHERE o.valid_to IS NULL AND e.scope IN ({scopes})
+        WHERE o.valid_to IS NULL AND e.retired_at IS NULL AND e.scope IN ({scopes})
         ORDER BY o.created_at ASC, o.id ASC
         ",
         scope_chain,
@@ -10187,7 +11026,7 @@ fn export_decisions(
         "
         SELECT id, title, status, scope, reasoning, superseded_by
         FROM decisions
-        WHERE scope IN ({scopes})
+        WHERE status != 'revoked' AND scope IN ({scopes})
         ORDER BY created_at ASC, id ASC
         ",
         scope_chain,
@@ -10210,7 +11049,7 @@ fn export_state(connection: &Connection, scope_chain: &[String]) -> Result<Vec<S
         "
         SELECT key, title, status, priority, owner, scope, details, blockers, depends_on
         FROM state
-        WHERE scope IN ({scopes})
+        WHERE status != 'abandoned' AND scope IN ({scopes})
         ORDER BY updated_at ASC, key ASC
         ",
         scope_chain,
@@ -10224,7 +11063,7 @@ fn export_context(connection: &Connection, scope_chain: &[String]) -> Result<Vec
         "
         SELECT key, title, category, scope, version, content
         FROM context
-        WHERE scope IN ({scopes})
+        WHERE retired_at IS NULL AND scope IN ({scopes})
         ORDER BY updated_at ASC, key ASC
         ",
         scope_chain,
@@ -10310,7 +11149,7 @@ fn status_active_sessions(connection: &Connection, scope_chain: &[String]) -> Re
             let goal: Option<String> = row.get(2)?;
             let scope: String = row.get(3)?;
             Ok(format!(
-                "{id} {session_type}: {} [{}]",
+                "[session:{id}] {session_type}: {} [{}]",
                 goal.unwrap_or_else(|| "No goal".to_owned()),
                 display_scope(&scope)
             ))
@@ -10336,7 +11175,7 @@ fn status_active_state(connection: &Connection, scope_chain: &[String]) -> Resul
             let priority: String = row.get(3)?;
             let scope: String = row.get(4)?;
             Ok(format!(
-                "{key}: {title} ({status}, {priority}) [{}]",
+                "[state:{key}] {title} ({status}, {priority}) [{}]",
                 display_scope(&scope)
             ))
         },
@@ -10349,7 +11188,7 @@ fn status_recent_decisions(connection: &Connection, scope_chain: &[String]) -> R
         "
         SELECT id, title, status, scope
         FROM decisions
-        WHERE scope IN ({scopes})
+        WHERE status != 'revoked' AND scope IN ({scopes})
         ORDER BY created_at DESC
         LIMIT 10
         ",
@@ -10360,7 +11199,7 @@ fn status_recent_decisions(connection: &Connection, scope_chain: &[String]) -> R
             let status: String = row.get(2)?;
             let scope: String = row.get(3)?;
             Ok(format!(
-                "{id} {title} ({status}) [{}]",
+                "[decision:{id}] {title} ({status}) [{}]",
                 display_scope(&scope)
             ))
         },
@@ -10371,7 +11210,7 @@ fn status_recent_events(connection: &Connection, scope_chain: &[String]) -> Resu
     query_scoped_rows(
         connection,
         "
-        SELECT summary, scope
+        SELECT id, summary, scope
         FROM events
         WHERE scope IN ({scopes})
         ORDER BY created_at DESC
@@ -10379,9 +11218,13 @@ fn status_recent_events(connection: &Connection, scope_chain: &[String]) -> Resu
         ",
         scope_chain,
         |row| {
-            let summary: String = row.get(0)?;
-            let scope: String = row.get(1)?;
-            Ok(format!("{summary} [{}]", display_scope(&scope)))
+            let id: String = row.get(0)?;
+            let summary: String = row.get(1)?;
+            let scope: String = row.get(2)?;
+            Ok(format!(
+                "[event:{id}] {summary} [{}]",
+                display_scope(&scope)
+            ))
         },
     )
 }
@@ -10482,19 +11325,21 @@ mod tests {
 
     use super::{
         add_context, approve_candidate, ask_memory, bulk_review_candidates, capture_ledger, chat,
-        delete_context, delete_decision, delete_entity, delete_observation, delete_relation,
-        delete_state, edit_candidate, end_session, export_memory, extract_capture_memory,
+        delete_context, delete_decision, delete_entity, delete_observation,
+        delete_relation, delete_state, edit_candidate, end_session, export_memory,
+        extract_capture_memory, redact_sensitive_text, MAX_BODY_CHARS, MAX_TITLE_CHARS,
+        TRUNCATION_MARK,
         generate_report, get_context, get_embedding_status, get_graph, get_status, handoff_session,
         hybrid_search_results, import_memory, ingest_capture_event, list_candidates,
-        list_capture_events, list_context, list_decisions, list_events, list_observations,
-        list_relations, list_sessions, list_state, log_decision, pending_embedding_count,
-        process_embedding_jobs, propose_candidate, reject_candidate, reopen_candidate,
-        resolve_and_open, revert_candidate_approval, run_capture_watch, save_entity, search_memory,
-        start_capture_session, update_context, update_decision, update_entity, update_observation,
-        update_relation, update_session, upsert_state, AddContextOptions, ApproveCandidateOptions,
-        AskMemoryOptions, BulkCandidateReviewOptions, CandidateOrder, CaptureLedgerOptions,
-        ChatOptions, ContextListOptions, DecisionListOptions, DeleteContextOptions,
-        DeleteDecisionOptions, DeleteEntityOptions, DeleteObservationOptions,
+        list_capture_events, list_context, list_decisions, list_entities, list_events,
+        list_observations, list_relations, list_sessions, list_state, log_decision,
+        pending_embedding_count, process_embedding_jobs, propose_candidate, reject_candidate,
+        reopen_candidate, resolve_and_open, revert_candidate_approval, run_capture_watch,
+        save_entity, search_memory, start_capture_session, update_context, update_decision,
+        update_entity, update_observation, update_relation, update_session, upsert_state,
+        AddContextOptions, ApproveCandidateOptions, AskMemoryOptions, BulkCandidateReviewOptions,
+        CandidateOrder, CaptureLedgerOptions, ChatOptions, ContextListOptions, DecisionListOptions,
+        DeleteContextOptions, DeleteDecisionOptions, DeleteEntityOptions, DeleteObservationOptions,
         DeleteRelationOptions, DeleteStateOptions, EditCandidateOptions, EmbeddingStatusOptions,
         EndSessionOptions, EventListOptions, EvidenceInput, ExportOptions, ExtractCaptureOptions,
         ExtractionCandidate, GetContextOptions, GraphOptions, HandoffOptions, ImportOptions,
@@ -11741,8 +12586,8 @@ mod tests {
 
         let deleted = delete_context(DeleteContextOptions {
             project_name: None,
-            start_dir: project_dir,
-            grafiki_home: Some(home),
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
             key: "phase1-prd".to_owned(),
         })
         .unwrap();
@@ -11753,6 +12598,22 @@ mod tests {
         assert_eq!(updated.version, 2);
         assert_eq!(search.results.len(), 1);
         assert_eq!(deleted.key, "phase1-prd");
+        assert!(get_context(GetContextOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            key: "phase1-prd".to_owned(),
+        })
+        .is_err());
+        let (_project, connection) = resolve_and_open(None, project_dir, Some(home)).unwrap();
+        let retired: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM context WHERE key = 'phase1-prd' AND retired_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired, 1, "delete must preserve the retired history row");
     }
 
     #[test]
@@ -11963,6 +12824,156 @@ mod tests {
     }
 
     #[test]
+    fn bare_high_entropy_secret_near_keyword_is_redacted() {
+        // No prefix, no `=` assignment — the shape that previously leaked
+        // while the JWT beside it was caught.
+        let mut text = String::from(
+            "The webhook signing key is a3f9c2e81b7d4056e9c1f80a2b6d4e37 for staging.",
+        );
+        assert!(redact_sensitive_text(&mut text));
+        assert!(!text.contains("a3f9c2e81b7d4056e9c1f80a2b6d4e37"), "{text}");
+        assert!(text.contains("[REDACTED_SECRET]"));
+
+        // The same token WITHOUT a secret-naming word on the line survives —
+        // build ids / artifact hashes are not secrets by default.
+        let mut benign = String::from(
+            "The deployment build is a3f9c2e81b7d4056e9c1f80a2b6d4e37 for staging.",
+        );
+        redact_sensitive_text(&mut benign);
+        assert!(benign.contains("a3f9c2e81b7d4056e9c1f80a2b6d4e37"), "{benign}");
+
+        // Long pure-alphabetic words on a key-naming line survive (no digits).
+        let mut prose = String::from(
+            "The key architectural consideration is internationalizationframeworks here.",
+        );
+        redact_sensitive_text(&mut prose);
+        assert!(prose.contains("internationalizationframeworks"), "{prose}");
+    }
+
+    #[test]
+    fn oversized_fields_are_clamped_at_the_write_boundary() {
+        let (_temp, home, project_dir) = setup_project();
+        // Well under the 16MiB HTTP body cap, and previously stored verbatim —
+        // it then rendered UNCLAMPED inside the briefing.
+        let huge = "A".repeat(1_000_000);
+        let report = log_decision(LogDecisionOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            title: huge.clone(),
+            reasoning: Some(huge),
+            alternatives: vec![],
+            tags: vec![],
+            scope: String::new(),
+            supersedes: None,
+        })
+        .unwrap();
+
+        let (_project, connection) =
+            resolve_and_open(None, project_dir, Some(home)).unwrap();
+        let (title, reasoning): (String, String) = connection
+            .query_row(
+                "SELECT title, reasoning FROM decisions WHERE id = ?1",
+                rusqlite::params![report.decision_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            title.chars().count() <= MAX_TITLE_CHARS + TRUNCATION_MARK.chars().count(),
+            "title must be clamped, got {} chars",
+            title.chars().count()
+        );
+        assert!(title.ends_with(TRUNCATION_MARK), "clamping must be marked");
+        assert!(
+            reasoning.chars().count() <= MAX_BODY_CHARS + TRUNCATION_MARK.chars().count(),
+            "reasoning must be clamped, got {} chars",
+            reasoning.chars().count()
+        );
+    }
+
+    #[test]
+    fn default_scope_cursor_extraction_sees_events() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let (_temp, home, project_dir) = setup_project();
+
+        // Events at the default (empty/root) scope — what the desktop terminal
+        // ingest and a bare `grafiki capture extract` actually produce.
+        let capture = start_capture_session(StartCaptureOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            scope: String::new(),
+            source_app: Some("test".to_owned()),
+            consent_profile: None,
+            redaction_profile: None,
+        })
+        .unwrap();
+        ingest_capture_event(IngestCaptureEventOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            capture_id: Some(capture.capture.id.clone()),
+            source_type: "terminal".to_owned(),
+            source: None,
+            title: Some("session".to_owned()),
+            text: Some("We chose SQLite over Postgres for V1 because it's embedded.".to_owned()),
+            payload: None,
+            metadata: None,
+            scope: String::new(),
+            privacy_level: None,
+            captured_at: None,
+            redacted: false,
+        })
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 16384];
+            let _ = socket.read(&mut buf).unwrap();
+            let content = "[{\"kind\":\"decision\",\"title\":\"Use SQLite\",\"content\":\
+                 \"Chosen over Postgres for V1 because it is embedded.\"}]";
+            let envelope =
+                serde_json::json!({"message":{"role":"assistant","content":content}}).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{envelope}",
+                envelope.len()
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+
+        // The exact path the desktop "Extract now" button, the ⌘K action, and a
+        // bare `grafiki capture extract` hit: no capture id, default scope,
+        // cursor-based unextracted-only read. The root scope resolves to an
+        // empty chain, and `scope IN ()` is always false in SQLite — this used
+        // to return zero events and report "no new session activity" forever.
+        let report = extract_capture_memory(ExtractCaptureOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            capture_id: None,
+            scope: String::new(),
+            limit: 100,
+            model: None,
+            ollama_url: Some(format!("http://127.0.0.1:{port}")),
+            unextracted_only: true,
+        })
+        .unwrap();
+        server.join().unwrap();
+
+        assert!(
+            report.events_read >= 1,
+            "default-scope events must be visible to cursor-based extraction, got: {}",
+            report.message
+        );
+        assert_eq!(report.proposed, 1);
+    }
+
+    #[test]
     fn run_capture_watch_imports_transcript_then_proposes() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -12049,6 +13060,54 @@ mod tests {
         .unwrap();
         assert_eq!(again.events_imported, 0, "re-run imports nothing new");
         assert_eq!(again.proposed, 0);
+    }
+
+    #[test]
+    fn run_capture_watch_rechecks_consent_and_fails_closed() {
+        let (_temp, home, project_dir) = setup_project();
+        crate::project::update_capture_config(crate::project::UpdateCaptureConfigOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            sources: crate::project::CaptureSourceUpdates {
+                transcripts: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        let disabled = run_capture_watch(RunCaptureWatchOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            agent: "claude-code".to_owned(),
+            input: None,
+            scope: "example-project".to_owned(),
+            limit: 10,
+            model: None,
+            ollama_url: None,
+        })
+        .unwrap_err();
+        assert!(disabled.to_string().contains("disabled"));
+
+        std::fs::remove_file(project_dir.join(".grafiki.capture.json")).unwrap();
+        let missing = run_capture_watch(RunCaptureWatchOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home),
+            agent: "claude-code".to_owned(),
+            input: None,
+            scope: "example-project".to_owned(),
+            limit: 10,
+            model: None,
+            ollama_url: None,
+        })
+        .unwrap_err();
+        assert!(missing.to_string().contains("existing consent file"));
+        assert!(
+            !project_dir.join(".grafiki.capture.json").exists(),
+            "passive capture must not recreate a deleted consent file"
+        );
     }
 
     #[test]
@@ -12340,16 +13399,19 @@ mod tests {
         assert!(reverted.candidate.trusted_record_id.is_none());
         assert!(reverted.candidate.evidence[0].trusted_record_type.is_none());
 
-        // The trusted decision itself is gone.
+        // The trusted decision is revoked from active retrieval but retained as
+        // immutable audit/history rather than hard-deleted.
         let decisions = list_decisions(DecisionListOptions {
             project_name: None,
             start_dir: project_dir.clone(),
             grafiki_home: Some(home.clone()),
             scope: String::new(),
-            status: None,
+            status: Some("revoked".to_owned()),
         })
         .unwrap();
-        assert!(!decisions.iter().any(|d| d.id == decision_id));
+        assert!(decisions
+            .iter()
+            .any(|d| d.id == decision_id && d.status == "revoked"));
 
         // Reverting an already-pending (never approved) candidate is rejected.
         let again = revert_candidate_approval(RevertApprovalOptions {
@@ -12359,6 +13421,75 @@ mod tests {
             id,
         });
         assert!(again.is_err());
+    }
+
+    #[test]
+    fn revert_approval_restores_exact_prior_decision_state() {
+        let (_temp, home, project_dir) = setup_project();
+        let prior = log_decision(LogDecisionOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            title: "Prior decision".to_owned(),
+            reasoning: Some("needs reconsideration".to_owned()),
+            alternatives: Vec::new(),
+            tags: Vec::new(),
+            scope: "example-project/core".to_owned(),
+            supersedes: None,
+        })
+        .unwrap();
+        update_decision(UpdateDecisionOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: prior.decision_id.clone(),
+            title: None,
+            reasoning: None,
+            scope: None,
+            status: Some("revisit".to_owned()),
+        })
+        .unwrap();
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:llm".to_owned(),
+            source: None,
+            record_type: "decision".to_owned(),
+            payload: serde_json::json!({
+                "title": "Replacement decision",
+                "supersedes": prior.decision_id,
+            }),
+            scope: "example-project/core".to_owned(),
+            confidence: 0.8,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+        approve_candidate(ApproveCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: proposed.candidate.id.clone(),
+        })
+        .unwrap();
+        revert_candidate_approval(RevertApprovalOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: proposed.candidate.id,
+        })
+        .unwrap();
+
+        let (_project, connection) = resolve_and_open(None, project_dir, Some(home)).unwrap();
+        let restored: (String, Option<String>) = connection
+            .query_row(
+                "SELECT status, superseded_by FROM decisions WHERE id = ?1",
+                [&prior.decision_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(restored, ("revisit".to_owned(), None));
     }
 
     #[test]
@@ -12538,6 +13669,32 @@ mod tests {
             blocked.is_err() && blocked.unwrap_err().to_string().contains("being approved"),
             "a fresh claim must block a second approval"
         );
+        let reject_during_approval = reject_candidate(RejectCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: id.clone(),
+            rationale: None,
+        });
+        assert!(reject_during_approval
+            .unwrap_err()
+            .to_string()
+            .contains("being approved"));
+        let edit_during_approval = edit_candidate(EditCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: id.clone(),
+            record_type: None,
+            payload: None,
+            scope: None,
+            confidence: None,
+            rationale: None,
+        });
+        assert!(edit_during_approval
+            .unwrap_err()
+            .to_string()
+            .contains("being approved"));
 
         // A STALE claim (crashed approval) is retakeable.
         let (_p, connection) =
@@ -12567,6 +13724,110 @@ mod tests {
             id,
         });
         assert!(again.is_err());
+    }
+
+    #[test]
+    fn approval_retry_reuses_provisional_trusted_pointer() {
+        let (_temp, home, project_dir) = setup_project();
+        let trusted = log_decision(LogDecisionOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            title: "Recovered trusted decision".to_owned(),
+            reasoning: Some("created before a simulated finalize crash".to_owned()),
+            alternatives: Vec::new(),
+            tags: Vec::new(),
+            scope: "example-project/core".to_owned(),
+            supersedes: None,
+        })
+        .unwrap();
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:llm".to_owned(),
+            source: None,
+            record_type: "decision".to_owned(),
+            payload: serde_json::json!({ "title": "Would duplicate without recovery" }),
+            scope: "example-project/core".to_owned(),
+            confidence: 0.7,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+        let (_project, connection) =
+            resolve_and_open(None, project_dir.clone(), Some(home.clone())).unwrap();
+        connection
+            .execute(
+                "UPDATE extraction_candidates
+                 SET reviewed_at = '2020-01-01T00:00:00Z',
+                     trusted_record_type = 'decision', trusted_record_id = ?1
+                 WHERE id = ?2",
+                rusqlite::params![trusted.decision_id, proposed.candidate.id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let approved = approve_candidate(ApproveCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: proposed.candidate.id,
+        })
+        .unwrap();
+        assert_eq!(
+            approved.candidate.trusted_record_id.as_deref(),
+            Some(trusted.decision_id.as_str())
+        );
+        let decisions = list_decisions(DecisionListOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            scope: "example-project/core".to_owned(),
+            status: None,
+        })
+        .unwrap();
+        assert_eq!(
+            decisions.len(),
+            1,
+            "retry must not create a duplicate decision"
+        );
+    }
+
+    #[test]
+    fn approval_error_releases_claim_without_clearing_recovery_state() {
+        let (_temp, home, project_dir) = setup_project();
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:llm".to_owned(),
+            source: None,
+            record_type: "decision".to_owned(),
+            payload: serde_json::json!({ "reasoning": "title is intentionally missing" }),
+            scope: "example-project/core".to_owned(),
+            confidence: 0.5,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+        let result = approve_candidate(ApproveCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: proposed.candidate.id.clone(),
+        });
+        assert!(result.is_err());
+        let (_project, connection) = resolve_and_open(None, project_dir, Some(home)).unwrap();
+        let state: (String, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT status, reviewed_at, trusted_record_id
+                 FROM extraction_candidates WHERE id = ?1",
+                [&proposed.candidate.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("pending".to_owned(), None, None));
     }
 
     #[test]
@@ -12968,6 +14229,39 @@ mod tests {
                 .any(|r| r.snippet.contains("us-east-1")),
             "stale observation must be suppressed after supersession"
         );
+
+        revert_candidate_approval(RevertApprovalOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: proposed.candidate.id,
+        })
+        .unwrap();
+        let restored = search_memory(SearchMemoryOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            query: "us-east-1".to_owned(),
+            record_type: "all".to_owned(),
+            mode: SearchMode::Keyword,
+            scope: scope.to_owned(),
+            limit: 10,
+            temporal_weight: 0.0,
+        })
+        .unwrap();
+        assert!(
+            restored.results.iter().any(|result| result.id == old_obs),
+            "undo must reopen the predecessor's exact validity window"
+        );
+        let (_project, connection) = resolve_and_open(None, project_dir, Some(home)).unwrap();
+        let valid_to: Option<String> = connection
+            .query_row(
+                "SELECT valid_to FROM observations WHERE id = ?1",
+                [&old_obs],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(valid_to.is_none());
     }
 
     #[test]
@@ -13318,9 +14612,25 @@ mod tests {
 
         let deleted = delete_state(DeleteStateOptions {
             project_name: None,
-            start_dir: project_dir,
-            grafiki_home: Some(home),
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
             key: "memory-loop".to_owned(),
+        })
+        .unwrap();
+        let current = list_state(StateListOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            status: None,
+            scope: "example-project/core".to_owned(),
+        })
+        .unwrap();
+        let history = list_state(StateListOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            status: Some("abandoned".to_owned()),
+            scope: "example-project/core".to_owned(),
         })
         .unwrap();
 
@@ -13336,6 +14646,13 @@ mod tests {
             .iter()
             .any(|session| session.id == session_id));
         assert_eq!(deleted.key, "memory-loop");
+        assert_eq!(deleted.status, "abandoned");
+        assert!(current.is_empty());
+        assert_eq!(
+            history.len(),
+            1,
+            "retired state must remain queryable as history"
+        );
     }
 
     #[test]
@@ -13577,6 +14894,145 @@ mod tests {
 
         assert!(remaining.is_empty());
         assert!(graph.relations.is_empty());
+    }
+
+    #[test]
+    fn relation_upsert_returns_and_audits_the_persisted_id() {
+        let (_temp, home, project_dir) = setup_project();
+        start_codex(home.clone(), project_dir.clone());
+        save_entity(SaveEntityOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            name: "Database".to_owned(),
+            entity_type: "service".to_owned(),
+            observe: None,
+            category: "general".to_owned(),
+            scope: "example-project/core".to_owned(),
+            relate: None,
+        })
+        .unwrap();
+        let save = || {
+            save_entity(SaveEntityOptions {
+                project_name: None,
+                start_dir: project_dir.clone(),
+                grafiki_home: Some(home.clone()),
+                name: "Auth Service".to_owned(),
+                entity_type: "service".to_owned(),
+                observe: None,
+                category: "general".to_owned(),
+                scope: "example-project/core".to_owned(),
+                relate: Some("database:depends_on".to_owned()),
+            })
+            .unwrap()
+        };
+        let first = save().relation_id.unwrap();
+        let second = save().relation_id.unwrap();
+        assert_eq!(first, second, "upsert must return the existing relation id");
+
+        let (_project, connection) = resolve_and_open(None, project_dir, Some(home)).unwrap();
+        let rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM relations WHERE id = ?1",
+                [&second],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let audit_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE target_type = 'relation' AND target_id = ?1",
+                [&second],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(audit_rows, 2);
+    }
+
+    #[test]
+    fn keyword_all_interleaves_record_types_before_global_limit() {
+        let (_temp, home, project_dir) = setup_project();
+        for index in 0..6 {
+            save_entity(SaveEntityOptions {
+                project_name: None,
+                start_dir: project_dir.clone(),
+                grafiki_home: Some(home.clone()),
+                name: format!("Auth Component {index}"),
+                entity_type: "service".to_owned(),
+                observe: None,
+                category: "general".to_owned(),
+                scope: "example-project/core".to_owned(),
+                relate: None,
+            })
+            .unwrap();
+        }
+        let exact = save_entity(SaveEntityOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            name: "Login".to_owned(),
+            entity_type: "service".to_owned(),
+            observe: Some("auth uses exact rotating credentials".to_owned()),
+            category: "architecture".to_owned(),
+            scope: "example-project/core".to_owned(),
+            relate: None,
+        })
+        .unwrap()
+        .observation_id
+        .unwrap();
+
+        let results = search_memory(SearchMemoryOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            query: "auth".to_owned(),
+            record_type: "all".to_owned(),
+            mode: SearchMode::Keyword,
+            scope: "example-project/core".to_owned(),
+            limit: 5,
+            temporal_weight: 0.0,
+        })
+        .unwrap()
+        .results;
+        assert!(
+            results.iter().any(|result| result.id == exact),
+            "an observation must not be starved by entity hits: {results:?}"
+        );
+    }
+
+    #[test]
+    fn entity_ids_are_nonempty_and_collision_safe() {
+        let (_temp, home, project_dir) = setup_project();
+        let save = |name: &str| {
+            save_entity(SaveEntityOptions {
+                project_name: None,
+                start_dir: project_dir.clone(),
+                grafiki_home: Some(home.clone()),
+                name: name.to_owned(),
+                entity_type: "concept".to_owned(),
+                observe: None,
+                category: "general".to_owned(),
+                scope: "example-project/core".to_owned(),
+                relate: None,
+            })
+            .unwrap()
+        };
+        let first = save("Auth/API");
+        let second = save("Auth API");
+        let unicode = save("认证服务");
+        assert_ne!(first.entity_id, second.entity_id);
+        assert!(!unicode.entity_id.is_empty());
+        assert!(unicode.entity_id.starts_with("entity-"));
+
+        let entities = list_entities(super::EntityListOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            scope: "example-project/core".to_owned(),
+            entity_type: None,
+        })
+        .unwrap();
+        assert_eq!(entities.len(), 3);
     }
 
     #[test]
@@ -14044,6 +15500,66 @@ mod tests {
             .contains("[REDACTED_EMAIL]"));
     }
 
+    #[test]
+    fn capture_ingest_redacts_nested_structured_secrets_before_serialization() {
+        let (_temp, home, project_dir) = setup_project();
+        let started = start_capture_session(StartCaptureOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            scope: "example-project".to_owned(),
+            source_app: Some("test".to_owned()),
+            consent_profile: None,
+            redaction_profile: Some("default".to_owned()),
+        })
+        .unwrap();
+        let event = ingest_capture_event(IngestCaptureEventOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            capture_id: Some(started.capture.id),
+            source_type: "agent".to_owned(),
+            source: None,
+            title: None,
+            text: None,
+            payload: Some(serde_json::json!({
+                "client_secret": "plainsecretvalue123",
+                "nested": { "password": "hunter2plaintext" },
+                "credentials": [{ "value": "nested-credential" }],
+                "client_id": "public-id"
+            })),
+            metadata: Some(serde_json::json!({
+                "auth_token": 123456,
+                "owner": "alice"
+            })),
+            scope: "example-project".to_owned(),
+            privacy_level: Some("internal".to_owned()),
+            captured_at: None,
+            redacted: false,
+        })
+        .unwrap();
+
+        let serialized = serde_json::to_string(&event.event).unwrap();
+        for secret in [
+            "plainsecretvalue123",
+            "hunter2plaintext",
+            "nested-credential",
+            "123456",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "structured secret leaked: {serialized}"
+            );
+        }
+        assert_eq!(
+            event.event.payload.as_ref().unwrap()["client_id"],
+            "public-id"
+        );
+        assert_eq!(event.event.metadata.as_ref().unwrap()["owner"], "alice");
+        assert!(event.event.redacted);
+        assert_eq!(event.event.privacy_level, "sensitive");
+    }
+
     // --- M-E6: entropy-gated + additional-prefix secret detection ----------
 
     #[test]
@@ -14237,6 +15753,123 @@ mod tests {
     }
 
     #[test]
+    fn candidate_and_evidence_insert_roll_back_together() {
+        let (_temp, home, project_dir) = setup_project();
+        let result = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "agent".to_owned(),
+            source: None,
+            record_type: "decision".to_owned(),
+            payload: serde_json::json!({ "title": "Must not remain" }),
+            scope: "example-project/core".to_owned(),
+            confidence: 0.5,
+            rationale: None,
+            evidence: vec![EvidenceInput {
+                source_event_id: None,
+                source_type: " ".to_owned(),
+                source: None,
+                title: None,
+                excerpt: "invalid evidence".to_owned(),
+                uri: None,
+                byte_start: None,
+                byte_end: None,
+                line_start: None,
+                line_end: None,
+                captured_at: None,
+            }],
+        });
+        assert!(result.is_err());
+
+        let (_project, connection) = resolve_and_open(None, project_dir, Some(home)).unwrap();
+        let candidates: i64 = connection
+            .query_row("SELECT COUNT(*) FROM extraction_candidates", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let evidence: i64 = connection
+            .query_row("SELECT COUNT(*) FROM evidence_links", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((candidates, evidence), (0, 0));
+    }
+
+    #[test]
+    fn evidence_order_uses_source_position_not_random_ulid_suffix() {
+        let (_temp, home, project_dir) = setup_project();
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:auto".to_owned(),
+            source: Some("session-auth".to_owned()),
+            record_type: "context".to_owned(),
+            payload: serde_json::json!({
+                "key": "session-auth",
+                "title": "Auth session",
+                "content": "Argon2id uses 64 MiB"
+            }),
+            scope: "example-project/core".to_owned(),
+            confidence: 0.8,
+            rationale: None,
+            evidence: vec![
+                EvidenceInput {
+                    source_event_id: None,
+                    source_type: "transcript".to_owned(),
+                    source: Some("session-auth:1".to_owned()),
+                    title: None,
+                    excerpt: "source fact".to_owned(),
+                    uri: None,
+                    byte_start: None,
+                    byte_end: None,
+                    line_start: Some(1),
+                    line_end: Some(1),
+                    captured_at: Some("2026-01-10T09:00:00Z".to_owned()),
+                },
+                EvidenceInput {
+                    source_event_id: None,
+                    source_type: "transcript".to_owned(),
+                    source: Some("session-auth:2".to_owned()),
+                    title: None,
+                    excerpt: "assistant summary".to_owned(),
+                    uri: None,
+                    byte_start: None,
+                    byte_end: None,
+                    line_start: Some(2),
+                    line_end: Some(2),
+                    captured_at: Some("2026-01-10T09:00:00Z".to_owned()),
+                },
+            ],
+        })
+        .unwrap();
+        let (_project, connection) = resolve_and_open(None, project_dir, Some(home)).unwrap();
+        // Force the random-ID order to conflict with source order. The old
+        // `ORDER BY created_at, id` path would now return turn 2 first.
+        connection
+            .execute(
+                "UPDATE evidence_links SET id = 'ZZ-source-turn-1'
+                 WHERE candidate_id = ?1 AND source = 'session-auth:1'",
+                [&proposed.candidate.id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE evidence_links SET id = 'AA-source-turn-2'
+                 WHERE candidate_id = ?1 AND source = 'session-auth:2'",
+                [&proposed.candidate.id],
+            )
+            .unwrap();
+        let reloaded =
+            super::load_extraction_candidate(&connection, &proposed.candidate.id).unwrap();
+        let sources = reloaded
+            .evidence
+            .iter()
+            .filter_map(|evidence| evidence.source.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(sources, vec!["session-auth:1", "session-auth:2"]);
+    }
+
+    #[test]
     fn pending_embedding_count_reflects_the_queue() {
         let (_temp, home, project_dir) = setup_project();
 
@@ -14313,6 +15946,66 @@ mod tests {
             )
             .unwrap();
         assert_eq!(failed, 0, "rebuild must revive previously-failed jobs");
+    }
+
+    #[cfg(feature = "sqlite-vec")]
+    #[test]
+    fn retiring_a_record_removes_its_sqlite_vec_entry() {
+        let (_temp, home, project_dir) = setup_project();
+        let saved = save_entity(SaveEntityOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            name: "Vector Target".to_owned(),
+            entity_type: "service".to_owned(),
+            observe: None,
+            category: "general".to_owned(),
+            scope: "example-project/core".to_owned(),
+            relate: None,
+        })
+        .unwrap();
+        process_embedding_jobs(ProcessEmbeddingsOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            scope: "example-project/core".to_owned(),
+            limit: 20,
+            rebuild: true,
+        })
+        .unwrap();
+        let (_project, connection) =
+            resolve_and_open(None, project_dir.clone(), Some(home.clone())).unwrap();
+        let table = super::sqlite_vec_tables(&connection).unwrap().remove(0);
+        let before: i64 = connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {table} WHERE record_type='entity' AND record_id=?1"
+                ),
+                [&saved.entity_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 1);
+        drop(connection);
+
+        delete_entity(DeleteEntityOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: saved.entity_id.clone(),
+        })
+        .unwrap();
+        let (_project, connection) = resolve_and_open(None, project_dir, Some(home)).unwrap();
+        let after: i64 = connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {table} WHERE record_type='entity' AND record_id=?1"
+                ),
+                [&saved.entity_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 0);
     }
 
     #[cfg(unix)]

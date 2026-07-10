@@ -8,8 +8,11 @@ use clap::{Parser, Subcommand};
 use grafiki_core::SearchMode;
 
 use grafiki_eval::config::{EvalConfig, EvalResult, OutputFormat};
-use grafiki_eval::dataset::{RedactionDataset, RetrievalDataset, SupersessionDataset};
+use grafiki_eval::dataset::{
+    MemoryQaDataset, RedactionDataset, RetrievalDataset, SupersessionDataset,
+};
 use grafiki_eval::report;
+use grafiki_eval::runner::memory_qa::{run_memory_qa, ApproverPolicy, MemoryQaReport};
 use grafiki_eval::runner::redaction::{run_redaction, RedactionReport};
 use grafiki_eval::runner::retrieval::{run_retrieval, RetrievalReport};
 use grafiki_eval::runner::supersession::{run_supersession, SupersessionReport};
@@ -41,9 +44,12 @@ struct RunArgs {
     /// Dataset path (defaults to the bundled fixture for the chosen arm).
     #[arg(long)]
     dataset: Option<PathBuf>,
-    /// keyword | semantic | hybrid | all (retrieval arm only)
+    /// keyword | semantic | hybrid | all (retrieval and memory-QA arms)
     #[arg(long, default_value = "keyword")]
     mode: String,
+    /// auto-all | oracle | reject-all (memory-QA arm only)
+    #[arg(long, default_value = "auto-all")]
+    approver: String,
     #[arg(long, default_value = "md")]
     format: String,
     /// Write results.json + report.md into this directory (else print to stdout).
@@ -109,17 +115,19 @@ fn run(args: &RunArgs) -> EvalResult<i32> {
 
     let arm = args.arm.trim().to_ascii_lowercase();
     let do_retrieval = arm == "retrieval" || arm == "all";
+    let do_memory_qa = arm == "memory-qa" || arm == "memory_qa" || arm == "all";
     let do_redaction = arm == "redaction" || arm == "all";
     let do_supersession = arm == "supersession" || arm == "all";
-    if !do_retrieval && !do_redaction && !do_supersession {
+    if !do_retrieval && !do_memory_qa && !do_redaction && !do_supersession {
         return Err(format!(
-            "unknown --arm '{}' (expected retrieval|redaction|supersession|all)",
+            "unknown --arm '{}' (expected retrieval|memory-qa|redaction|supersession|all)",
             args.arm
         )
         .into());
     }
 
     let mut retrieval_report: Option<RetrievalReport> = None;
+    let mut memory_qa_reports: Vec<MemoryQaReport> = Vec::new();
     let mut redaction_report: Option<RedactionReport> = None;
     let mut supersession_report: Option<SupersessionReport> = None;
 
@@ -142,6 +150,33 @@ fn run(args: &RunArgs) -> EvalResult<i32> {
             println!("{md}");
         }
         retrieval_report = Some(rep);
+    }
+
+    if do_memory_qa {
+        let dir = args
+            .dataset
+            .clone()
+            .filter(|_| arm == "memory-qa" || arm == "memory_qa")
+            .unwrap_or_else(|| fixtures_dir().join("memory_qa/grafiki_sessions_v1"));
+        let dataset = MemoryQaDataset::load(&dir)?;
+        let approver = ApproverPolicy::parse(&args.approver)?;
+        for mode in parse_modes(&args.mode)? {
+            let rep = run_memory_qa(&dataset, mode, approver, &cfg)?;
+            let json = report::memory_qa_json(&rep, &cfg);
+            let md = report::memory_qa_md(&rep, &cfg);
+            if let Some(out) = &cfg.out_dir {
+                let stem = format!(
+                    "memory-qa-{}",
+                    grafiki_eval::runner::memory_qa::report_mode(&rep)
+                );
+                write_outputs(out, &stem, &json, &md)?;
+            } else if matches!(cfg.format, OutputFormat::Json) {
+                println!("{}", serde_json::to_string_pretty(&json)?);
+            } else {
+                println!("{md}");
+            }
+            memory_qa_reports.push(rep);
+        }
     }
 
     if do_redaction {
@@ -187,6 +222,7 @@ fn run(args: &RunArgs) -> EvalResult<i32> {
     if let Some(path) = &args.write_baseline {
         let baseline = report::build_baseline(
             retrieval_report.as_ref(),
+            memory_qa_reports.first(),
             redaction_report.as_ref(),
             supersession_report.as_ref(),
             args.tolerance,
@@ -210,6 +246,7 @@ fn run(args: &RunArgs) -> EvalResult<i32> {
         let failures = report::check_regressions(
             &baseline,
             retrieval_report.as_ref(),
+            memory_qa_reports.first(),
             redaction_report.as_ref(),
             supersession_report.as_ref(),
         );

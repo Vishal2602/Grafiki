@@ -68,6 +68,43 @@ struct ProjectSnapshot {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DesktopEmbeddingCapabilities {
+    provider: &'static str,
+    model: &'static str,
+    dimension: usize,
+    vector_backend: &'static str,
+    production: bool,
+}
+
+fn desktop_embedding_capabilities() -> DesktopEmbeddingCapabilities {
+    #[cfg(feature = "production-embeddings")]
+    {
+        DesktopEmbeddingCapabilities {
+            provider: "fastembed",
+            model: "sentence-transformers/all-MiniLM-L6-v2",
+            dimension: 384,
+            vector_backend: "json+sqlite-vec",
+            production: true,
+        }
+    }
+    #[cfg(not(feature = "production-embeddings"))]
+    {
+        DesktopEmbeddingCapabilities {
+            provider: "deterministic",
+            model: "hashed-token-v1",
+            dimension: 64,
+            vector_backend: "json",
+            production: false,
+        }
+    }
+}
+
+#[tauri::command]
+fn get_desktop_embedding_capabilities() -> DesktopEmbeddingCapabilities {
+    desktop_embedding_capabilities()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SnapshotRequest {
@@ -138,6 +175,7 @@ struct ListCandidatesRequest {
     scope: Option<String>,
     status: Option<String>,
     limit: Option<usize>,
+    capture_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -737,6 +775,7 @@ fn get_session_detail(
 #[serde(rename_all = "camelCase")]
 struct LiveTranscriptRequest {
     start_dir: Option<String>,
+    terminal_id: String,
 }
 
 /// Tail this project's newest Claude Code transcript as conversation turns —
@@ -744,9 +783,13 @@ struct LiveTranscriptRequest {
 #[tauri::command]
 fn get_live_transcript(
     request: LiveTranscriptRequest,
+    registry: State<terminal::TerminalRegistry>,
 ) -> Result<Vec<grafiki_core::LiveTranscriptTurn>, String> {
-    grafiki_core::read_live_transcript(&resolve_start_dir(request.start_dir), 80)
-        .map_err(|error| error.to_string())
+    terminal::session_live_transcript(
+        &registry,
+        &request.terminal_id,
+        &resolve_start_dir(request.start_dir),
+    )
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -790,6 +833,7 @@ struct ExtractSessionRequest {
     start_dir: Option<String>,
     model: Option<String>,
     ollama_url: Option<String>,
+    capture_id: Option<String>,
 }
 
 /// One tick of the "Granola for agents" loop, desktop edition: extract durable
@@ -829,16 +873,17 @@ fn extract_session_memory(
                 }
             }
         };
+        let capture_id = clean_optional(request.capture_id);
         extract_capture_memory(ExtractCaptureOptions {
             project_name: None,
             start_dir: resolve_start_dir(request.start_dir),
             grafiki_home: None,
-            capture_id: None,
+            capture_id: capture_id.clone(),
             scope: String::new(),
             limit: 200,
             model: Some(model),
             ollama_url,
-            unextracted_only: true,
+            unextracted_only: capture_id.is_none(),
         })
         .map(Some)
         .map_err(|error| error.to_string())
@@ -1281,9 +1326,11 @@ fn list_memory_candidates(
         scope: None,
         status: None,
         limit: None,
+        capture_id: None,
     });
 
-    list_candidates(ListCandidatesOptions {
+    let capture_id = clean_optional(request.capture_id);
+    let candidates = list_candidates(ListCandidatesOptions {
         project_name: None,
         start_dir: resolve_start_dir(request.start_dir),
         grafiki_home: None,
@@ -1292,7 +1339,14 @@ fn list_memory_candidates(
         limit: request.limit.unwrap_or(50),
         order: CandidateOrder::Recent,
     })
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    Ok(match capture_id {
+        Some(capture_id) => candidates
+            .into_iter()
+            .filter(|candidate| candidate.source.as_deref() == Some(capture_id.as_str()))
+            .collect(),
+        None => candidates,
+    })
 }
 
 #[tauri::command]
@@ -2484,6 +2538,13 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 
 pub fn run() {
     install_panic_logger();
+    // A packaged production build should use the local semantic stack without
+    // requiring users to discover an environment variable. Explicit user
+    // configuration still wins, and lean debug builds remain deterministic.
+    #[cfg(feature = "production-embeddings")]
+    if env::var_os("GRAFIKI_EMBEDDING_PROVIDER").is_none() {
+        env::set_var("GRAFIKI_EMBEDDING_PROVIDER", "auto");
+    }
     let builder = tauri::Builder::default();
     // E2E automation servers — DEBUG BUILDS ONLY, never shipped:
     // - wdio-webdriver powers the WebdriverIO regression suite (npm run test:e2e)
@@ -2504,6 +2565,7 @@ pub fn run() {
         .manage(DaemonTokens::default())
         .manage(terminal::TerminalRegistry::default())
         .invoke_handler(tauri::generate_handler![
+            get_desktop_embedding_capabilities,
             get_project_snapshot,
             initialize_project,
             search_project_memory,
@@ -3271,6 +3333,8 @@ fn slug_key(title: &str, prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "production-embeddings")]
+    use super::desktop_embedding_capabilities;
     use super::generate_daemon_token;
 
     #[test]
@@ -3280,5 +3344,15 @@ mod tests {
         assert_eq!(a.len(), 64, "256-bit token = 64 hex chars");
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b, "tokens must not repeat");
+    }
+
+    #[test]
+    #[cfg(feature = "production-embeddings")]
+    fn production_embedding_capabilities_are_exposed() {
+        let capabilities = desktop_embedding_capabilities();
+        assert!(capabilities.production);
+        assert_eq!(capabilities.provider, "fastembed");
+        assert_eq!(capabilities.dimension, 384);
+        assert_eq!(capabilities.vector_backend, "json+sqlite-vec");
     }
 }

@@ -5,6 +5,7 @@
 //! - **Retrieval** (BEIR triple): `corpus_seed.jsonl`, `queries.jsonl`,
 //!   `qrels.tsv`, optional `dataset.json` (name/version/description).
 //! - **Redaction**: a single `*.jsonl` of labeled cases.
+//! - **Memory QA** (LongMemEval-shaped): `sessions.jsonl` + `questions.jsonl`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -205,6 +206,136 @@ impl RetrievalDataset {
             }
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Memory-QA replay (Arm B)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryQaTurn {
+    /// Stable evidence id. When omitted, the loader derives
+    /// `<session_id>:<one-based turn index>`.
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryQaSession {
+    pub session_id: String,
+    pub date: String,
+    pub turns: Vec<MemoryQaTurn>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryQaQuestion {
+    pub question_id: String,
+    pub question_type: String,
+    pub question: String,
+    #[serde(default)]
+    pub answer: String,
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub abstain: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryQaDataset {
+    pub name: String,
+    pub sessions: Vec<MemoryQaSession>,
+    pub questions: Vec<MemoryQaQuestion>,
+}
+
+impl MemoryQaDataset {
+    pub fn load(dir: &Path) -> EvalResult<Self> {
+        let mut sessions: Vec<MemoryQaSession> = read_jsonl(&dir.join("sessions.jsonl"))?;
+        let questions: Vec<MemoryQaQuestion> = read_jsonl(&dir.join("questions.jsonl"))?;
+
+        let mut session_ids = std::collections::HashSet::new();
+        let mut evidence_ids = std::collections::HashSet::new();
+        for session in &mut sessions {
+            if session.session_id.trim().is_empty()
+                || !session_ids.insert(session.session_id.clone())
+            {
+                return Err(format!(
+                    "memory-QA session id is empty or duplicated: '{}'",
+                    session.session_id
+                )
+                .into());
+            }
+            if session.turns.is_empty() {
+                return Err(
+                    format!("memory-QA session '{}' has no turns", session.session_id).into(),
+                );
+            }
+            for (index, turn) in session.turns.iter_mut().enumerate() {
+                if turn.content.trim().is_empty() {
+                    return Err(format!(
+                        "memory-QA session '{}' turn {} has empty content",
+                        session.session_id,
+                        index + 1
+                    )
+                    .into());
+                }
+                let id = turn
+                    .turn_id
+                    .get_or_insert_with(|| format!("{}:{}", session.session_id, index + 1));
+                if !evidence_ids.insert(id.clone()) {
+                    return Err(format!("duplicate memory-QA evidence id '{id}'").into());
+                }
+            }
+        }
+
+        let mut question_ids = std::collections::HashSet::new();
+        for question in &questions {
+            if question.question.trim().is_empty()
+                || !question_ids.insert(question.question_id.clone())
+            {
+                return Err(format!(
+                    "memory-QA question id is duplicated or text is empty: '{}'",
+                    question.question_id
+                )
+                .into());
+            }
+            if question.abstain && !question.evidence_ids.is_empty() {
+                return Err(format!(
+                    "abstention question '{}' must not declare evidence",
+                    question.question_id
+                )
+                .into());
+            }
+            if !question.abstain && question.evidence_ids.is_empty() {
+                return Err(format!(
+                    "answerable question '{}' must declare evidence",
+                    question.question_id
+                )
+                .into());
+            }
+            for evidence in &question.evidence_ids {
+                if !evidence_ids.contains(evidence) {
+                    return Err(format!(
+                        "question '{}' references unknown evidence id '{}'",
+                        question.question_id, evidence
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let name = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("memory-qa")
+            .to_owned();
+        Ok(Self {
+            name,
+            sessions,
+            questions,
+        })
     }
 }
 

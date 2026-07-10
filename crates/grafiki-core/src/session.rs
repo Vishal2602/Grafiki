@@ -138,6 +138,10 @@ fn generate_template_briefing(
     let observations = query_recent_observations(connection, scope_chain)?;
     let events = query_recent_events(connection, scope_chain)?;
 
+    const FOOTER: &str =
+        "\nUse this briefing as the project memory starting point for the session.\n";
+    let content_budget =
+        crate::context_budget::DEFAULT_CONTEXT_BUDGET_CHARS.saturating_sub(FOOTER.chars().count());
     let mut briefing = String::new();
     briefing.push_str("# Grafiki Briefing\n\n");
     briefing.push_str(&format!("- Project: {project}\n"));
@@ -147,33 +151,72 @@ fn generate_template_briefing(
         "- Scope: {}\n",
         if scope.is_empty() { "global" } else { scope }
     ));
-    briefing.push_str(&format!("- Goal: {goal}\n\n"));
+    briefing.push_str(&format!(
+        "- Goal: {}\n\n",
+        crate::context_budget::truncate_chars(goal, 600)
+    ));
 
-    push_section(&mut briefing, "Active Decisions", &decisions);
-    push_section(&mut briefing, "Active Work", &state_items);
-    push_section(&mut briefing, "Recent Sessions", &recent_sessions);
-    push_section(&mut briefing, "Recent Observations", &observations);
-    push_section(&mut briefing, "Recent Events", &events);
+    // Useful work context wins the deterministic budget: actionable state and
+    // active decisions first, then fresh facts/sessions/events. Every item starts
+    // with a stable record id so a truncated briefing remains auditable.
+    push_section(&mut briefing, "Active Work", &state_items, content_budget);
+    push_section(
+        &mut briefing,
+        "Active Decisions",
+        &decisions,
+        content_budget,
+    );
+    push_section(
+        &mut briefing,
+        "Recent Observations",
+        &observations,
+        content_budget,
+    );
+    push_section(
+        &mut briefing,
+        "Recent Sessions",
+        &recent_sessions,
+        content_budget,
+    );
+    push_section(&mut briefing, "Recent Events", &events, content_budget);
 
-    briefing
-        .push_str("\nUse this briefing as the project memory starting point for the session.\n");
+    briefing = crate::context_budget::truncate_chars(&briefing, content_budget);
+    briefing.push_str(FOOTER);
     Ok(briefing)
 }
 
-fn push_section(briefing: &mut String, title: &str, items: &[String]) {
-    briefing.push_str(&format!("## {title}\n"));
+fn push_section(briefing: &mut String, title: &str, items: &[String], max_chars: usize) {
+    let remaining = max_chars.saturating_sub(briefing.chars().count());
+    let heading = format!("## {title}\n");
+    if remaining <= heading.chars().count() {
+        return;
+    }
+    briefing.push_str(&heading);
 
     if items.is_empty() {
-        briefing.push_str("- None yet.\n\n");
+        if max_chars.saturating_sub(briefing.chars().count()) >= 13 {
+            briefing.push_str("- None yet.\n\n");
+        }
         return;
     }
 
-    for item in items {
+    let remaining = max_chars.saturating_sub(briefing.chars().count());
+    let kept = crate::context_budget::budget_ranked_strings(
+        items.iter().cloned(),
+        remaining,
+        crate::context_budget::DEFAULT_ITEM_BUDGET_CHARS,
+    );
+    for item in kept {
+        if max_chars.saturating_sub(briefing.chars().count()) < item.chars().count() + 3 {
+            break;
+        }
         briefing.push_str("- ");
-        briefing.push_str(item);
+        briefing.push_str(&item);
         briefing.push('\n');
     }
-    briefing.push('\n');
+    if briefing.chars().count() < max_chars {
+        briefing.push('\n');
+    }
 }
 
 fn query_active_decisions(
@@ -183,7 +226,7 @@ fn query_active_decisions(
     query_scoped_rows(
         connection,
         "
-        SELECT title, scope
+        SELECT id, title, scope
         FROM decisions
         WHERE status = 'active' AND scope IN ({scopes})
         ORDER BY created_at DESC
@@ -191,9 +234,13 @@ fn query_active_decisions(
         ",
         scope_chain,
         |row| {
-            let title: String = row.get(0)?;
-            let scope: String = row.get(1)?;
-            Ok(format!("{title} [{}]", display_scope(&scope)))
+            let id: String = row.get(0)?;
+            let title: String = row.get(1)?;
+            let scope: String = row.get(2)?;
+            Ok(format!(
+                "[decision:{id}] {title} [{}]",
+                display_scope(&scope)
+            ))
         },
     )
 }
@@ -218,7 +265,7 @@ fn query_active_state(connection: &Transaction<'_>, scope_chain: &[String]) -> R
             let scope: String = row.get(5)?;
             let owner = owner.unwrap_or_else(|| "unassigned".to_owned());
             Ok(format!(
-                "{key}: {title} ({status}, {priority}, {owner}) [{}]",
+                "[state:{key}] {title} ({status}, {priority}, {owner}) [{}]",
                 display_scope(&scope)
             ))
         },
@@ -232,7 +279,7 @@ fn query_recent_sessions(
 ) -> Result<Vec<String>> {
     let sql = scoped_query(
         "
-        SELECT session_type, goal, summary, scope
+        SELECT id, session_type, goal, summary, scope
         FROM sessions
         WHERE status IN ('completed', 'handed-off') AND id != ? AND scope IN ({scopes})
         ORDER BY ended_at DESC, started_at DESC
@@ -243,13 +290,14 @@ fn query_recent_sessions(
     let mut statement = connection.prepare(&sql)?;
     let params = std::iter::once(current_session_id).chain(scope_chain.iter().map(String::as_str));
     let rows = statement.query_map(params_from_iter(params), |row| {
-        let session_type: String = row.get(0)?;
-        let goal: Option<String> = row.get(1)?;
-        let summary: Option<String> = row.get(2)?;
-        let scope: String = row.get(3)?;
+        let id: String = row.get(0)?;
+        let session_type: String = row.get(1)?;
+        let goal: Option<String> = row.get(2)?;
+        let summary: Option<String> = row.get(3)?;
+        let scope: String = row.get(4)?;
         let headline = summary.or(goal).unwrap_or_else(|| "No summary".to_owned());
         Ok(format!(
-            "{session_type}: {headline} [{}]",
+            "[session:{id}] {session_type}: {headline} [{}]",
             display_scope(&scope)
         ))
     })?;
@@ -264,21 +312,22 @@ fn query_recent_observations(
     query_scoped_rows(
         connection,
         "
-        SELECT e.id, o.category, o.content, e.scope
+        SELECT o.id, e.id, o.category, o.content, e.scope
         FROM observations o
         JOIN entities e ON e.id = o.entity_id
-        WHERE o.valid_to IS NULL AND e.scope IN ({scopes})
+        WHERE o.valid_to IS NULL AND e.retired_at IS NULL AND e.scope IN ({scopes})
         ORDER BY o.created_at DESC
         LIMIT 15
         ",
         scope_chain,
         |row| {
-            let entity_id: String = row.get(0)?;
-            let category: String = row.get(1)?;
-            let content: String = row.get(2)?;
-            let scope: String = row.get(3)?;
+            let observation_id: String = row.get(0)?;
+            let entity_id: String = row.get(1)?;
+            let category: String = row.get(2)?;
+            let content: String = row.get(3)?;
+            let scope: String = row.get(4)?;
             Ok(format!(
-                "{entity_id} ({category}): {content} [{}]",
+                "[observation:{observation_id}] {entity_id} ({category}): {content} [{}]",
                 display_scope(&scope)
             ))
         },
@@ -292,7 +341,7 @@ fn query_recent_events(
     query_scoped_rows(
         connection,
         "
-        SELECT summary, scope
+        SELECT id, summary, scope
         FROM events
         WHERE scope IN ({scopes})
         ORDER BY created_at DESC
@@ -300,9 +349,13 @@ fn query_recent_events(
         ",
         scope_chain,
         |row| {
-            let summary: String = row.get(0)?;
-            let scope: String = row.get(1)?;
-            Ok(format!("{summary} [{}]", display_scope(&scope)))
+            let id: String = row.get(0)?;
+            let summary: String = row.get(1)?;
+            let scope: String = row.get(2)?;
+            Ok(format!(
+                "[event:{id}] {summary} [{}]",
+                display_scope(&scope)
+            ))
         },
     )
 }
@@ -356,6 +409,7 @@ mod tests {
     use rusqlite::Connection;
 
     use crate::db::schema::initialize_schema;
+    use crate::memory::{save_entity, SaveEntityOptions};
     use crate::project::{init_project, InitOptions};
 
     use super::{start_session, StartSessionOptions};
@@ -450,5 +504,49 @@ mod tests {
                 "example-project/backend/api"
             ]
         );
+    }
+
+    #[test]
+    fn start_session_briefing_is_bounded_and_keeps_record_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let project_dir = temp.path().join("example-project");
+        init_project(InitOptions {
+            project_name: None,
+            project_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+        })
+        .unwrap();
+        let observation_id = save_entity(SaveEntityOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            name: "Large Runbook".to_owned(),
+            entity_type: "concept".to_owned(),
+            observe: Some("important deployment detail ".repeat(3_000)),
+            category: "architecture".to_owned(),
+            scope: "example-project/core".to_owned(),
+            relate: None,
+        })
+        .unwrap()
+        .observation_id
+        .unwrap();
+
+        let report = start_session(StartSessionOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            session_type: "codex".to_owned(),
+            goal: "Use the existing project memory".to_owned(),
+            scope: "example-project/core".to_owned(),
+        })
+        .unwrap();
+        assert!(
+            report.briefing.chars().count() <= crate::context_budget::DEFAULT_CONTEXT_BUDGET_CHARS
+        );
+        assert!(report
+            .briefing
+            .contains(&format!("[observation:{observation_id}]")));
+        assert!(report.briefing.contains('…'));
     }
 }

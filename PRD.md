@@ -141,7 +141,7 @@ Phase 2:
 
 Important architecture rule:
 - `grafiki serve` runs the HTTP API, background jobs, and connectors.
-- `grafiki mcp --project <project>` runs stdio MCP for clients.
+- `grafiki mcp --project <project>` runs least-privilege, read-only stdio MCP for clients; trusted clients must explicitly opt into mutation tools with `--allow-write`.
 - MCP can talk to the daemon over HTTP when available, otherwise use direct SQLite.
 
 Desktop direction:
@@ -349,5 +349,5 @@ Current implementation status:
 - Done: session start/end/handoff, decisions, entities, observations, relations, state, context, evidence-linked candidate review with edit/bulk actions, agent memory ask/audit, events, logs, status, search, graph traversal, reports, analysis, export, JSON import, a localhost HTTP API with daemon lifecycle and optional token auth, a first MCP stdio tool surface, and a Tauri desktop alpha with URL-synced panes plus review/agent-activity surfaces.
 - Done: export formats for JSON, Markdown, wiki directory, DOT, GraphML, and self-contained HTML.
 - Done: client setup examples, shell smoke coverage, and first Cargo integration tests for CLI/HTTP/daemon/MCP.
-- Next: build the Tauri desktop memory console foundation with Macro-inspired sharpness, command palette, launcher, and URL-synced multi-pane layout.
-- Later: automatic session hooks, richer graph analysis, packaging, AI-tool integrations, and external connectors.
+- Next: finish signed/notarized distribution, clean-machine installed-app testing, and larger real-world retrieval/memory-QA evaluations.
+- Later: richer graph analysis, cross-platform desktop packaging, deeper AI-tool integrations, and external connectors.

@@ -647,9 +647,10 @@ impl VectorBackend for SqliteVecBackend<'_> {
 #[cfg(feature = "sqlite-vec")]
 pub fn register_sqlite_vec() -> Result<()> {
     unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+        let entry = std::mem::transmute::<*const (), rusqlite::auto_extension::RawAutoExtension>(
             sqlite_vec::sqlite3_vec_init as *const (),
-        )));
+        );
+        rusqlite::ffi::sqlite3_auto_extension(Some(entry));
     }
     Ok(())
 }

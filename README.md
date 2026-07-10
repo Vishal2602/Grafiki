@@ -146,6 +146,8 @@ When a token is configured, pass it as `Authorization: Bearer <token>`, `X-Grafi
 
 Grafiki defaults to deterministic local embeddings so the core workflow is fast, offline, and testable. For real local semantic embeddings, build with the `fastembed` feature and set `GRAFIKI_EMBEDDING_PROVIDER=fastembed`. Add the `sqlite-vec` feature when you want the embedding worker and semantic search to maintain a local vector index. The first run may download the MiniLM model and ONNX Runtime assets through fastembed.
 
+Published desktop builds enable the `production-embeddings` feature, which forwards both `fastembed` and `sqlite-vec` into the desktop's in-process core and selects the automatic real-provider path when no provider override is set. Development builds remain lightweight.
+
 ```bash
 GRAFIKI_EMBEDDING_PROVIDER=fastembed cargo run -p grafiki-cli --features fastembed -- embeddings rebuild --scope grafiki/core
 GRAFIKI_EMBEDDING_PROVIDER=fastembed cargo run -p grafiki-cli --features "fastembed sqlite-vec" -- search "token refresh design" --scope grafiki/core --mode semantic
@@ -155,7 +157,7 @@ For an optional end-to-end check of the real local embedding stack, run `scripts
 
 ## Desktop App
 
-The Tauri desktop app lives in `apps/grafiki-desktop`. It is a Macro-inspired memory console with a left rail, top status strip, inspector, command palette, launcher, URL-synced multi-pane layout, native project folder picker, scoped search with mode/type/scope filters and embedding freshness controls, session controls with real history, direct handoff/completion actions, handoff review, editable session records, native local-daemon controls, Capture Consent settings for source toggles/blocked paths, real memory capture, transcript import from Codex/Claude Code/Cursor histories, a Memory Review pane grouped by source/day with keyboard focus flow, evidence previews, noisy-candidate selection, and candidate edit/approve/reject/bulk promotion into trusted memory, a focused relations ledger, real decisions/context/state list panes, inline maintenance for context/state, detail-view editing/deletion for decisions/entities/observations/relations/context/state plus session editing, and detail/provenance panes.
+The Tauri desktop app lives in `apps/grafiki-desktop`. Its primary surfaces are Today, hosted agent sessions, trusted Memory (chat, exact/semantic search, decisions, context, and Agent Activity), Memory Review, and Settings. It includes a keyboard-first command palette, URL-synced panes, native project selection, explicit capture consent, per-terminal provenance, off/digest/full terminal privacy modes, evidence-linked candidate review, manual decision/context creation, record detail maintenance, daemon controls, embedding freshness/maintenance, responsive zoom reflow, and screen-reader semantics.
 
 ```bash
 cd apps/grafiki-desktop
@@ -230,7 +232,7 @@ curl -X POST http://127.0.0.1:9700/api/candidates/approve -H 'Content-Type: appl
 curl -X POST http://127.0.0.1:9700/api/capture/auto -H 'Content-Type: application/json' -d '{"scope":"grafiki/core","source":"codex-session"}'
 curl "http://127.0.0.1:9700/api/capture/config"
 curl -X POST http://127.0.0.1:9700/api/capture/config -H 'Content-Type: application/json' -d '{"terminal":true,"files":true,"git":true,"add_blocked_paths":["secrets"],"terminal_output":"off"}'
-curl -X POST http://127.0.0.1:9700/api/capture/import-transcripts -H 'Content-Type: application/json' -d '{"scope":"grafiki/core","agent":"codex","input":"/path/to/session.jsonl","summarize":true}'
+curl -X POST http://127.0.0.1:9700/api/capture/import-transcripts -H 'Content-Type: application/json' -d '{"scope":"grafiki/core","agent":"codex","input":"/path/to/project/.grafiki-imports/session.jsonl","summarize":true}'
 curl -X POST http://127.0.0.1:9700/api/capture/terminal-command -H 'Content-Type: application/json' -d '{"scope":"grafiki/core","command":"cargo test","cwd":"/path/to/project","exit_code":0,"duration_ms":1200,"shell":"zsh"}'
 curl -X POST http://127.0.0.1:9700/api/capture/watch-files -H 'Content-Type: application/json' -d '{"scope":"grafiki/core","since_seconds":300,"limit":50,"summarize":true}'
 curl -X POST http://127.0.0.1:9700/api/capture/git-summary -H 'Content-Type: application/json' -d '{"scope":"grafiki/core","summarize":true}'
@@ -242,7 +244,7 @@ curl -X POST http://127.0.0.1:9700/api/sessions/end -H 'Content-Type: applicatio
 
 ## MCP
 
-`grafiki mcp` runs a stdio JSON-RPC server for MCP-compatible clients. The first tool surface includes:
+`grafiki mcp` runs a stdio JSON-RPC server for MCP-compatible clients. It is read-only by default; pass `--allow-write` only for a trusted client that should curate memory. The complete capability set (read-only plus opt-in write tools) includes:
 
 ```text
 grafiki_start

@@ -12,6 +12,7 @@ pub mod chat;
 pub mod code_index;
 pub mod confidence;
 pub mod conflict;
+mod context_budget;
 pub mod db;
 pub mod decay;
 pub mod embeddings;
@@ -80,10 +81,10 @@ pub use memory::{
     UpdateObservationOptions, UpdateRelationOptions, UpdateSessionOptions, UpsertStateOptions,
 };
 pub use project::{
-    grafiki_home, init_project, load_capture_config, resolve_project, update_capture_config,
-    CaptureConfig, CaptureConfigOptions, CaptureConfigReport, CaptureSourceConfig,
-    CaptureSourceUpdates, InitImportedFile, InitOptions, InitReport, ProjectContext,
-    ProjectResolveOptions, UpdateCaptureConfigOptions,
+    canonical_descendant, grafiki_home, init_project, load_capture_config, resolve_project,
+    update_capture_config, CaptureConfig, CaptureConfigOptions, CaptureConfigReport,
+    CaptureSourceConfig, CaptureSourceUpdates, InitImportedFile, InitOptions, InitReport,
+    ProjectContext, ProjectResolveOptions, UpdateCaptureConfigOptions,
 };
 pub use reflection::{CommunityDetail, ReflectionReport, RunReflectionOptions};
 pub use scope::{Scope, ScopeChain};

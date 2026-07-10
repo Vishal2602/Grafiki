@@ -1,0 +1,6 @@
+{"question_id":"qa-auth-algorithm","question_type":"info-extraction","question":"Argon2id","answer":"Argon2id","evidence_ids":["session-auth:1"],"abstain":false}
+{"question_id":"qa-auth-cost","question_type":"info-extraction","question":"64 MiB","answer":"64 MiB","evidence_ids":["session-auth:1"],"abstain":false}
+{"question_id":"qa-backup-policy","question_type":"multi-session","question":"backups","answer":"every 6 hours and are retained for 30 days","evidence_ids":["session-backups:1"],"abstain":false}
+{"question_id":"qa-current-timeout","question_type":"temporal","question":"45 seconds","answer":"45 seconds","evidence_ids":["session-timeout-new:1"],"abstain":false}
+{"question_id":"qa-focus-ring","question_type":"info-extraction","question":"ultramarine","answer":"two-pixel ultramarine outline","evidence_ids":["session-frontend:1"],"abstain":false}
+{"question_id":"qa-unknown-region","question_type":"abstention","question":"zephyrhostingregion","answer":"","evidence_ids":[],"abstain":true}

@@ -1,0 +1,5 @@
+{
+  "name": "grafiki_type_balance_v1",
+  "version": "1",
+  "description": "Regression fixture: a saturated entity result set must not starve a more useful observation."
+}

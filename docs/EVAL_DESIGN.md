@@ -1,7 +1,7 @@
 # DESIGN: `grafiki-eval` — Grafiki Evaluation Harness (H1)
 
-**Status:** Proposed (implementation-ready)
-**Crate:** `crates/grafiki-eval` (new workspace member)
+**Status:** Implemented; deterministic arms run in CI
+**Crate:** `crates/grafiki-eval`
 **Depends on:** `grafiki-core` (path dep, in-process), `clap`, `serde`, `serde_json`
 **Owner:** Lead engineer, eval
 **Version target:** v1 self-contained + offline; extensible to v2 (judged QA / external datasets) and v3 (SWE-bench memory-lift)
@@ -16,7 +16,7 @@
 
 1. **Rigor / correctness first.** Metrics match the world standard *exactly*. The single biggest correctness risk is the nDCG gain convention: we implement **linear-gain TREC nDCG** (gain = grade, discount = `1/log2(rank+1)`), the convention `pytrec_eval`/BEIR/MTEB report, and we **prove it** against `pytrec_eval` on a frozen fixture (one-time, offline). We never ship the exponential `2^rel−1` variant as the default, or our numbers are not comparable to BEIR/MTEB.
 2. **Reproducibility by construction.** Every run pins and records: `grafiki-core` version + git hash, embedding model id (`all-MiniLM-L6-v2`) + dim (384), RRF params (`RRF_K=45`, kw weight `1.10`, semantic `1.00`, `CROSS_SOURCE_BONUS=0.018`, `text_match_boost`), dataset version, RNG seed, bootstrap iterations. This is `lm-evaluation-harness`'s central lesson (arXiv:2405.14782): *the harness, not the model, is the dominant source of irreproducibility.*
-3. **Self-contained v1.** No network, no model download, no API keys, no external datasets. Grafiki-native fixtures + gold sets checked into the repo. Keyword retrieval + redaction are fully deterministic and run in the existing fast CI `test` matrix.
+3. **Self-contained v1.** No network, no model download, no API keys, no external datasets. Grafiki-native fixtures + gold sets are checked in. Keyword retrieval, memory-QA replay, supersession, and redaction are deterministic and run in the fast CI matrix.
 4. **Honest headline.** Grafiki's `ask_memory` has **no LLM generator** (`format_agent_memory_answer` templates status + top-5 snippets). So the honest headline for a *retriever* is **retrieval quality** (does the right evidence reach the briefing) + **abstention** + **redaction safety**, not a faux "QA accuracy." Judged free-text QA is a clearly-labeled v2 layer behind a feature flag.
 5. **Multi-dimensional reporting** (HELM lesson): report retrieval quality **and** latency/cost **and** redaction safety side-by-side; never collapse to one number. Always report uncertainty (bootstrap 95% CI) and, for system comparisons, paired significance.
 6. **Extensible.** The dataset schema is BEIR-shaped and LongMemEval-shaped from day one, so thin adapters can ingest LongMemEval / LoCoMo / BEIR / SecretBench / MemoryAgentBench later without touching the metrics or runner core. SWE-bench memory-lift is a fully-specified but deferred arm.
@@ -55,7 +55,7 @@ crates/grafiki-eval/
         corpus_seed.jsonl    # records to ingest (record_type, payload, scope, captured_at)
         queries.jsonl        # {_id, text}
         qrels.tsv            # query-id \t doc-id \t grade   (header row; grade 0/1/2)
-        dataset.toml         # version, description, gold-set provenance
+        dataset.json         # version, description, gold-set provenance
     memory_qa/
       grafiki_sessions_v1/
         sessions.jsonl       # LongMemEval-shaped: sessions w/ dates, turns, has_answer
@@ -68,7 +68,8 @@ crates/grafiki-eval/
       pytrec_eval_fixture/   # tiny (qrels, run) + frozen pytrec_eval outputs for the parity test
   tests/
     metrics_oracle.rs        # asserts Rust IR metrics == frozen pytrec_eval outputs (~1e-6)
-    ci_regression.rs         # keyword-retrieval + redaction on fixture vs baseline.json
+    ci_regression.rs         # retrieval balance + structured redaction regressions
+    memory_qa_regression.rs  # capture/review/trust replay + reject-all isolation
 ```
 
 ### 2.2 How it calls `grafiki-core` (in-process, verified signatures)
@@ -77,19 +78,18 @@ No subprocess, no network. The crate depends on `grafiki-core` by path and calls
 
 - **Retrieval:** `grafiki_core::memory::search_memory(SearchMemoryOptions{ project_name, start_dir, grafiki_home, query, record_type: "all", mode, scope, limit })` → `SearchReport{ semantic_available, fallback, results: Vec<SearchResult> }`. `SearchResult` has `{ record_type, id, score: Option<f64>, evidence: Vec<EvidenceLink> }`. Doc id = `format!("{}:{}", record_type, id)`.
 - **Ask:** `ask_memory(AskMemoryOptions{ question, scope, limit, agent: Some("eval"), .. })` → `AgentMemoryBriefing{ answer, relevant_memory: Vec<SearchResult>, semantic_available, fallback, audit_id, .. }`.
-- **Capture→candidate→trusted:** `ingest_capture_event(IngestCaptureEventOptions{ scope, source_type, text, payload, privacy_level, redacted: false, captured_at, .. })` → `CaptureEventReport`; then `propose_capture_candidates(..)` → pending `ExtractionCandidate` rows; then per-candidate `approve_candidate(ApproveCandidateOptions{ id, .. })` → `CandidateMutationReport` (auto-approver), or `reject_candidate(..)`.
-- **Redaction:** `redact_sensitive_text(&mut String) -> bool` is **private** (`fn`, L5858). **Required API addition (v1):** add to `grafiki-core` a small, well-scoped public wrapper:
+- **Capture→candidate→trusted:** `ingest_capture_event(..)` persists dated transcript evidence; the memory-QA runner proposes one reviewable context candidate per source session with stable turn evidence, then applies `auto-all`, `oracle`, or `reject-all` before retrieval.
+- **Redaction:** the implemented `redact_text`/`redact_json` public eval seams test the redactor directly, and `ci_regression.rs` separately verifies structured payload and metadata redaction through the persistence boundary.
 
   ```rust
   /// Public eval/test seam over the redaction trust boundary.
-  /// Returns the redacted text and whether any redaction fired.
   pub fn redact_text(input: &str) -> (String, bool) {
       let mut s = input.to_string();
       let changed = redact_sensitive_text(&mut s);
       (s, changed)
   }
   ```
-  Rationale: lets Arm C score the redactor *directly* (cleaner than reading records back through the ingest path). The harness still keeps an **indirect** path (ingest a secret-bearing event with `redacted:false`, read the stored record back) as a second test that the *trust boundary side-effects* fire (e.g. `privacy_level` escalates to `sensitive`).
+  The indirect ingest regression also proves trust-boundary side effects such as `redacted=true` and privacy escalation to `sensitive`.
 
 ### 2.3 Determinism contract
 
@@ -143,7 +143,7 @@ grafiki-eval validate-metrics   # runs the pytrec_eval-parity oracle test
 
 **v1 self-contained fixture:** 30–50 dev queries over the frozen Grafiki-native store. **Extension point:** thin adapter `dataset::beir::load(dir)` ingests external `corpus.jsonl/queries.jsonl/qrels.tsv` (SciFact/FiQA/NFCorpus are closest in spirit) — format already native, only licensing keeps them out of v1.
 
-### Arm B — Memory-QA replay (capture → candidate → trusted → ask)
+### Arm B — Memory-QA replay (capture → candidate → trusted → retrieve)
 
 **Purpose:** Evaluate the *full loop* end-to-end with a deterministic, judge-free score (retrieval recall over evidence) plus abstention, and isolate candidate-extraction recall from retrieval recall.
 
@@ -154,19 +154,19 @@ grafiki-eval validate-metrics   # runs the pytrec_eval-parity oracle test
 **Procedure (replay mapping):**
 1. **Isolate** each instance into its own `scope`/project; snapshot SQLite per instance so haystacks don't bleed.
 2. **Ingest** each session turn via `ingest_capture_event(source_type="transcript", text=..., captured_at=session.date, ..)`, **threading the session date into the bitemporal `valid_from`** (temporal questions are unanswerable otherwise) and **threading the source session id through `EvidenceLink.source`** so retrieved records map back to gold haystack sessions. This also exercises the redactor on real-ish text.
-3. **Candidate gate (two arms to isolate extraction recall):**
+3. **Candidate gate (three policies to isolate review effects):**
    - `--approver auto-all`: `approve_candidate` for *every* proposed candidate (baseline).
    - `--approver oracle`: approve only candidates whose evidence overlaps gold evidence ids. **The gap between the two = how much candidate-extraction recall (not retrieval) costs you.**
-4. **Ask:** `ask_memory(question, scope, agent="eval")` → `AgentMemoryBriefing`.
+4. **Retrieve:** run the configured search mode and map each result's promoted evidence links back to stable turn ids.
 
 **Scoring — three layers:**
 - **(A) Retrieval (primary, judge-free, CI-safe):** from `relevant_memory` (and audited `returned_ids`), compute Recall@k / nDCG@k / MRR against gold evidence ids threaded at ingest. Directly evaluates FTS5+MiniLM+RRF across all three modes.
-- **(B) Abstention:** for `abstain:true` items, **correct iff the briefing refuses** — `format_agent_memory_answer` emits "I do not have trusted memory for this yet…" when status+search are empty. Any fabricated/non-empty answer = miss. Report **abstention accuracy separately**; never blend with answerable accuracy (the dominant reporting mistake).
+- **(B) Abstention:** for `abstain:true` items, correct iff retrieval returns no relevant-memory result. Unrelated active state is not treated as an answer. Report **abstention accuracy separately**; never blend it with answerable accuracy.
 - **Knowledge-update / supersession:** insert the superseding fact as a *later* session; assert the briefing surfaces the **new** fact and **NOT** the stale one (`valid_to`/supersedes is the mechanism under test).
 
 **Metrics:** answerable Recall@k / nDCG@k / MRR (macro, per question_type); abstention accuracy (separate); supersession pass-rate; plus latency/ingest cost. Optional deterministic answer check: normalized substring/required-fact match on gold short answer.
 
-**v1 self-contained fixture:** ~10–20 small synthetic multi-session conversations authored in the LongMemEval-shaped schema, run across all three modes (so the loop doubles as a hybrid-beats-keyword regression). **Extension points:** `dataset::longmemeval::load` (HF `xiaowu0162/longmemeval-cleaned`: `question_id`/`_abs`→`abstain`, `answer_session_ids`→`evidence_ids`, `haystack_dates`→`captured_at`); `dataset::locomo::load` (`adymaharana/locomo`: `qa.evidence` dia_ids → evidence_ids, `category==5` → `abstain`); MemoryAgentBench conflict items → supersession stress. **(B-judged, v2, feature-flagged):** feed `briefing.answer`/snippets to a fixed external reader LLM and score with the LongMemEval GPT-4o-2024-08-06 judge (temp=0, prompt+model hash recorded) — the honest way to publish a real LongMemEval/LoCoMo number given Grafiki has no generator. Cache judge calls keyed by `(question_id, answer_hash)`.
+**v1 self-contained fixture:** five synthetic sessions and six questions (information extraction, multi-session, temporal, and abstention). Keyword mode is a blocking deterministic baseline; semantic/hybrid modes remain available on demand. **Extension points:** LongMemEval, LoCoMo, and MemoryAgentBench adapters remain future work. A judged free-text layer remains deliberately out of blocking CI.
 
 ### Arm C — Redaction precision/recall/F1 by secret type
 
@@ -267,8 +267,8 @@ Discount at rank 1 = `1/log2(2)=1`, rank 2 = `1/log2(3)≈0.6309`, rank 3 = `0.5
 
 **CI wiring (`.github/workflows/ci.yml`).** Split fast/deterministic (CI) from slow/non-deterministic (nightly), mirroring how `ci.yml` already isolates the fastembed build:
 
-1. **Add to the existing fast `test` matrix** (no model download): `cargo test -p grafiki-eval` runs `metrics_oracle.rs` + `ci_regression.rs` (keyword-retrieval + redaction on the committed fixture).
-2. **New `eval-gate` job** (Ubuntu, fast): `grafiki-eval run --arm retrieval --mode keyword --baseline fixtures/baselines/baseline.json --fail-on-regression` **and** `--arm redaction --fail-on-regression`. **Gate rules:** any **FN (secret leak)** on the positive corpus → **build fails**; redaction precision below threshold → fail; nDCG@10 drop > tolerance (e.g. 0.02 absolute, or below baseline CI lower bound) → fail. Deterministic (seeded, tiny fixture, keyword-only — no model) so it runs on every PR like `cargo test`.
+1. **Existing fast `test` matrix** (no model download): `cargo test -p grafiki-eval` runs the metric oracle, retrieval/type-balance, structured redaction, memory-QA, reflection, and supersession regressions.
+2. **`eval-gate` job** (Ubuntu, fast): `grafiki-eval run --arm all --mode keyword --baseline fixtures/baselines/baseline.json --fail-on-regression`. **Gate rules:** any secret leak fails; redaction precision/recall, retrieval nDCG/recall, memory-QA evidence quality/abstention, and supersession invariants must meet their committed floors.
 3. **`baseline.json`** committed; updated deliberately via PR when a metric change is intended and reviewed.
 4. **Nightly `eval-semantic` job** (feature-flagged, `--features fastembed`): downloads MiniLM, runs semantic+hybrid retrieval and the memory-QA loop; appends headline metrics + git hash to a committed results-history artifact so trend regressions are visible across releases. (v2-judged QA stays behind a separate flag + cached judge.)
 
@@ -281,11 +281,9 @@ Sketch added to `ci.yml`:
       - uses: actions/checkout@v4
       - name: Metric oracle + regression tests
         run: cargo test -p grafiki-eval
-      - name: Retrieval/redaction regression gate
+      - name: Deterministic regression gate
         run: |
-          cargo run -p grafiki-eval -- run --arm retrieval --mode keyword \
-            --baseline crates/grafiki-eval/fixtures/baselines/baseline.json --fail-on-regression
-          cargo run -p grafiki-eval -- run --arm redaction \
+          cargo run -p grafiki-eval -- run --arm all --mode keyword \
             --baseline crates/grafiki-eval/fixtures/baselines/baseline.json --fail-on-regression
 ```
 
@@ -295,12 +293,13 @@ Sketch added to `ci.yml`:
 
 **v1 (build first — self-contained, offline, deterministic, no external datasets, no API keys, in the fast CI matrix):**
 1. **Metrics module** — linear-gain TREC nDCG@k, Recall@k, Precision@k, MRR, MAP, Success@k, Judged@k, P/R/F1/F2, bootstrap + paired-bootstrap + paired-permutation + Holm — with the **pytrec_eval parity oracle test** + a hand-computed example.
-2. **Arm A retrieval** over a 30–50-query Grafiki-native frozen fixture, **Keyword mode in CI** (deterministic, no model), all three modes available locally; mode × metric table + paired permutation (hybrid vs each baseline, Holm).
-3. **Arm C redaction** — synthetic corpus, input→output diff scorer, per-type P/R/F1/F2 + confusion matrix + **leak list**; primary = recall + leak count, precision co-reported. Requires the small `redact_text` public wrapper in `grafiki-core`.
-4. **`results.json` + `report.md`** with full provenance.
-5. **One CI regression gate** (keyword retrieval + redaction): zero leaks + precision ≥ threshold + nDCG@10 within tolerance.
+2. **Arm A retrieval** over committed Grafiki-native fixtures, including a type-saturation regression, with **Keyword mode in CI** and all modes available locally.
+3. **Arm B memory-QA** — deterministic capture/review/trust replay with evidence Recall/nDCG, gold-answer containment, abstention, and reject-all isolation.
+4. **Arm C redaction** — synthetic corpus plus an indirect structured capture-ingest boundary test; per-type P/R/F1/F2 and a hard leak list.
+5. **`results.json` + `report.md`** with full provenance.
+6. **One CI regression gate** spanning keyword retrieval, memory-QA, redaction, and supersession.
 
-**v1.5 (self-contained but needs the MiniLM download → nightly/on-demand, `fastembed` feature):** Arm A **semantic + hybrid**; **Arm B memory-QA** retrieval + abstention scoring (deterministic, judge-free) with `auto-all` vs `oracle` approver split and supersession assertions.
+**v1.5 (needs the MiniLM download → nightly/on-demand, `fastembed` feature):** Arm A and memory-QA **semantic + hybrid** runs.
 
 **v2 (gated on LLM dependency / network, feature-flagged, never in PR-blocking CI):** judged end-to-end QA (external reader + LongMemEval GPT-4o-2024-08-06 judge, temp=0, prompt+model hash recorded, cached) to publish real LongMemEval/LoCoMo numbers; external-dataset adapters (`longmemeval`, `locomo` with LLM-judge + category split, BEIR `SciFact/FiQA/NFCorpus`, MemoryAgentBench conflict items); sqlite-vec ANN-vs-exact recall@k arm.
 

@@ -188,8 +188,9 @@ the `relations` table).
   `indexes_rust_symbols_and_graph_connects_them` (counts + idempotency + graph reaches co-located
   symbols). **Deferred → M-E4b:** cross-file `calls` edges (name resolution), tree-sitter multi-language,
   signatures-as-observations. See `docs/CODE_INDEX_DESIGN.md`. (RepoGraph.) **M**
-- [x] **M-E5 — MCP security hardening.** **DONE.** (1) **Read/write capability split**: `grafiki mcp
-  --read-only` (or `GRAFIKI_MCP_READONLY`) exposes only the ~11 retrieval tools — the ~25
+- [x] **M-E5 — MCP security hardening.** **DONE.** (1) **Read/write capability split**: `grafiki mcp`
+  is read-only by default (`--read-only`/`GRAFIKI_MCP_READONLY` can force it); explicit
+  `--allow-write` exposes the mutating tools. In read-only mode, the ~25
   mutating/curate tools are hidden from `tools/list` AND rejected on call (`tool_is_mutating`). (2)
   **Indirect-prompt-injection guard**: pure `grafiki_core::injection` (curated override phrases +
   chat-template markers; deterministic, 4 unit tests, low-FP on engineering prose) flags

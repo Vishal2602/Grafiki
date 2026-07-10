@@ -48,6 +48,9 @@ import type {
 } from "./types";
 
 const hasTauri = () => "__TAURI_INTERNALS__" in window;
+let previewDataPromise: Promise<typeof import("./previewData")> | null = null;
+const getPreviewData = () =>
+  (previewDataPromise ??= import("./previewData"));
 
 /// True when running outside the Tauri shell (e.g. a plain browser), where the
 /// API returns mock data and mutations are not persisted. The UI surfaces this
@@ -72,7 +75,7 @@ export async function confirmDialog(
 }
 
 export async function getProjectSnapshot(input: { startDir?: string; scope?: string } = {}): Promise<ProjectSnapshot> {
-  if (!hasTauri()) return mockSnapshot;
+  if (!hasTauri()) return (await getPreviewData()).mockSnapshot;
 
   try {
     return await invoke<ProjectSnapshot>("get_project_snapshot", {
@@ -80,8 +83,13 @@ export async function getProjectSnapshot(input: { startDir?: string; scope?: str
     });
   } catch (error) {
     return {
-      ...mockSnapshot,
+      start_dir: input.startDir ?? "",
+      scope: input.scope ?? "",
       memory_available: false,
+      project: null,
+      status: null,
+      report: null,
+      embedding: null,
       error: String(error),
     };
   }
@@ -96,6 +104,7 @@ export async function searchProjectMemory(input: {
   limit?: number;
 }): Promise<SearchReport> {
   if (!hasTauri()) {
+    const { mockSearchResults } = await getPreviewData();
     const recordType = input.recordType ?? "all";
     return {
       project: "Grafiki",
@@ -130,6 +139,7 @@ export async function chatWithMemory(input: {
   ollamaUrl?: string;
 }): Promise<ChatReply> {
   if (!hasTauri()) {
+    const { mockSearchResults } = await getPreviewData();
     const hits = mockSearchResults.filter((result) =>
       `${result.title} ${result.snippet}`.toLowerCase().includes(input.question.toLowerCase()),
     );
@@ -193,8 +203,17 @@ export interface HomeLedgerReport {
     tail: string;
     capturing: boolean;
     capture_hint: string | null;
+    capture_id: string | null;
+    capture_mode: "off" | "digest" | "full";
   }>;
-  resumable: { id: string; launch: string; cwd: string; updated_at: number } | null;
+  resumable: {
+    id: string;
+    launch: string;
+    cwd: string;
+    updated_at: number;
+    capture_id: string | null;
+    capture_mode: "off" | "digest" | "full";
+  } | null;
 }
 
 export interface SessionDetailReport {
@@ -253,15 +272,16 @@ export interface LiveTranscriptTurn {
   timestamp?: string | null;
 }
 
-/// Tail this project's newest Claude Code transcript (the chat lens).
+/// Tail the transcript attributable to one hosted terminal session.
 export async function getLiveTranscript(input: {
   startDir?: string;
+  terminalId: string;
 }): Promise<LiveTranscriptTurn[]> {
   if (!hasTauri()) {
     return [];
   }
   return invoke<LiveTranscriptTurn[]>("get_live_transcript", {
-    request: { startDir: input.startDir ?? "" },
+    request: { startDir: input.startDir ?? "", terminalId: input.terminalId },
   });
 }
 
@@ -279,6 +299,7 @@ export async function listLocalModels(): Promise<string[]> {
 export async function extractSessionMemory(input: {
   startDir?: string;
   model?: string | null;
+  captureId?: string | null;
 }): Promise<{ events_read: number; proposed: number; message: string } | null> {
   if (!hasTauri()) {
     return null;
@@ -289,6 +310,7 @@ export async function extractSessionMemory(input: {
       request: {
         startDir: input.startDir ?? "",
         model: input.model ?? null,
+        captureId: input.captureId ?? null,
         ollamaUrl: null,
       },
     },
@@ -351,6 +373,7 @@ export async function getMemoryRecord(input: {
   scope?: string;
 }): Promise<MemoryRecordDetail> {
   if (!hasTauri()) {
+    const { mockSearchResults } = await getPreviewData();
     return {
       record_type: input.recordType,
       id: input.id,
@@ -571,8 +594,10 @@ export async function listCandidates(input: {
   scope?: string;
   status?: string;
   limit?: number;
+  captureId?: string;
 } = {}): Promise<ExtractionCandidate[]> {
   if (!hasTauri()) {
+    const { mockCandidates } = await getPreviewData();
     const status = input.status ?? "pending";
     return mockCandidates
       .filter((candidate) => status === "all" || candidate.status === status)
@@ -586,6 +611,7 @@ export async function listCandidates(input: {
       scope: input.scope ?? "",
       status: input.status ?? "pending",
       limit: input.limit ?? 50,
+      captureId: input.captureId ?? "",
     },
   });
 }
@@ -595,6 +621,7 @@ export async function approveCandidate(input: {
   id: string;
 }): Promise<CandidateMutationResult> {
   if (!hasTauri()) {
+    const { mockCandidates } = await getPreviewData();
     const candidate = mockCandidates.find((item) => item.id === input.id) ?? mockCandidates[0];
     return {
       candidate: {
@@ -626,6 +653,7 @@ export async function editCandidate(input: {
   rationale?: string;
 }): Promise<CandidateMutationResult> {
   if (!hasTauri()) {
+    const { mockCandidates } = await getPreviewData();
     const candidate = mockCandidates.find((item) => item.id === input.id) ?? mockCandidates[0];
     return {
       candidate: {
@@ -660,6 +688,7 @@ export async function bulkReviewCandidates(input: {
   rationale?: string;
 }): Promise<BulkCandidateReviewResult> {
   if (!hasTauri()) {
+    const { mockCandidates } = await getPreviewData();
     const results = input.ids.map((id) => {
       const candidate = mockCandidates.find((item) => item.id === id) ?? mockCandidates[0];
       return {
@@ -701,6 +730,7 @@ export async function rejectCandidate(input: {
   rationale?: string;
 }): Promise<CandidateMutationResult> {
   if (!hasTauri()) {
+    const { mockCandidates } = await getPreviewData();
     const candidate = mockCandidates.find((item) => item.id === input.id) ?? mockCandidates[0];
     return {
       candidate: {
@@ -729,6 +759,7 @@ export async function revertCandidateApproval(input: {
   id: string;
 }): Promise<CandidateMutationResult> {
   if (!hasTauri()) {
+    const { mockCandidates } = await getPreviewData();
     const candidate = mockCandidates.find((item) => item.id === input.id) ?? mockCandidates[0];
     return {
       candidate: {
@@ -753,6 +784,7 @@ export async function reopenCandidate(input: {
   id: string;
 }): Promise<CandidateMutationResult> {
   if (!hasTauri()) {
+    const { mockCandidates } = await getPreviewData();
     const candidate = mockCandidates.find((item) => item.id === input.id) ?? mockCandidates[0];
     return {
       candidate: { ...candidate, status: "pending", reviewed_at: null },
@@ -1167,6 +1199,7 @@ export async function exportMemoryToFile(input: {
   scope?: string;
 } = {}): Promise<ExportFileResult | null> {
   if (!hasTauri()) {
+    const { mockSearchResults } = await getPreviewData();
     return {
       output_path: "preview-grafiki-export.json",
       records: mockSearchResults.length,
@@ -1443,7 +1476,7 @@ export async function handoffSession(input: HandoffSessionInput): Promise<Handof
 
 export async function pickProjectFolder(defaultPath?: string): Promise<string | null> {
   if (!hasTauri()) {
-    return window.prompt("Project folder", defaultPath ?? mockSnapshot.start_dir);
+    return window.prompt("Project folder", defaultPath ?? "");
   }
 
   const selected = await open({
@@ -1455,138 +1488,3 @@ export async function pickProjectFolder(defaultPath?: string): Promise<string | 
 
   return typeof selected === "string" ? selected : null;
 }
-
-const mockCandidates: ExtractionCandidate[] = [
-  {
-    id: "01JCANDIDATE001",
-    source_type: "assistant",
-    source: "desktop-session",
-    record_type: "decision",
-    payload: {
-      title: "Candidate review stays separate from trusted memory",
-      reasoning: "Extracted memory should be reviewed before it becomes durable project truth.",
-      status: "active",
-      tags: ["desktop", "trust"],
-    },
-    scope: "grafiki/desktop",
-    confidence: 0.91,
-    status: "pending",
-    rationale: "Repeated in a handoff and implementation notes.",
-    trusted_record_type: null,
-    trusted_record_id: null,
-    created_at: new Date(Date.now() - 1000 * 60 * 20).toISOString(),
-    reviewed_at: null,
-  },
-  {
-    id: "01JCANDIDATE002",
-    source_type: "import",
-    source: "preview-json",
-    record_type: "context",
-    payload: {
-      key: "desktop-review-workflow",
-      title: "Desktop review workflow",
-      category: "architecture",
-      content: "Grafiki should surface candidate memory as a review queue before approval.",
-    },
-    scope: "grafiki/desktop",
-    confidence: 0.84,
-    status: "pending",
-    rationale: "Useful but not yet promoted into trusted context.",
-    trusted_record_type: null,
-    trusted_record_id: null,
-    created_at: new Date(Date.now() - 1000 * 60 * 42).toISOString(),
-    reviewed_at: null,
-  },
-];
-
-export const mockSearchResults = [
-  {
-    record_type: "decision",
-    id: "01JDESKTOP001",
-    title: "Desktop shell is a memory console",
-    snippet:
-      "Grafiki Desktop opens into a working console with panes for search, graph, sessions, decisions, context, and settings.",
-    scope: "grafiki/desktop",
-    score: 0.94,
-  },
-  {
-    record_type: "context",
-    id: "01JDESKTOP002",
-    title: "URL-synced pane layout",
-    snippet:
-      "Pane state is encoded into the route so layouts can be restored, shared, bookmarked, and debugged.",
-    scope: "grafiki/desktop",
-    score: 0.9,
-  },
-  {
-    record_type: "state",
-    id: "01JDESKTOP003",
-    title: "Retrieval quality completed",
-    snippet:
-      "Hybrid search now exposes scores, embedding freshness, provider metadata, and larger topic-separation fixtures.",
-    scope: "grafiki/search",
-    score: 0.86,
-  },
-];
-
-const mockSnapshot: ProjectSnapshot = {
-  start_dir: "/Users/vishalsunilkumar/Documents/Project/Grafiki",
-  scope: "",
-  memory_available: true,
-  project: {
-    project: "Grafiki",
-    project_dir: "/Users/vishalsunilkumar/Documents/Project/Grafiki",
-    db_path: "~/.grafiki/Grafiki.db",
-    marker_path: "/Users/vishalsunilkumar/Documents/Project/Grafiki/.grafiki",
-  },
-  status: {
-    project: "Grafiki",
-    scope: "",
-    active_sessions: ["desktop-foundation"],
-    active_state: ["Build Tauri shell", "Wire pane manager"],
-    recent_decisions: ["Macro-inspired, AI-memory-only desktop"],
-    recent_events: ["Desktop plan added", "Retrieval quality completed"],
-  },
-  report: {
-    project: "Grafiki",
-    scope: "",
-    entity_count: 38,
-    relation_count: 64,
-    observation_count: 147,
-    decision_count: 12,
-    active_session_count: 1,
-    god_nodes: [
-      { id: "grafiki", name: "Grafiki", entity_type: "concept", scope: "grafiki", degree: 8 },
-      { id: "desktop", name: "Desktop", entity_type: "module", scope: "grafiki/desktop", degree: 5 },
-    ],
-    orphan_entities: [
-      { id: "retrieval", name: "Retrieval", entity_type: "module", scope: "grafiki/search", degree: 0 },
-    ],
-    suggested_queries: [
-      "What should a new AI session know?",
-      "Which decisions affect desktop architecture?",
-      "What context is stale?",
-    ],
-  },
-  embedding: {
-    project: "Grafiki",
-    scope: "",
-    runtime: {
-      requested_provider: "auto",
-      provider: "deterministic",
-      model: "deterministic-test",
-      dimension: 64,
-      vector_backend: "sqlite-vec",
-      embeddable_records: 147,
-      indexed_records: 142,
-      fresh_records: 139,
-      missing_or_stale_records: 8,
-      note: null,
-    },
-    pending: 3,
-    embedded: 142,
-    failed: 0,
-    skipped: 2,
-  },
-  error: null,
-};
