@@ -168,6 +168,20 @@ impl CaptureMode {
     }
 }
 
+/// The session's LIVE capture state, shared (its own small mutex) between the
+/// reader thread — which revokes/downgrades it when the policy changes
+/// mid-session — and every registry reader (attach, detach, live_sessions,
+/// finish_session). Without this the registry kept the spawn-time mode, so a
+/// detach after "capture off" still persisted a resume tail under stale Full
+/// and the UI kept reporting "Capturing · full".
+#[derive(Clone)]
+struct CaptureState {
+    id: Option<String>,
+    mode: CaptureMode,
+    hint: Option<String>,
+}
+type SharedCapture = Arc<Mutex<CaptureState>>;
+
 #[derive(Debug, Default)]
 struct DigestBuffer {
     observed_bytes: usize,
@@ -227,7 +241,8 @@ pub fn live_sessions(registry: &TerminalRegistry) -> Vec<LiveTerminalInfo> {
             if state.exited {
                 return None;
             }
-            let tail = if session.capture_mode.allows_resume_tail() {
+            let capture = session.capture.lock().unwrap().clone();
+            let tail = if capture.mode.allows_resume_tail() {
                 let scrollback = &state.scrollback;
                 let start = scrollback.len().saturating_sub(600);
                 let text = redact_text(&strip_ansi(&scrollback[start..])).0;
@@ -244,10 +259,10 @@ pub fn live_sessions(registry: &TerminalRegistry) -> Vec<LiveTerminalInfo> {
                 launch: session.launch.clone(),
                 cwd: session.project_root.clone(),
                 tail,
-                capturing: session.capture_id.is_some(),
-                capture_hint: session.capture_hint.clone(),
-                capture_id: session.capture_id.clone(),
-                capture_mode: session.capture_mode.as_str().to_owned(),
+                capturing: capture.id.is_some(),
+                capture_hint: capture.hint.clone(),
+                capture_id: capture.id.clone(),
+                capture_mode: capture.mode.as_str().to_owned(),
             })
         })
         .collect()
@@ -380,11 +395,10 @@ struct TerminalSession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    /// Grafiki capture session id (`None` when the folder isn't a Grafiki project).
-    capture_id: Option<String>,
-    /// User-facing reason capture is off (`None` while capturing).
-    capture_hint: Option<String>,
-    capture_mode: CaptureMode,
+    /// LIVE capture state (id / mode / off-reason), shared with the reader
+    /// thread so a mid-session revocation is visible here too — read this, never
+    /// a cached spawn-time copy.
+    capture: SharedCapture,
     project_root: String,
     /// The agent command this session was started for ("" = plain shell).
     launch: String,
@@ -615,14 +629,13 @@ fn spawn_session(
         if let Some(existing) = sessions.get(&id) {
             if !existing.shared.lock().unwrap().exited {
                 attach_channel(&existing.shared, on_output);
-                let capturing = existing.capture_id.is_some();
-                let capture_hint = existing.capture_hint.clone();
+                let capture = existing.capture.lock().unwrap().clone();
                 return Ok(OpenReply {
                     id,
-                    capturing,
-                    capture_hint,
-                    capture_id: existing.capture_id.clone(),
-                    capture_mode: existing.capture_mode.as_str().to_owned(),
+                    capturing: capture.id.is_some(),
+                    capture_hint: capture.hint.clone(),
+                    capture_id: capture.id.clone(),
+                    capture_mode: capture.mode.as_str().to_owned(),
                 });
             }
             // Exited leftover under this id: drop it and spawn fresh below.
@@ -706,6 +719,11 @@ fn spawn_session(
     };
 
     let preamble = preamble.unwrap_or_default();
+    let capture_state: SharedCapture = Arc::new(Mutex::new(CaptureState {
+        id: capture_id.clone(),
+        mode: capture_mode,
+        hint: capture_hint.clone(),
+    }));
     let shared = Arc::new(Mutex::new(TermShared {
         scrollback: preamble.clone(),
         channel: Some(on_output),
@@ -727,10 +745,12 @@ fn spawn_session(
     // only detaches the channel; it never stops the session.
     {
         let shared = shared.clone();
+        let capture_state = capture_state.clone();
         // Mutable: re-checked against the live capture policy on every flush so
         // a mid-session "capture off" in Settings actually stops persistence
         // instead of the reader thread running for the session's whole life on
-        // the consent it was spawned with.
+        // the consent it was spawned with. Every change is mirrored into
+        // `capture_state` so the registry readers see it too.
         let mut capture_id = capture_id.clone();
         let mut capture_mode_for_reader = capture_mode;
         let project_root = cwd.clone();
@@ -795,6 +815,10 @@ fn spawn_session(
                                     let mut state = shared.lock().unwrap();
                                     let leftover = std::mem::take(&mut state.capture);
                                     state.digest.push(&leftover);
+                                    drop(state);
+                                    // Mirror the downgrade so attach/detach/UI
+                                    // report digest, not stale Full.
+                                    capture_state.lock().unwrap().mode = CaptureMode::Digest;
                                 }
                                 // Piggyback resume-tail persistence on the capture
                                 // cadence so a hard app quit loses little context.
@@ -818,6 +842,16 @@ fn spawn_session(
                                     capture_id: stopped,
                                 });
                                 capture_mode_for_reader = CaptureMode::Off;
+                                // Mirror the revocation: the registry must now
+                                // report "not capturing", and a later detach must
+                                // NOT persist a resume tail under stale Full.
+                                {
+                                    let mut current = capture_state.lock().unwrap();
+                                    current.id = None;
+                                    current.mode = CaptureMode::Off;
+                                    current.hint =
+                                        Some("terminal capture is off in Settings".to_owned());
+                                }
                                 persist_tail(
                                     &id,
                                     &project_root,
@@ -898,9 +932,7 @@ fn spawn_session(
             writer: Arc::new(Mutex::new(writer)),
             master,
             child,
-            capture_id,
-            capture_hint: capture_hint.clone(),
-            capture_mode,
+            capture: capture_state,
             project_root: cwd,
             launch,
             transcript_baseline,
@@ -929,14 +961,15 @@ pub fn terminal_attach(
     match sessions.get(&id) {
         Some(session) => {
             let alive = attach_channel(&session.shared, on_output);
+            let capture = session.capture.lock().unwrap().clone();
             Ok(AttachReply {
                 found: true,
                 exited: !alive,
                 cwd: session.project_root.clone(),
-                capturing: session.capture_id.is_some(),
-                capture_hint: session.capture_hint.clone(),
-                capture_id: session.capture_id.clone(),
-                capture_mode: session.capture_mode.as_str().to_owned(),
+                capturing: capture.id.is_some(),
+                capture_hint: capture.hint.clone(),
+                capture_id: capture.id.clone(),
+                capture_mode: capture.mode.as_str().to_owned(),
             })
         }
         None => Ok(AttachReply {
@@ -961,11 +994,15 @@ pub fn terminal_detach(registry: State<TerminalRegistry>, id: String) -> Result<
         let sessions = registry.0.lock().unwrap();
         sessions.get(&id).map(|session| {
             session.shared.lock().unwrap().channel = None;
+            // Read the LIVE capture state — if capture was revoked mid-session
+            // this is now Off, so persist_tail writes no resume tail rather than
+            // 32 KiB of output under the stale spawn-time Full mode.
+            let capture = session.capture.lock().unwrap().clone();
             (
                 session.project_root.clone(),
                 session.launch.clone(),
-                session.capture_id.clone(),
-                session.capture_mode,
+                capture.id.clone(),
+                capture.mode,
                 session.shared.clone(),
             )
         })
@@ -1043,15 +1080,17 @@ pub fn terminal_close(registry: State<TerminalRegistry>, id: String) -> Result<(
 /// so double flushing the same bytes is harmless.
 fn finish_session(mut session: TerminalSession) {
     let _ = session.child.kill();
+    // The LIVE capture state, which the reader may have revoked/downgraded.
+    let capture = session.capture.lock().unwrap().clone();
     let flush = {
         let mut shared = session.shared.lock().unwrap();
-        match session.capture_mode {
+        match capture.mode {
             CaptureMode::Full => Some(CaptureFlush::Full(std::mem::take(&mut shared.capture))),
             CaptureMode::Digest => shared.digest.take().map(CaptureFlush::Digest),
             CaptureMode::Off => None,
         }
     };
-    if let Some(capture_id) = session.capture_id.clone() {
+    if let Some(capture_id) = capture.id.clone() {
         if let Some(flush) = flush {
             // Same live-policy gate as the reader thread's exit flush: an
             // explicit "End session" after capture was disabled (or downgraded)
@@ -1059,7 +1098,7 @@ fn finish_session(mut session: TerminalSession) {
             if let Some(allowed) =
                 reconcile_flush_with_policy(flush, &capture_policy(&session.project_root))
             {
-                flush_capture(&session.project_root, &session.capture_id, allowed);
+                flush_capture(&session.project_root, &capture.id, allowed);
             }
         }
         let _ = stop_capture_session(StopCaptureOptions {
@@ -1093,7 +1132,7 @@ fn take_capture_for_flush(capture: &mut Vec<u8>) -> Option<Vec<u8>> {
             // Never flush the raw partial block: drop it and keep only what
             // preceded it. (No real private key is this large — this bounds a
             // hostile endless "BEGIN" stream from pinning the buffer forever.)
-            let flushed: Vec<u8> = capture.drain(..).collect();
+            let flushed: Vec<u8> = std::mem::take(capture);
             let safe = flushed[..begin].to_vec();
             return (!safe.is_empty()).then_some(safe);
         }

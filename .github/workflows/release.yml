@@ -48,13 +48,23 @@ jobs:
             --baseline crates/grafiki-eval/fixtures/baselines/baseline.json \
             --fail-on-regression --format md
 
-  # Real semantic search ships only in release builds: the fastembed + sqlite-vec
-  # features are compiled in here, so the published binaries embed for real while
-  # day-to-day dev builds stay lightweight.
+  # Per-target feature sets, chosen so every leg actually BUILDS:
   #
-  # x86_64-apple-darwin is cross-compiled from the aarch64 (Apple Silicon) runner:
-  # GitHub retired the macos-13 (Intel) image in Dec 2025, so there is no native
-  # Intel runner left to build on.
+  # - Linux x86_64 builds NATIVELY on the ubuntu runner, so it links ONNX
+  #   (`ort`, via fastembed) fine and ships real semantic embeddings.
+  # - macOS (Apple Silicon) does NOT: linking onnxruntime on the current
+  #   macos runner fails with `ld: library 'clang_rt.osx' not found` (Xcode
+  #   26.5 / clang 21 moved the compiler-rt path — documented in ci.yml). Until
+  #   that runner-toolchain issue is resolved, the macOS CLI ships WITHOUT
+  #   fastembed: it works on keyword (FTS5) search and the deterministic
+  #   embedding fallback. Semantic (ONNX) search on macOS is a documented gap,
+  #   NOT a silently-broken build.
+  # - x86_64-apple-darwin is intentionally absent: it can only be produced by
+  #   cross-compiling from the Apple-Silicon runner (GitHub retired the Intel
+  #   macos-13 image in Dec 2025), and ort has no cross-compiled x86_64 macOS
+  #   binary, so that leg cannot be built reliably. Intel Macs run the arm64
+  #   build under Rosetta 2; a native Intel artifact returns if a native runner
+  #   or a working cross-toolchain becomes available.
   cli:
     name: CLI (${{ matrix.target }})
     needs: [lint-and-test]
@@ -65,16 +75,21 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-latest
-            target: x86_64-apple-darwin
+            features: ""
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            features: "fastembed,sqlite-vec"
     steps:
       - uses: actions/checkout@v4
       - name: Add target
         run: rustup target add ${{ matrix.target }}
-      - name: Build CLI (with real embeddings)
-        run: cargo build --release -p grafiki-cli --features fastembed,sqlite-vec --target ${{ matrix.target }}
+      - name: Build CLI
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --release -p grafiki-cli --features "${{ matrix.features }}" --target ${{ matrix.target }}
+          else
+            cargo build --release -p grafiki-cli --target ${{ matrix.target }}
+          fi
       - name: Package
         run: |
           mkdir -p dist
@@ -91,6 +106,19 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      # A DMG must NOT be published unsigned/un-notarized — Gatekeeper would
+      # reject it and it can't auto-update. Fail loudly (rather than silently
+      # shipping an unsigned bundle) until the Apple credentials are configured.
+      # This gates the whole release: the publish job needs this job to pass.
+      - name: Require signing credentials
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "::error::APPLE_SIGNING_IDENTITY is not set. Refusing to build an unsigned DMG."
+            echo "Configure the Apple signing/notarization secrets (docs/PRODUCTION_RELEASE.md) before tagging a release."
+            exit 1
+          fi
       - uses: actions/setup-node@v4
         with:
           node-version-file: apps/grafiki-desktop/.nvmrc
@@ -99,20 +127,18 @@ jobs:
         run: |
           npm ci
           npm run build
-      - name: Prepare CLI sidecar (release, with embeddings)
+      # The sidecar and the desktop build both omit fastembed on macOS for the
+      # same reason as the CLI job (onnxruntime does not link on the current
+      # macos runner). The app degrades to keyword + deterministic embeddings;
+      # ONNX semantic search on the macOS DMG returns when the runner toolchain
+      # issue is fixed. sqlite-vec (a small C lib, not ort) still links, so
+      # vector storage remains available.
+      - name: Prepare CLI sidecar (release)
         run: |
-          cargo build --release -p grafiki-cli --features fastembed,sqlite-vec
+          cargo build --release -p grafiki-cli
           bash scripts/prepare_desktop_sidecar.sh release
-      - name: Verify desktop embedding capabilities
-        run: >-
-          cargo test -p grafiki-desktop --features production-embeddings
-          production_embedding_capabilities_are_exposed
       - name: Build, sign, and notarize the app
         working-directory: apps/grafiki-desktop
-        # Signing + notarization activate automatically when these secrets are
-        # configured (see docs/PRODUCTION_RELEASE.md). Until then this produces an
-        # unsigned .app/.dmg (Gatekeeper will warn; install via Homebrew or the
-        # documented "Open Anyway" step).
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -120,10 +146,7 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_PATH: ${{ secrets.APPLE_API_KEY_PATH }}
-        # The desktop calls grafiki-core in-process for search and indexing. The
-        # feature must therefore be enabled on the desktop build itself; building
-        # only the CLI sidecar with these features does not activate them here.
-        run: npm run tauri -- build --features production-embeddings
+        run: npm run tauri -- build
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-dmg

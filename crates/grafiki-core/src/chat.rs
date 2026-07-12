@@ -158,6 +158,16 @@ pub trait ChatProvider {
     fn judges_relevance(&self) -> bool {
         false
     }
+
+    /// Entailment check: does every claim in `answer` actually follow from the
+    /// given memories? Lexical overlap can't answer this ("GCP mars" shares
+    /// "GCP" with a source saying "europe-west1"); only real understanding can.
+    /// `Some(false)` ⇒ abstain. `None` ⇒ this provider can't judge (the caller
+    /// must NOT treat that as failure — the deterministic checks still apply).
+    /// Best-effort: any transport error returns `None`, never blocks the reply.
+    fn verify_supported(&self, _answer: &str, _memories: &[GroundedMemory]) -> Option<bool> {
+        None
+    }
 }
 
 /// Fraction of the question's distinct content words that appear in at least
@@ -223,6 +233,108 @@ pub fn answer_support_coverage(answer: &str, memories: &[GroundedMemory]) -> f32
     // Same tokenizer/stopword/suffix rules as the question gate; citation
     // markers ("[1]") never tokenize as content words.
     question_term_coverage(answer, memories)
+}
+
+/// Deterministic disagreement checks that WORD OVERLAP structurally cannot make:
+/// a specific NUMBER the sources don't state ("30 seconds" vs a source's "45"),
+/// or a NEGATION the sources don't ("Do not deploy" vs a source's "deploy").
+/// Returns `false` when the answer contradicts its cited sources on either.
+/// These are cheap, sound pre-filters — NOT entailment (see `verify_supported`
+/// for the model-judged semantic check that catches e.g. "GCP mars").
+pub fn answer_specifics_agree(answer: &str, memories: &[GroundedMemory]) -> bool {
+    // Strip `[n]` citation markers first — their digits are not claim content
+    // (else "…45 seconds [1]" reads as claiming both 45 AND 1).
+    let answer: String = {
+        let mut out = String::with_capacity(answer.len());
+        let mut chars = answer.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '[' {
+                let mut marker = String::new();
+                while let Some(&next) = chars.peek() {
+                    if next == ']' {
+                        chars.next();
+                        break;
+                    }
+                    marker.push(next);
+                    chars.next();
+                }
+                if !marker.chars().all(|c| c.is_ascii_digit()) || marker.is_empty() {
+                    out.push('[');
+                    out.push_str(&marker);
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    };
+    let answer = answer.as_str();
+    let source_text = memories
+        .iter()
+        .map(|memory| format!("{} {}", memory.title, memory.snippet))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+
+    // Every numeric literal (incl. short ones like "30", which the content-word
+    // tokenizer drops) stated in the answer must appear in the sources.
+    let numbers_in = |text: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = String::new();
+        for ch in text.chars() {
+            if ch.is_ascii_digit() || (ch == '.' && !current.is_empty()) {
+                current.push(ch);
+            } else if !current.is_empty() {
+                out.push(std::mem::take(&mut current).trim_matches('.').to_owned());
+            }
+        }
+        if !current.is_empty() {
+            out.push(current.trim_matches('.').to_owned());
+        }
+        out.into_iter().filter(|n| !n.is_empty()).collect()
+    };
+    let source_numbers = numbers_in(&source_text);
+    for number in numbers_in(&answer.to_lowercase()) {
+        if !source_numbers.iter().any(|source| source == &number) {
+            return false;
+        }
+    }
+
+    // A negation the answer introduces but no source contains flips polarity.
+    const NEGATIONS: &[&str] = &[
+        "not",
+        "no",
+        "never",
+        "don't",
+        "dont",
+        "cannot",
+        "can't",
+        "cant",
+        "won't",
+        "wont",
+        "shouldn't",
+        "shouldnt",
+        "isn't",
+        "isnt",
+        "aren't",
+        "arent",
+        "without",
+        "neither",
+        "nor",
+        "avoid",
+    ];
+    let has_negation = |text: &str| -> bool {
+        let lower = text.to_lowercase();
+        NEGATIONS.iter().any(|neg| {
+            lower
+                .split(|c: char| !c.is_alphanumeric() && c != '\'')
+                .any(|token| token == *neg)
+        })
+    };
+    if has_negation(answer) && !has_negation(&source_text) {
+        return false;
+    }
+    true
 }
 
 /// Extract the citation indices an answer references as `[n]` markers. Used to
@@ -350,6 +462,41 @@ impl ChatProvider for OllamaProvider {
         // The grounded system prompt instructs the model to abstain when the
         // memories don't answer — lexical gating would only break semantic wins.
         true
+    }
+
+    fn verify_supported(&self, answer: &str, memories: &[GroundedMemory]) -> Option<bool> {
+        // A second, strict pass: the model checks its OWN answer against the
+        // sources. This is the only entailment check available locally, so it
+        // catches semantic contradictions ("europe-west1" → "mars") that no
+        // lexical rule can. Fallible (small models are imperfect judges), so it
+        // is defense-in-depth on top of the deterministic checks, not a
+        // guarantee. Any error ⇒ None (don't block on an unreachable judge).
+        let mut sources = String::new();
+        for memory in memories {
+            sources.push_str(&format!(
+                "- {}: {}\n",
+                memory.title.trim(),
+                memory.snippet.trim()
+            ));
+        }
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_owned(),
+                content: "You are a strict fact-checker. Decide whether EVERY claim in the \
+                    ANSWER is directly supported by the SOURCES. If any claim is missing from, \
+                    or contradicts, the sources, it is NOT supported. Reply with exactly one \
+                    word: YES or NO."
+                    .to_owned(),
+            },
+            ChatMessage {
+                role: "user".to_owned(),
+                content: format!("SOURCES:\n{sources}\nANSWER:\n{answer}\n\nSupported? YES or NO."),
+            },
+        ];
+        let verdict = self.complete(&messages).ok()?;
+        let normalized = verdict.trim().to_lowercase();
+        // Default to "unsupported" on an ambiguous verdict — safer to abstain.
+        Some(normalized.starts_with("yes"))
     }
 }
 
@@ -531,6 +678,25 @@ mod tests {
             snippet: snippet.to_owned(),
             suspicious: false,
         }
+    }
+
+    #[test]
+    fn answer_specifics_agree_catches_number_and_negation_contradictions() {
+        let src = [mem(1, "Deploy", "We deploy every 45 seconds")];
+        // Wrong number → disagree.
+        assert!(!answer_specifics_agree(
+            "We deploy every 30 seconds [1]",
+            &src
+        ));
+        // Right number → agree.
+        assert!(answer_specifics_agree(
+            "We deploy every 45 seconds [1]",
+            &src
+        ));
+        // Introduced negation absent from the source → disagree.
+        assert!(!answer_specifics_agree("Do not deploy [1]", &src));
+        // No numbers/negation, on-topic → agree.
+        assert!(answer_specifics_agree("We deploy frequently [1]", &src));
     }
 
     #[test]

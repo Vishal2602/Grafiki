@@ -183,8 +183,11 @@ export default function Onboarding(props: {
             ) : (
               <>
                 <p className="muted">
-                  Ollama isn't reachable. Grafiki still records your sessions now; automatic
-                  memory extraction starts as soon as a local model exists. Install{" "}
+                  Ollama isn't reachable.{" "}
+                  {captureConsent
+                    ? "Grafiki still records your sessions now; automatic memory extraction starts as soon as a local model exists."
+                    : "Your sessions will run normally, but nothing will be recorded or remembered until you turn on capture (in Settings, or on the next step)."}{" "}
+                  Install{" "}
                   <a href="https://ollama.com" target="_blank" rel="noreferrer">
                     Ollama
                   </a>{" "}

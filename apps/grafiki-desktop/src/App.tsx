@@ -301,11 +301,15 @@ export default function App() {
   // overlay ON TOP of the workspace — so the covered controls must not stay
   // keyboard-focusable behind it. Track the breakpoint to make the workspace
   // `inert` while the overlay is open.
-  const [inspectorIsOverlay, setInspectorIsOverlay] = useState(false);
+  // Initialize synchronously from the media query — a false→true flip in a
+  // post-mount effect added a re-render that raced the boot pane transition
+  // (AnimatePresence briefly kept two Home panes, tripping the e2e).
+  const [inspectorIsOverlay, setInspectorIsOverlay] = useState(
+    () => window.matchMedia("(max-width: 1100px)").matches,
+  );
   useEffect(() => {
     const media = window.matchMedia("(max-width: 1100px)");
     const sync = () => setInspectorIsOverlay(media.matches);
-    sync();
     media.addEventListener("change", sync);
     return () => media.removeEventListener("change", sync);
   }, []);
@@ -2092,20 +2096,25 @@ function TerminalPane(props: {
   const [peekBusy, setPeekBusy] = useState<string | null>(null);
   const [peekOpen, setPeekOpen] = useState(true);
   const loadPeek = async () => {
+    // Pin the session this call was made for: if the pane switches sessions
+    // while listCandidates is in flight, a slow response for the OLD session
+    // must not be applied over the NEW session's (or emptied) peek.
+    const captureId = captureIdRef.current;
     try {
       const candidates = await listCandidates({
         startDir: props.projectRoot,
         scope: "",
         status: "pending",
         limit: 50,
-        captureId: captureIdRef.current ?? undefined,
+        captureId: captureId ?? undefined,
       });
+      if (captureId !== captureIdRef.current) return;
       setPeek(
         candidates.filter(
           (candidate) =>
             candidate.source_type === "capture:llm" &&
-            Boolean(captureIdRef.current) &&
-            candidate.source === captureIdRef.current,
+            Boolean(captureId) &&
+            candidate.source === captureId,
         ),
       );
     } catch {
@@ -3905,10 +3914,6 @@ function CandidatesPane(props: {
         ids,
         rationale,
       });
-      setMessage(`${result.action} complete: ${result.succeeded}/${result.requested} candidates reviewed.`);
-      if (result.failed) {
-        setError(result.errors.map((item) => `${item.id}: ${item.error}`).join("\n"));
-      }
       if (action === "approve" && result.succeeded > 0) {
         const approvedIds = result.results
           .filter((item) => item.candidate.status === "approved")
@@ -3918,8 +3923,15 @@ function CandidatesPane(props: {
         clearUndo();
       }
       setSelectedIds([]);
+      // Refresh FIRST: load() clears the error state on entry, so reporting
+      // the outcome (including partial-failure detail) before it ran wiped
+      // the report a frame later (same bug class as performUndo above).
       await load();
       await props.onMemoryChanged();
+      setMessage(`${result.action} complete: ${result.succeeded}/${result.requested} candidates reviewed.`);
+      if (result.failed) {
+        setError(result.errors.map((item) => `${item.id}: ${item.error}`).join("\n"));
+      }
     } catch (bulkError) {
       setError(String(bulkError));
     } finally {
@@ -4400,6 +4412,9 @@ function SettingsPane(props: {
     setDaemonStatus(null);
     setDaemonHost("127.0.0.1");
     setDaemonPort(9700);
+    // A stale captureConfig must not linger and stay visible/interactive for
+    // the previous project if the new project's fetch fails or is slow.
+    setCaptureConfig(null);
     // Pass the fresh root explicitly: this effect runs in the same commit as
     // the setDraftRoot above, so the functions' closures still hold the OLD
     // project's draftRoot and would show the previous project's config.
@@ -4792,7 +4807,7 @@ function SettingsPane(props: {
               />
             </label>
             <div className="maintenance-actions">
-              <button className="button secondary" type="button" onClick={() => void refreshCaptureConfig()} disabled={captureConfigBusy || !draftRoot.trim()}>
+              <button className="button secondary" type="button" onClick={() => void refreshCaptureConfig(undefined, settingsRequestRef.current)} disabled={captureConfigBusy || !draftRoot.trim()}>
                 <RefreshCcw size={15} />
                 Refresh
               </button>
@@ -4961,7 +4976,7 @@ function SettingsPane(props: {
               <div className="maintenance-actions">
                 <button
                   className="button secondary"
-                  onClick={() => void refreshDaemonStatus()}
+                  onClick={() => void refreshDaemonStatus(undefined, { request: settingsRequestRef.current })}
                   disabled={daemonBusy !== null || !draftRoot.trim()}
                 >
                   <RefreshCcw size={15} />
@@ -5518,19 +5533,39 @@ function Inspector(props: {
   useEffect(() => setCopyFeedback(null), [selectedId]);
 
   // Overlay/panel keyboard contract: focus moves in on open, Escape closes,
-  // and focus returns to whatever had it before — the workspace behind the
-  // narrow-width overlay is `inert`, so without this the keyboard user is
-  // stranded with nothing focusable at all.
+  // Tab is trapped within the panel, and focus returns to whatever had it
+  // before — the workspace behind the narrow-width overlay is `inert`, so
+  // without this the keyboard user is stranded with nothing focusable, or
+  // Tab can walk them out into the inert workspace behind it.
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const asideRef = useRef<HTMLElement | null>(null);
   const onCloseRef = useRef(props.onClose);
   onCloseRef.current = props.onClose;
   useEffect(() => {
     const previouslyFocused = document.activeElement as HTMLElement | null;
     closeButtonRef.current?.focus();
+    const focusableSelector =
+      'button:not([disabled]), [href], input:not([disabled]), [tabindex]:not([tabindex="-1"])';
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
         onCloseRef.current();
+        return;
+      }
+      if (event.key !== "Tab" || !asideRef.current) return;
+      const items = Array.from(
+        asideRef.current.querySelectorAll<HTMLElement>(focusableSelector),
+      ).filter((el) => el.offsetParent !== null);
+      if (items.length === 0) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && active === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -5553,6 +5588,7 @@ function Inspector(props: {
 
   return (
     <motion.aside
+      ref={asideRef}
       className="inspector"
       role="dialog"
       aria-modal={false}

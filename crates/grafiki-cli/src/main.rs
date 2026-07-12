@@ -6058,7 +6058,7 @@ fn daemon_start(
         command.env("GRAFIKI_HTTP_TOKEN", token);
     }
     command.env("GRAFIKI_DAEMON_INSTANCE_ID", &instance_id);
-    let child = command.spawn()?;
+    let mut child = command.spawn()?;
     let pid = child.id();
     let record = DaemonRecord {
         project: context.project.clone(),
@@ -6077,6 +6077,8 @@ fn daemon_start(
     let mut ready = false;
     for _ in 0..25 {
         if !pid_running(pid) {
+            let _ = child.kill();
+            let _ = fs::remove_file(&pid_path);
             return Err(format!(
                 "Daemon process {pid} exited during startup — see the log at {}.",
                 log_path.display()
@@ -6090,6 +6092,8 @@ fn daemon_start(
         std::thread::sleep(Duration::from_millis(200));
     }
     if !ready {
+        let _ = child.kill();
+        let _ = fs::remove_file(&pid_path);
         return Err(format!(
             "Daemon process {pid} started but did not become healthy within 5s — see the log at {}.",
             log_path.display()

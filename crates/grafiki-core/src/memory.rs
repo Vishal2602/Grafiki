@@ -2802,11 +2802,21 @@ pub fn chat_with_provider(
     // The CLAIM must be supported by those sources, not just carry a valid
     // marker — "We deploy to the moon [1]" cited a real memory and used to be
     // accepted as grounded. Model providers only: the extractive provider is
-    // verbatim-by-construction. Low lexical support ⇒ abstain, never present a
-    // confidently unsupported answer.
-    if provider.judges_relevance()
-        && crate::chat::answer_support_coverage(&answer, &cited_memories) < 0.6
-    {
+    // verbatim-by-construction. Three layers, cheapest first:
+    //   1. lexical coverage — catches wholesale off-topic answers;
+    //   2. specifics agreement — a number/negation the sources don't state
+    //      (word overlap structurally can't see these);
+    //   3. model self-verification — the only local ENTAILMENT check, catching
+    //      semantic contradictions ("europe-west1" → "mars") no rule can.
+    // Any one failing ⇒ abstain rather than present a confidently wrong answer.
+    // NB none of this PROVES entailment — it's layered heuristics plus a
+    // fallible model judge; the durable guarantee is that citations point at
+    // real, user-inspectable memory, and the extractive floor is verbatim.
+    let unsupported = provider.judges_relevance()
+        && (crate::chat::answer_support_coverage(&answer, &cited_memories) < 0.6
+            || !crate::chat::answer_specifics_agree(&answer, &cited_memories)
+            || provider.verify_supported(&answer, &cited_memories) == Some(false));
+    if unsupported {
         return Ok(ChatReply {
             question,
             scope,
@@ -4604,40 +4614,70 @@ fn trusted_record_diverged_from_payload(
             )
         }
         "context" => {
-            let Some((title, content)) = connection
+            // Compare EVERY field approval writes — category and scope edits
+            // matter too, and were previously ignored (an undo silently
+            // restored the old category after the user changed it).
+            let Some((title, content, category, scope)) = connection
                 .query_row(
-                    "SELECT title, content FROM context WHERE key = ?1",
+                    "SELECT title, content, category, scope FROM context WHERE key = ?1",
                     [record_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
                 )
                 .optional()?
             else {
                 return Ok(false);
             };
-            let expected_title = candidate_payload_optional_string(payload, &["title"])
-                .map(|value| clamp_field(value.trim(), MAX_TITLE_CHARS));
-            let expected_content = candidate_payload_optional_string(payload, &["content", "body"])
-                .map(|value| clamp_field(&value, MAX_BODY_CHARS));
-            Ok(expected_title.is_some_and(|expected| expected != title)
-                || expected_content.is_some_and(|expected| expected != content))
+            let differs = |keys: &[&str], current: &str, clamp: usize| {
+                candidate_payload_optional_string(payload, keys)
+                    .map(|value| clamp_field(value.trim(), clamp))
+                    .is_some_and(|expected| expected != current)
+            };
+            Ok(differs(&["title"], &title, MAX_TITLE_CHARS)
+                || differs(&["content", "body"], &content, MAX_BODY_CHARS)
+                || differs(&["category"], &category, MAX_TITLE_CHARS)
+                || differs(&["scope"], &scope, MAX_TITLE_CHARS))
         }
         "state" => {
-            let Some((title, details)) = connection
+            // Same: title/status/owner/details/priority/scope are all
+            // user-editable and must all count as divergence.
+            let Some((title, status, owner, details, priority, scope)) = connection
                 .query_row(
-                    "SELECT title, coalesce(details, '') FROM state WHERE key = ?1",
+                    "SELECT title, status, coalesce(owner, ''), coalesce(details, ''), \
+                     priority, scope FROM state WHERE key = ?1",
                     [record_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    },
                 )
                 .optional()?
             else {
                 return Ok(false);
             };
-            let expected_title = candidate_payload_optional_string(payload, &["title"])
-                .map(|value| clamp_field(value.trim(), MAX_TITLE_CHARS));
-            let expected_details = candidate_payload_optional_string(payload, &["details"])
-                .map(|value| clamp_field(&value, MAX_BODY_CHARS));
-            Ok(expected_title.is_some_and(|expected| expected != title)
-                || expected_details.is_some_and(|expected| expected != details))
+            let differs = |keys: &[&str], current: &str, clamp: usize| {
+                candidate_payload_optional_string(payload, keys)
+                    .map(|value| clamp_field(value.trim(), clamp))
+                    .is_some_and(|expected| expected != current)
+            };
+            Ok(differs(&["title"], &title, MAX_TITLE_CHARS)
+                || differs(&["status"], &status, MAX_TITLE_CHARS)
+                || differs(&["owner"], &owner, MAX_TITLE_CHARS)
+                || differs(&["details"], &details, MAX_BODY_CHARS)
+                || differs(&["priority"], &priority, MAX_TITLE_CHARS)
+                || differs(&["scope"], &scope, MAX_TITLE_CHARS))
         }
         _ => Ok(false),
     }
@@ -7568,13 +7608,26 @@ fn validate_candidate_review_action(raw: &str) -> Result<String> {
 
 fn validate_candidate_source_type(raw: &str) -> Result<String> {
     let source_type = raw.trim();
+    // A category label ("capture:llm", "manual", "mcp"), NOT free text. It was
+    // stored verbatim and unredacted, so the HTTP propose API could smuggle a
+    // secret through it. Constrain to an identifier charset + length so no
+    // secret (spaces, `=`, long high-entropy tokens) can persist here, while
+    // every legitimate label still passes.
     if source_type.is_empty() {
-        Err(GrafikiError::InvalidCandidate(
+        return Err(GrafikiError::InvalidCandidate(
             "candidate source_type is required".to_owned(),
-        ))
-    } else {
-        Ok(source_type.to_owned())
+        ));
     }
+    if source_type.chars().count() > 64
+        || !source_type
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '.' | '_' | '-'))
+    {
+        return Err(GrafikiError::InvalidCandidate(format!(
+            "candidate source_type must be a short label (letters, digits, and :._- only): {raw}"
+        )));
+    }
+    Ok(source_type.to_owned())
 }
 
 fn validate_capture_source_type(raw: &str) -> Result<String> {
@@ -13263,6 +13316,63 @@ mod tests {
         );
         assert_eq!(invented.answer, crate::chat::NO_MEMORY_ANSWER);
 
+        // A number the sources don't state (source: europe-west1; the model
+        // invents a latency the memory never mentions) — deterministic
+        // specifics check must abstain even at high word overlap.
+        struct WrongNumber;
+        impl ChatProvider for WrongNumber {
+            fn generate(&self, _q: &str, _m: &[GroundedMemory]) -> crate::Result<String> {
+                Ok("We deploy to GCP europe-west1 in 30 seconds [1].".to_owned())
+            }
+            fn judges_relevance(&self) -> bool {
+                true
+            }
+        }
+        let wrong_number = chat_with_provider(
+            ChatOptions {
+                project_name: None,
+                start_dir: project_dir.clone(),
+                grafiki_home: Some(home.clone()),
+                question: "where do we deploy".to_owned(),
+                scope: scope.to_owned(),
+                limit: 8,
+                temporal_weight: 0.0,
+            },
+            &WrongNumber,
+        )
+        .unwrap();
+        assert_eq!(wrong_number.answer, crate::chat::NO_MEMORY_ANSWER);
+
+        // A provider whose SELF-VERIFICATION says the answer isn't supported
+        // (the entailment layer) must abstain even when overlap + specifics pass.
+        struct SemanticContradiction;
+        impl ChatProvider for SemanticContradiction {
+            fn generate(&self, _q: &str, _m: &[GroundedMemory]) -> crate::Result<String> {
+                // High word overlap with the source, but factually wrong region.
+                Ok("We deploy to GCP europe [1].".to_owned())
+            }
+            fn judges_relevance(&self) -> bool {
+                true
+            }
+            fn verify_supported(&self, _a: &str, _m: &[GroundedMemory]) -> Option<bool> {
+                Some(false)
+            }
+        }
+        let contradiction = chat_with_provider(
+            ChatOptions {
+                project_name: None,
+                start_dir: project_dir.clone(),
+                grafiki_home: Some(home.clone()),
+                question: "where do we deploy".to_owned(),
+                scope: scope.to_owned(),
+                limit: 8,
+                temporal_weight: 0.0,
+            },
+            &SemanticContradiction,
+        )
+        .unwrap();
+        assert_eq!(contradiction.answer, crate::chat::NO_MEMORY_ANSWER);
+
         // A model that cites exactly one supported source must get ONLY that
         // citation back, not every retrieved memory. (It cites the memory that
         // actually contains the claim, like the grounded prompt instructs.)
@@ -14079,6 +14189,78 @@ mod tests {
             current.content.contains("C: the user's newer edit"),
             "the post-approval edit must survive undo, got: {}",
             current.content
+        );
+    }
+
+    #[test]
+    fn undo_leaves_a_context_whose_category_was_changed_after_approval() {
+        // Divergence detection must cover category/scope, not just title/content:
+        // change the category after approval, then Undo — the new category must
+        // survive (no silent restore of the old one).
+        let (_temp, home, project_dir) = setup_project();
+        add_context(AddContextOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            key: "runbook".to_owned(),
+            title: "Runbook".to_owned(),
+            content: "steps".to_owned(),
+            category: "runbook".to_owned(),
+            scope: String::new(),
+        })
+        .unwrap();
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:llm".to_owned(),
+            source: None,
+            record_type: "context".to_owned(),
+            payload: serde_json::json!({
+                "key": "runbook", "title": "Runbook", "category": "runbook", "content": "steps",
+            }),
+            scope: String::new(),
+            confidence: 0.6,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+        approve_candidate(ApproveCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: proposed.candidate.id.clone(),
+        })
+        .unwrap();
+        // User changes ONLY the category after approval.
+        update_context(UpdateContextOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            key: "runbook".to_owned(),
+            title: None,
+            category: Some("guide".to_owned()),
+            scope: None,
+            content: None,
+        })
+        .unwrap();
+        revert_candidate_approval(RevertApprovalOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: proposed.candidate.id,
+        })
+        .unwrap();
+        let current = get_context(GetContextOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            key: "runbook".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            current.category, "guide",
+            "the post-approval category edit must survive undo"
         );
     }
 
