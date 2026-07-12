@@ -181,7 +181,18 @@ pub fn question_term_coverage(question: &str, memories: &[GroundedMemory]) -> f3
             .split(|c: char| !c.is_alphanumeric())
             .filter(|token| token.chars().count() >= 3)
             .filter(|token| !STOPWORDS.contains(token))
-            .map(str::to_owned)
+            // Light suffix normalization so "deploys"/"deployed" match
+            // "deploy" — tolerance for inflection, not real stemming.
+            .map(|token| {
+                for suffix in ["ing", "es", "ed", "s"] {
+                    if let Some(stem) = token.strip_suffix(suffix) {
+                        if stem.chars().count() >= 3 {
+                            return stem.to_owned();
+                        }
+                    }
+                }
+                token.to_owned()
+            })
             .collect()
     };
     let question_terms = tokenize(question);
@@ -198,6 +209,20 @@ pub fn question_term_coverage(question: &str, memories: &[GroundedMemory]) -> f3
         .filter(|term| memory_terms.contains(*term))
         .count();
     covered as f32 / question_terms.len() as f32
+}
+
+/// Fraction of the ANSWER's distinct content words that appear in the given
+/// memories (title + snippet), 0.0–1.0. Citation-number validation alone lets a
+/// fabricated claim ride on a VALID marker ("We deploy to the moon [1]") or on
+/// no marker at all — this checks the claim's words against the sources it
+/// says it used. Applied to MODEL providers only: the extractive provider is
+/// verbatim-by-construction and can't fabricate. Lexical support is a
+/// heuristic, not entailment — the caller treats low support as "abstain",
+/// never as a confident different answer.
+pub fn answer_support_coverage(answer: &str, memories: &[GroundedMemory]) -> f32 {
+    // Same tokenizer/stopword/suffix rules as the question gate; citation
+    // markers ("[1]") never tokenize as content words.
+    question_term_coverage(answer, memories)
 }
 
 /// Extract the citation indices an answer references as `[n]` markers. Used to

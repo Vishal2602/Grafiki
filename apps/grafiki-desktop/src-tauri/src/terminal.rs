@@ -773,14 +773,29 @@ fn spawn_session(
                         };
                         if let Some(flush) = flush {
                             // Re-read the live capture policy before persisting —
-                            // a mid-session "capture off" in Settings must stop
-                            // persistence, not just be honored on the next
-                            // terminal_open. Re-reading once per ~64 KiB flush is
-                            // cheap; don't thrash the config file per byte.
-                            let still_capturing =
-                                capture_id.is_some() && capture_policy(&project_root).is_ok();
-                            if still_capturing {
-                                flush_capture(&project_root, &capture_id, flush);
+                            // a mid-session change in Settings must be honored NOW:
+                            // "off" stops persistence, and a Full→Digest downgrade
+                            // must never write raw output under the old mode.
+                            // Re-reading once per ~64 KiB flush is cheap; don't
+                            // thrash the config file per byte.
+                            let live_policy = capture_policy(&project_root);
+                            let allowed = if capture_id.is_some() {
+                                reconcile_flush_with_policy(flush, &live_policy)
+                            } else {
+                                None
+                            };
+                            if let Some(allowed) = allowed {
+                                flush_capture(&project_root, &capture_id, allowed);
+                                // A live Full→Digest downgrade: convert the raw
+                                // carry to counts and buffer as digest from now on.
+                                if capture_mode_for_reader == CaptureMode::Full
+                                    && matches!(live_policy, Ok(CaptureMode::Digest))
+                                {
+                                    capture_mode_for_reader = CaptureMode::Digest;
+                                    let mut state = shared.lock().unwrap();
+                                    let leftover = std::mem::take(&mut state.capture);
+                                    state.digest.push(&leftover);
+                                }
                                 // Piggyback resume-tail persistence on the capture
                                 // cadence so a hard app quit loses little context.
                                 persist_tail(
@@ -851,7 +866,15 @@ fn spawn_session(
             );
             if let Some(capture) = capture_id {
                 if let Some(remainder) = remainder {
-                    flush_capture(&project_root, &Some(capture.clone()), remainder);
+                    // The exit flush honors the LIVE policy too — output below
+                    // the 64 KiB threshold never hits the mid-loop recheck, so
+                    // without this a session whose capture was disabled (or
+                    // downgraded) mid-run would persist everything at exit.
+                    if let Some(allowed) =
+                        reconcile_flush_with_policy(remainder, &capture_policy(&project_root))
+                    {
+                        flush_capture(&project_root, &Some(capture.clone()), allowed);
+                    }
                 }
                 let _ = stop_capture_session(StopCaptureOptions {
                     project_name: None,
@@ -1030,7 +1053,14 @@ fn finish_session(mut session: TerminalSession) {
     };
     if let Some(capture_id) = session.capture_id.clone() {
         if let Some(flush) = flush {
-            flush_capture(&session.project_root, &session.capture_id, flush);
+            // Same live-policy gate as the reader thread's exit flush: an
+            // explicit "End session" after capture was disabled (or downgraded)
+            // must not persist the buffered output under the stale mode.
+            if let Some(allowed) =
+                reconcile_flush_with_policy(flush, &capture_policy(&session.project_root))
+            {
+                flush_capture(&session.project_root, &session.capture_id, allowed);
+            }
         }
         let _ = stop_capture_session(StopCaptureOptions {
             project_name: None,
@@ -1046,17 +1076,84 @@ fn finish_session(mut session: TerminalSession) {
 /// falls in that trailing window survives into the next accumulation instead
 /// of being redacted (or not) independently of its value. Returns `None`
 /// until `capture` exceeds the flush threshold.
+///
+/// Multi-line PEM material needs more than the fixed carry: redaction drops an
+/// UNTERMINATED `-----BEGIN … PRIVATE KEY-----` block from the flushed text,
+/// but the block's continuation lines in the next chunk carry no marker and
+/// would sail through in the clear. So a block that starts in the would-be
+/// flushed portion and hasn't terminated is held back whole (bounded by
+/// `PEM_CARRY_MAX`; a pathological oversized "block" is dropped, never leaked).
 fn take_capture_for_flush(capture: &mut Vec<u8>) -> Option<Vec<u8>> {
     if capture.len() <= CAPTURE_FLUSH_THRESHOLD {
         return None;
     }
-    let split_at = capture.len().saturating_sub(REDACT_CARRY);
+    let mut split_at = capture.len().saturating_sub(REDACT_CARRY);
+    if let Some(begin) = find_unterminated_private_key_begin(&capture[..split_at]) {
+        if capture.len() - begin > PEM_CARRY_MAX {
+            // Never flush the raw partial block: drop it and keep only what
+            // preceded it. (No real private key is this large — this bounds a
+            // hostile endless "BEGIN" stream from pinning the buffer forever.)
+            let flushed: Vec<u8> = capture.drain(..).collect();
+            let safe = flushed[..begin].to_vec();
+            return (!safe.is_empty()).then_some(safe);
+        }
+        split_at = begin;
+        if split_at == 0 {
+            return None; // the whole buffer is the partial block — keep holding
+        }
+    }
     Some(capture.drain(..split_at).collect())
+}
+
+/// Largest partial PEM block held back across flushes before it's dropped.
+const PEM_CARRY_MAX: usize = 256 * 1024;
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Byte-offset of the LAST `-----BEGIN … PRIVATE KEY-----` in `bytes` that has
+/// no `-----END` after it — i.e. a private-key block that continues past the
+/// end of this slice. Byte-based on purpose: terminal output isn't guaranteed
+/// valid UTF-8, and lossy conversion would shift offsets.
+fn find_unterminated_private_key_begin(bytes: &[u8]) -> Option<usize> {
+    const BEGIN: &[u8] = b"-----BEGIN ";
+    let begin = bytes.windows(BEGIN.len()).rposition(|w| w == BEGIN)?;
+    let line_end = bytes[begin..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map(|i| begin + i)
+        .unwrap_or(bytes.len());
+    find_subslice(&bytes[begin..line_end], b" PRIVATE KEY-----")?;
+    if find_subslice(&bytes[begin..], b"-----END ").is_some() {
+        return None; // terminated in this slice — redact_text handles it whole
+    }
+    Some(begin)
 }
 
 enum CaptureFlush {
     Full(Vec<u8>),
     Digest(String),
+}
+
+/// Reconcile an about-to-persist flush with the LIVE capture policy: nothing
+/// may persist under a MORE permissive mode than the user's current setting.
+/// Off ⇒ drop entirely; a Full buffer under a now-Digest policy is downgraded
+/// to counts (the raw bytes are never written). Persisting digest counts under
+/// a now-Full policy is fine — less than allowed, never more.
+fn reconcile_flush_with_policy(
+    flush: CaptureFlush,
+    live_policy: &Result<CaptureMode, String>,
+) -> Option<CaptureFlush> {
+    match (flush, live_policy) {
+        (_, Err(_)) => None,
+        (CaptureFlush::Full(bytes), Ok(CaptureMode::Digest)) => {
+            let mut digest = DigestBuffer::default();
+            digest.push(&bytes);
+            digest.take().map(CaptureFlush::Digest)
+        }
+        (flush, Ok(_)) => Some(flush),
+    }
 }
 
 /// Persist a chunk of terminal output as a capture event (ANSI-stripped). Silent
@@ -1280,5 +1377,41 @@ mod tests {
         assert!(!redacted2.contains("SECRETVALUE"));
         assert!(!redacted2.contains("sk-SECRETVALUE"));
         assert!(redacted2.contains("REDACTED"));
+    }
+
+    #[test]
+    fn full_capture_holds_back_an_unterminated_pem_block_across_flushes() {
+        // A PEM private key that starts before the flush boundary and ends
+        // after it. The fixed 4 KiB carry can't save this — the block's body
+        // continues far past the retained window — so the split point must
+        // move back to the BEGIN line, keeping the partial block out of the
+        // flushed (persisted) portion entirely.
+        let mut capture: Vec<u8> = vec![b'x'; CAPTURE_FLUSH_THRESHOLD];
+        capture.extend_from_slice(b"\n-----BEGIN RSA PRIVATE KEY-----\n");
+        capture.extend_from_slice(&vec![b'K'; 8 * 1024]); // body continues…
+        assert!(capture.len() > CAPTURE_FLUSH_THRESHOLD);
+
+        let flushed = take_capture_for_flush(&mut capture).expect("threshold crossed");
+        let flushed_text = String::from_utf8_lossy(&flushed);
+        assert!(
+            !flushed_text.contains("BEGIN RSA") && !flushed_text.contains("KKKK"),
+            "no part of the unterminated key block may be flushed"
+        );
+        // The carried remainder still holds the whole partial block…
+        let carried = String::from_utf8_lossy(&capture);
+        assert!(carried.contains("BEGIN RSA PRIVATE KEY"));
+
+        // …so when the END line arrives and the session flushes, the block is
+        // complete and redaction removes ALL of it, including the body.
+        capture.extend_from_slice(b"\n-----END RSA PRIVATE KEY-----\nafter\n");
+        let final_flush = std::mem::take(&mut capture);
+        let (redacted, changed) = redact_text(&strip_ansi(&final_flush));
+        assert!(changed);
+        assert!(
+            !redacted.contains("KKKK"),
+            "key body must not survive: {redacted}"
+        );
+        assert!(redacted.contains("[REDACTED_PRIVATE_KEY]"));
+        assert!(redacted.contains("after"));
     }
 }

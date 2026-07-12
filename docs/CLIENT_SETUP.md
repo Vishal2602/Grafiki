@@ -93,11 +93,21 @@ grafiki_graph
 grafiki_export
 ```
 
-Useful first prompt for an agent:
+Useful first prompt for an agent — **only applies to a server started with
+`--allow-write`**; every tool named below except `grafiki_ask` and
+`grafiki_capture_config` is a mutating tool and is unavailable (and will
+error) against the read-only default:
 
 ```text
 Use grafiki_start with scope "grafiki/core" and goal "<current task>". Then call grafiki_ask with the current task before broad repository exploration, passing your agent name as "agent" when possible. Grafiki logs the question and returned memory locally for audit. Check grafiki_capture_config before automatic capture if the workspace is unfamiliar. Start grafiki_capture_start, stream transcript/IDE/screen/file events with grafiki_capture_ingest as work happens, call grafiki_capture_import_transcripts for Codex, Claude Code, Cursor, or generic transcript files, and call grafiki_capture_terminal_command, grafiki_capture_watch_files, or grafiki_capture_git_summary when those facts are available. Then call grafiki_capture_summarize near the end so the user can review pending memory candidates with evidence links. Save decisions or durable observations as you work, and use grafiki_candidate_propose when a memory should be reviewed by the user first.
 ```
+
+On a read-only server (the default), skip the prompt above and stick to the
+read-only tools: `grafiki_status`, `grafiki_ask`, `grafiki_chat`,
+`grafiki_agent_activity`, `grafiki_search`, `grafiki_candidate_list`,
+`grafiki_capture_status`, `grafiki_capture_events`, `grafiki_capture_config`,
+`grafiki_embeddings_status`, `grafiki_record`, `grafiki_report`,
+`grafiki_graph`, and `grafiki_export`.
 
 At the end of a coding turn, agents can call `grafiki_auto_capture` to inspect the git working tree and place a concise session snapshot into the Memory Review queue. That keeps automatic capture reviewable instead of silently trusting inferred memory.
 

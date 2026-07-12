@@ -154,6 +154,63 @@ jobs:
       - name: Build desktop crate
         run: cargo build -p grafiki-desktop
 
+  # Layer 2 of docs/TESTING.md: the deterministic WebdriverIO suite, driving the
+  # REAL debug app (real Rust backend, real DB resolution) end-to-end. This is a
+  # real gate, not continue-on-error — a startup-race warning ("Tauri core.invoke
+  # not available after 5s timeout") is documented as benign self-healing retry
+  # noise, not a failure signal.
+  desktop-e2e:
+    name: Desktop e2e (WebdriverIO)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: apps/grafiki-desktop/.nvmrc
+          cache: npm
+          cache-dependency-path: apps/grafiki-desktop/package-lock.json
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-macos-latest-${{ hashFiles('Cargo.lock') }}
+      - name: Install web deps
+        working-directory: apps/grafiki-desktop
+        run: npm ci
+      - name: Build frontend
+        working-directory: apps/grafiki-desktop
+        run: npm run build
+      # tauri-build needs the CLI sidecar staged (externalBin) or the desktop
+      # crate build below fails to resolve the resource (see the smoke job).
+      - name: Prepare desktop sidecar
+        run: bash scripts/prepare_desktop_sidecar.sh debug
+      - name: Build desktop crate
+        run: cargo build -p grafiki-desktop
+      - name: Start Vite dev server
+        working-directory: apps/grafiki-desktop
+        run: |
+          npm run dev > /tmp/vite-dev.log 2>&1 &
+          echo $! > /tmp/vite-dev.pid
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:1420/ >/dev/null 2>&1; then
+              echo "Vite dev server is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Vite dev server did not become ready within 60s"
+          cat /tmp/vite-dev.log
+          exit 1
+      - name: Run e2e suite
+        working-directory: apps/grafiki-desktop
+        run: npm run test:e2e:only
+      - name: Stop Vite dev server
+        if: always()
+        run: kill "$(cat /tmp/vite-dev.pid)" 2>/dev/null || true
+
   supply-chain:
     name: Supply chain audit
     runs-on: ubuntu-latest

@@ -2791,12 +2791,37 @@ pub fn chat_with_provider(
         });
     }
 
+    // The memories the answer claims as its sources: what it cited, or the
+    // whole provided set when it used no markers at all.
+    let cited_memories: Vec<GroundedMemory> = memories
+        .iter()
+        .filter(|memory| cited.is_empty() || cited.contains(&memory.index))
+        .cloned()
+        .collect();
+
+    // The CLAIM must be supported by those sources, not just carry a valid
+    // marker — "We deploy to the moon [1]" cited a real memory and used to be
+    // accepted as grounded. Model providers only: the extractive provider is
+    // verbatim-by-construction. Low lexical support ⇒ abstain, never present a
+    // confidently unsupported answer.
+    if provider.judges_relevance()
+        && crate::chat::answer_support_coverage(&answer, &cited_memories) < 0.6
+    {
+        return Ok(ChatReply {
+            question,
+            scope,
+            answer: NO_MEMORY_ANSWER.to_owned(),
+            citations: Vec::new(),
+            used_memory: false,
+            flagged_injection,
+        });
+    }
+
     // Attach ONLY the memories the answer actually cited. If the model cited
     // nothing at all (some models omit markers), fall back to the provided set
     // so the answer still carries its provenance rather than none.
-    let citations: Vec<Citation> = memories
+    let citations: Vec<Citation> = cited_memories
         .iter()
-        .filter(|memory| cited.is_empty() || cited.contains(&memory.index))
         .map(|memory| Citation {
             index: memory.index,
             record_type: memory.record_type.clone(),
@@ -4010,6 +4035,13 @@ pub fn propose_candidate(options: ProposeCandidateOptions) -> Result<CandidateMu
         redact_sensitive_text(&mut value);
         value
     });
+    // The free-text source (a capture id, a command line, an URL…) is caller
+    // provenance and can carry secrets just like the payload — reproduced via
+    // the HTTP propose API with an API_TOKEN in the source string.
+    let source = options.source.map(|mut value| {
+        redact_sensitive_text(&mut value);
+        value
+    });
     // Candidate and provenance are one logical write. Invalid evidence or any
     // later insert failure must roll the candidate back instead of leaving a
     // pending, evidence-less row in the review queue.
@@ -4023,7 +4055,7 @@ pub fn propose_candidate(options: ProposeCandidateOptions) -> Result<CandidateMu
         params![
             id,
             source_type,
-            options.source,
+            source,
             record_type,
             serde_json::to_string(&payload)?,
             scope.as_str(),
@@ -4520,6 +4552,97 @@ fn release_candidate_approval_claim(options: &ApproveCandidateOptions) {
     }
 }
 
+/// Whether the trusted record's CURRENT contents no longer match what this
+/// candidate's approval wrote — i.e. the user (or another candidate) edited it
+/// AFTER approval. Undo must then leave the record alone: deleting it or
+/// restoring a pre-approval snapshot over it would silently destroy the newer
+/// contents. Returns `false` when the record is missing (nothing newer to
+/// protect) or the type has no comparable content (entity). Only fields the
+/// payload actually defines are compared, with the same clamping approval
+/// applied on write.
+fn trusted_record_diverged_from_payload(
+    connection: &Connection,
+    record_type: &str,
+    record_id: &str,
+    payload: &serde_json::Value,
+) -> Result<bool> {
+    match record_type {
+        "decision" => {
+            let Some((title, reasoning)) = connection
+                .query_row(
+                    "SELECT title, coalesce(reasoning, '') FROM decisions WHERE id = ?1",
+                    [record_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+            else {
+                return Ok(false);
+            };
+            let expected_title = candidate_payload_optional_string(payload, &["title"])
+                .map(|value| clamp_field(value.trim(), MAX_TITLE_CHARS));
+            let expected_reasoning =
+                candidate_payload_optional_string(payload, &["reasoning", "content"])
+                    .map(|value| clamp_field(&value, MAX_BODY_CHARS));
+            Ok(expected_title.is_some_and(|expected| expected != title)
+                || expected_reasoning.is_some_and(|expected| expected != reasoning))
+        }
+        "observation" => {
+            let Some(content) = connection
+                .query_row(
+                    "SELECT content FROM observations WHERE id = ?1",
+                    [record_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            else {
+                return Ok(false);
+            };
+            Ok(
+                candidate_payload_optional_string(payload, &["content", "observe"])
+                    .map(|value| clamp_field(value.trim(), MAX_BODY_CHARS))
+                    .is_some_and(|expected| expected != content),
+            )
+        }
+        "context" => {
+            let Some((title, content)) = connection
+                .query_row(
+                    "SELECT title, content FROM context WHERE key = ?1",
+                    [record_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+            else {
+                return Ok(false);
+            };
+            let expected_title = candidate_payload_optional_string(payload, &["title"])
+                .map(|value| clamp_field(value.trim(), MAX_TITLE_CHARS));
+            let expected_content = candidate_payload_optional_string(payload, &["content", "body"])
+                .map(|value| clamp_field(&value, MAX_BODY_CHARS));
+            Ok(expected_title.is_some_and(|expected| expected != title)
+                || expected_content.is_some_and(|expected| expected != content))
+        }
+        "state" => {
+            let Some((title, details)) = connection
+                .query_row(
+                    "SELECT title, coalesce(details, '') FROM state WHERE key = ?1",
+                    [record_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+            else {
+                return Ok(false);
+            };
+            let expected_title = candidate_payload_optional_string(payload, &["title"])
+                .map(|value| clamp_field(value.trim(), MAX_TITLE_CHARS));
+            let expected_details = candidate_payload_optional_string(payload, &["details"])
+                .map(|value| clamp_field(&value, MAX_BODY_CHARS));
+            Ok(expected_title.is_some_and(|expected| expected != title)
+                || expected_details.is_some_and(|expected| expected != details))
+        }
+        _ => Ok(false),
+    }
+}
+
 /// Restore a pre-existing context/state record's prior contents that an
 /// upsert-approval overwrote. Returns whether it restored anything (⇒ the
 /// caller must NOT delete the record). Entity prior-upserts are refused earlier,
@@ -4747,6 +4870,16 @@ pub fn revert_candidate_approval(
         }
     }
 
+    // If the record was EDITED after approval (approve B → user edits to C →
+    // undo), the delete/restore below would silently destroy C. Undo then only
+    // reverts the candidate and leaves the record exactly as the user left it.
+    let edited_since_approval = trusted_record_diverged_from_payload(
+        &connection,
+        &trusted_record_type,
+        &trusted_record_id,
+        &candidate.payload,
+    )?;
+
     // Entities are upserted by (name, scope) across approvals (`save_entity`),
     // so a DIFFERENT, already-approved candidate's observation/relation can
     // point at this SAME entity row. Deleting it would cascade away someone
@@ -4813,14 +4946,34 @@ pub fn revert_candidate_approval(
     restore_candidate_supersession(&tx, &options.id, &trusted_record_type, &trusted_record_id)?;
     // If approval overwrote a pre-existing context/state record, restore its
     // prior contents in the same transaction and SKIP the delete below — the
-    // record must survive undo with the data it held before approval.
-    let restored_prior = restore_prior_upsert(&tx, prior_upsert.as_ref(), &trusted_record_id)?;
+    // record must survive undo with the data it held before approval. A record
+    // edited AFTER approval is never touched (the edit is newer than both).
+    let restored_prior = if edited_since_approval {
+        false
+    } else {
+        restore_prior_upsert(&tx, prior_upsert.as_ref(), &trusted_record_id)?
+    };
     tx.execute(
         "UPDATE extraction_candidates SET approval_restore = NULL WHERE id = ?1",
         [&options.id],
     )?;
     tx.commit()?;
     drop(connection);
+
+    if edited_since_approval {
+        let (_project, connection) = resolve_and_open(
+            options.project_name,
+            options.start_dir,
+            options.grafiki_home,
+        )?;
+        let candidate = load_extraction_candidate(&connection, &options.id)?;
+        return Ok(CandidateMutationReport {
+            candidate,
+            message: "Approval undone — the record was edited after approval, so it was left \
+                      in place with your newer contents."
+                .to_owned(),
+        });
+    }
 
     if restored_prior {
         let (_project, connection) = resolve_and_open(
@@ -5030,7 +5183,16 @@ pub fn reject_candidate(options: RejectCandidateOptions) -> Result<CandidateMuta
             candidate.id
         )));
     }
-    let rationale = options.rationale.or(candidate.rationale);
+    // A reject rationale is user free-text pasted at review time — it can carry
+    // the very secret the reviewer is rejecting. Redact like every other
+    // persisted free-text field (propose/edit already do).
+    let rationale = options
+        .rationale
+        .map(|mut value| {
+            redact_sensitive_text(&mut value);
+            value
+        })
+        .or(candidate.rationale);
     let rejected = connection.execute(
         "
         UPDATE extraction_candidates
@@ -13069,12 +13231,50 @@ mod tests {
         );
         assert_eq!(fabricated.answer, crate::chat::NO_MEMORY_ANSWER);
 
-        // A model that cites exactly [1] must get ONLY that one citation back,
-        // not every retrieved memory.
-        struct CitesFirst;
-        impl ChatProvider for CitesFirst {
+        // A model whose citation NUMBER is valid but whose CLAIM is invented —
+        // "the moon" appears in no memory. Number validation alone accepted
+        // this as grounded; the answer-support check must abstain instead.
+        struct ValidMarkerInventedClaim;
+        impl ChatProvider for ValidMarkerInventedClaim {
             fn generate(&self, _q: &str, _m: &[GroundedMemory]) -> crate::Result<String> {
-                Ok("We deploy to GCP europe-west1 [1].".to_owned())
+                Ok("We deploy to the moon [1].".to_owned())
+            }
+            fn judges_relevance(&self) -> bool {
+                true
+            }
+        }
+        let invented = chat_with_provider(
+            ChatOptions {
+                project_name: None,
+                start_dir: project_dir.clone(),
+                grafiki_home: Some(home.clone()),
+                question: "where do we deploy".to_owned(),
+                scope: scope.to_owned(),
+                limit: 8,
+                temporal_weight: 0.0,
+            },
+            &ValidMarkerInventedClaim,
+        )
+        .unwrap();
+        assert!(
+            !invented.used_memory && invented.citations.is_empty(),
+            "an unsupported claim behind a valid [1] must abstain, got: {}",
+            invented.answer
+        );
+        assert_eq!(invented.answer, crate::chat::NO_MEMORY_ANSWER);
+
+        // A model that cites exactly one supported source must get ONLY that
+        // citation back, not every retrieved memory. (It cites the memory that
+        // actually contains the claim, like the grounded prompt instructs.)
+        struct CitesSupported;
+        impl ChatProvider for CitesSupported {
+            fn generate(&self, _q: &str, m: &[GroundedMemory]) -> crate::Result<String> {
+                let index = m
+                    .iter()
+                    .find(|memory| memory.snippet.contains("europe-west1"))
+                    .map(|memory| memory.index)
+                    .unwrap_or(1);
+                Ok(format!("We deploy to GCP europe-west1 [{index}]."))
             }
             fn judges_relevance(&self) -> bool {
                 true
@@ -13090,7 +13290,7 @@ mod tests {
                 limit: 8,
                 temporal_weight: 0.0,
             },
-            &CitesFirst,
+            &CitesSupported,
         )
         .unwrap();
         assert!(cited.used_memory);
@@ -13099,7 +13299,7 @@ mod tests {
             1,
             "only the cited memory should be attached, not all retrieved ones"
         );
-        assert_eq!(cited.citations[0].index, 1);
+        assert!(cited.citations[0].snippet.contains("europe-west1"));
     }
 
     #[test]
@@ -13798,6 +13998,87 @@ mod tests {
             restored.content.contains("ORIGINAL"),
             "undo must restore the overwritten record's prior contents, got: {}",
             restored.content
+        );
+    }
+
+    #[test]
+    fn undo_leaves_a_record_the_user_edited_after_approval() {
+        // A → approve B → user edits to C → Undo. The undo must NOT restore A
+        // (or delete the record): C is newer than both and must survive.
+        let (_temp, home, project_dir) = setup_project();
+        add_context(AddContextOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            key: "deploy-runbook".to_owned(),
+            title: "Deploy Runbook".to_owned(),
+            content: "A: original".to_owned(),
+            category: "runbook".to_owned(),
+            scope: String::new(),
+        })
+        .unwrap();
+        let proposed = propose_candidate(ProposeCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            source_type: "capture:llm".to_owned(),
+            source: None,
+            record_type: "context".to_owned(),
+            payload: serde_json::json!({
+                "key": "deploy-runbook",
+                "title": "Deploy Runbook",
+                "category": "runbook",
+                "content": "B: approved overwrite",
+            }),
+            scope: String::new(),
+            confidence: 0.6,
+            rationale: None,
+            evidence: Vec::new(),
+        })
+        .unwrap();
+        approve_candidate(ApproveCandidateOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: proposed.candidate.id.clone(),
+        })
+        .unwrap();
+        update_context(UpdateContextOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            key: "deploy-runbook".to_owned(),
+            title: None,
+            category: None,
+            scope: None,
+            content: Some("C: the user's newer edit".to_owned()),
+        })
+        .unwrap();
+
+        let report = revert_candidate_approval(RevertApprovalOptions {
+            project_name: None,
+            start_dir: project_dir.clone(),
+            grafiki_home: Some(home.clone()),
+            id: proposed.candidate.id,
+        })
+        .unwrap();
+        assert_eq!(report.candidate.status, "pending");
+        assert!(
+            report.message.contains("edited after approval"),
+            "{}",
+            report.message
+        );
+        let current = get_context(GetContextOptions {
+            project_name: None,
+            start_dir: project_dir,
+            grafiki_home: Some(home),
+            key: "deploy-runbook".to_owned(),
+        })
+        .unwrap();
+        assert!(
+            current.content.contains("C: the user's newer edit"),
+            "the post-approval edit must survive undo, got: {}",
+            current.content
         );
     }
 

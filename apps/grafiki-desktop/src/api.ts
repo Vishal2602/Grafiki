@@ -57,6 +57,17 @@ const getPreviewData = () =>
 /// so demos/QA cannot mistake preview behavior for a working backend.
 export const isPreviewMode = () => !hasTauri();
 
+/// Runtime shape check for load-bearing IPC responses. `invoke<T>` is a
+/// compile-time assertion only — a renamed/mistyped backend field flows through
+/// as a valid-looking object and misleads the whole UI. This validates the
+/// fields the app's logic branches on and throws a diagnosable error instead.
+function expectShape<T>(value: T, description: string, ok: (value: T) => boolean): T {
+  if (value === null || typeof value !== "object" || !ok(value)) {
+    throw new Error(`malformed ${description} from backend`);
+  }
+  return value;
+}
+
 /// A reliable yes/no confirmation. Uses the Tauri dialog plugin inside the app
 /// (window.confirm can be suppressed by the webview) and falls back to
 /// window.confirm in browser preview. Returns true when the user confirms.
@@ -130,16 +141,20 @@ export async function searchProjectMemory(input: {
     };
   }
 
-  return invoke<SearchReport>("search_project_memory", {
-    request: {
-      query: input.query,
-      mode: input.mode,
-      startDir: input.startDir ?? "",
-      scope: input.scope ?? "",
-      limit: input.limit ?? 20,
-      recordType: input.recordType ?? "all",
-    },
-  });
+  return expectShape(
+    await invoke<SearchReport>("search_project_memory", {
+      request: {
+        query: input.query,
+        mode: input.mode,
+        startDir: input.startDir ?? "",
+        scope: input.scope ?? "",
+        limit: input.limit ?? 20,
+        recordType: input.recordType ?? "all",
+      },
+    }),
+    "search report",
+    (report) => Array.isArray(report.results),
+  );
 }
 
 export async function chatWithMemory(input: {
@@ -179,16 +194,20 @@ export async function chatWithMemory(input: {
     };
   }
 
-  return invoke<ChatReply>("chat_with_memory", {
-    request: {
-      question: input.question,
-      startDir: input.startDir ?? "",
-      scope: input.scope ?? "",
-      limit: input.limit ?? 8,
-      model: input.model ?? null,
-      ollamaUrl: input.ollamaUrl ?? null,
-    },
-  });
+  return expectShape(
+    await invoke<ChatReply>("chat_with_memory", {
+      request: {
+        question: input.question,
+        startDir: input.startDir ?? "",
+        scope: input.scope ?? "",
+        limit: input.limit ?? 8,
+        model: input.model ?? null,
+        ollamaUrl: input.ollamaUrl ?? null,
+      },
+    }),
+    "chat reply",
+    (reply) => typeof reply.answer === "string" && Array.isArray(reply.citations),
+  );
 }
 
 export interface HomeLedgerReport {
@@ -273,9 +292,17 @@ export async function getHomeLedger(input: { startDir?: string }): Promise<HomeL
       resumable: null,
     };
   }
-  return invoke<HomeLedgerReport>("get_home_ledger", {
-    request: { startDir: input.startDir ?? "" },
-  });
+  return expectShape(
+    await invoke<HomeLedgerReport>("get_home_ledger", {
+      request: { startDir: input.startDir ?? "" },
+    }),
+    "home ledger",
+    (report) =>
+      report.ledger !== null &&
+      typeof report.ledger === "object" &&
+      Array.isArray(report.ledger.sessions) &&
+      typeof report.ledger.pending_candidates === "number",
+  );
 }
 
 export interface LiveTranscriptTurn {
@@ -617,7 +644,7 @@ export async function listCandidates(input: {
       .slice(0, input.limit ?? 50);
   }
 
-  return invoke<ExtractionCandidate[]>("list_memory_candidates", {
+  const candidates = await invoke<ExtractionCandidate[]>("list_memory_candidates", {
     request: {
       startDir: input.startDir ?? "",
       scope: input.scope ?? "",
@@ -626,6 +653,10 @@ export async function listCandidates(input: {
       captureId: input.captureId ?? "",
     },
   });
+  if (!Array.isArray(candidates)) {
+    throw new Error("malformed candidate list from backend");
+  }
+  return candidates;
 }
 
 export async function approveCandidate(input: {
@@ -985,9 +1016,21 @@ export async function getCaptureConfig(input: { startDir?: string } = {}): Promi
     };
   }
 
-  return invoke<CaptureConfigReport>("get_capture_config", {
-    request: { startDir: input.startDir ?? "" },
-  });
+  // Extra scrutiny here: this response DRIVES the consent UI — a shape drift
+  // must fail loudly, never render as a wrong-looking privacy setting.
+  return expectShape(
+    await invoke<CaptureConfigReport>("get_capture_config", {
+      request: { startDir: input.startDir ?? "" },
+    }),
+    "capture config",
+    (report) =>
+      report.config !== null &&
+      typeof report.config === "object" &&
+      typeof report.config.terminal_output === "string" &&
+      report.config.sources !== null &&
+      typeof report.config.sources === "object" &&
+      typeof report.config.sources.terminal === "boolean",
+  );
 }
 
 export async function updateCaptureConfig(input: CaptureConfigUpdateInput): Promise<CaptureConfigReport> {
@@ -1318,11 +1361,15 @@ export async function getDaemonStatus(input: {
     };
   }
 
-  return invoke<DaemonStatus>("get_daemon_status", {
-    request: {
-      startDir: input.startDir ?? "",
-    },
-  });
+  return expectShape(
+    await invoke<DaemonStatus>("get_daemon_status", {
+      request: {
+        startDir: input.startDir ?? "",
+      },
+    }),
+    "daemon status",
+    (status) => typeof status.running === "boolean",
+  );
 }
 
 export async function startDaemon(input: {

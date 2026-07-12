@@ -1913,7 +1913,10 @@ textarea {
   white-space: nowrap;
 }
 .chip-live {
-  color: var(--accent-live);
+  /* --success, not --accent-live: this is TINY (11px) status TEXT and the
+     bright live green sat at ~3.3:1 on the sheet — under the 4.5:1 AA floor.
+     The bright green remains for the decorative pulse dot only. */
+  color: var(--success);
   border-color: rgba(46, 158, 107, 0.35);
 }
 .chip-warn {

@@ -36,7 +36,10 @@ boot→Home (drives onboarding on a fresh profile with a /tmp project), all rail
 destinations, the ⌘K palette → ask-memory routing, the Review keyboard-triage
 legend, and the theme switch (asserts `html[data-theme]` flips and restores).
 
-Status: **5/5 passing, ~0.5s** (deterministic across runs).
+Status: **7/7 passing** (deterministic across runs). The suite also runs in
+CI as the `desktop-e2e` job in `.github/workflows/ci.yml` (macOS, debug build,
+Vite dev server + `npm run test:e2e:only`) — it is a real gate, not
+`continue-on-error`.
 
 Notes:
 - `npm run test:e2e:preflight` checks `http://127.0.0.1:1420/` so a missing Vite
@@ -125,4 +128,4 @@ Lessons from the five-persona audit campaign (2026-07-09):
 | "Did my change break anything obvious?" | 2 (run the suite) |
 | "Does the new flow feel right / look right?" | 1 (agent drive + screenshots) |
 | "Let an agent regression-hunt for an hour" | 3 (MCP) or 1 |
-| Unit/integration logic (core, CLI) | `cargo test` (136+ tests) + eval gates |
+| Unit/integration logic (core, CLI) | `cargo test` (219+ tests across grafiki-core, grafiki-cli, grafiki-eval, grafiki-desktop) + eval gates |

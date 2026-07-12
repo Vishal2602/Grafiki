@@ -51,6 +51,10 @@ jobs:
   # Real semantic search ships only in release builds: the fastembed + sqlite-vec
   # features are compiled in here, so the published binaries embed for real while
   # day-to-day dev builds stay lightweight.
+  #
+  # x86_64-apple-darwin is cross-compiled from the aarch64 (Apple Silicon) runner:
+  # GitHub retired the macos-13 (Intel) image in Dec 2025, so there is no native
+  # Intel runner left to build on.
   cli:
     name: CLI (${{ matrix.target }})
     needs: [lint-and-test]
@@ -61,7 +65,7 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -75,9 +79,11 @@ jobs:
         run: |
           mkdir -p dist
           tar -czf "dist/grafiki-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" grafiki
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          files: dist/grafiki-${{ matrix.target }}.tar.gz
+          name: cli-${{ matrix.target }}
+          path: dist/grafiki-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
 
   desktop:
     name: Desktop DMG (macOS)
@@ -118,7 +124,30 @@ jobs:
         # feature must therefore be enabled on the desktop build itself; building
         # only the CLI sidecar with these features does not activate them here.
         run: npm run tauri -- build --features production-embeddings
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-dmg
+          path: target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+  # Nothing is published until every build job above has succeeded. This job
+  # downloads every artifact and attaches them to the release in one step, so a
+  # single failed matrix leg (e.g. the Linux CLI build) can never yield a
+  # partial release with only some platforms published.
+  publish:
+    name: Publish release assets
+    needs: [cli, desktop]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten artifact layout
+        run: |
+          mkdir -p release-assets
+          find dist -type f \( -name '*.tar.gz' -o -name '*.dmg' \) -exec cp {} release-assets/ \;
+          ls -la release-assets
       - uses: softprops/action-gh-release@v2
         with:
-          files: |
-            target/release/bundle/dmg/*.dmg
+          files: release-assets/*

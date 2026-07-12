@@ -1501,11 +1501,18 @@ function HomePane(props: {
     };
   }, [props.projectRoot, props.snapshot?.memory_available, pipelineCheck]);
 
-  const enableCaptureNow = () => {
+  const enableCaptureNow = async () => {
     // Re-disclose before enabling full-output capture — the same consent the
     // onboarding checkbox obtains. A one-click "Turn on capture" that silently
     // starts storing terminal output would bypass the initial disclosure.
-    if (!window.confirm(CAPTURE_ENABLE_DISCLOSURE)) return;
+    // (confirmDialog = the Tauri dialog plugin: window.confirm can be
+    // suppressed inside the packaged webview.)
+    const consented = await confirmDialog(CAPTURE_ENABLE_DISCLOSURE, {
+      title: "Turn on terminal capture?",
+      kind: "info",
+      okLabel: "Turn on capture",
+    });
+    if (!consented) return;
     setPipelineFixBusy(true);
     updateCaptureConfig({ startDir: props.projectRoot, terminal: true, terminalOutput: "full" })
       .then(() => {
@@ -1569,7 +1576,7 @@ function HomePane(props: {
                   className="link-button"
                   type="button"
                   disabled={pipelineFixBusy}
-                  onClick={enableCaptureNow}
+                  onClick={() => void enableCaptureNow()}
                 >
                   {pipelineFixBusy ? "Turning on…" : "Turn on capture"}
                 </button>
@@ -2979,41 +2986,29 @@ function ChatPane(props: {
       style={{ display: "flex", flexDirection: "column", height: "100%", gap: 12 }}
     >
       <div className="seg-tabs" role="tablist" aria-label="Memory views" onKeyDown={handleTablistKeyDown}>
-        <button role="tab" aria-selected={memTab === "chat"} className={`seg-tab ${memTab === "chat" ? "active" : ""}`} onClick={() => setMemTab("chat")}>
-          Ask
-        </button>
-        <button
-          role="tab"
-          aria-selected={memTab === "search"}
-          className={`seg-tab ${memTab === "search" ? "active" : ""}`}
-          onClick={() => setMemTab("search")}
-        >
-          Search
-        </button>
-        <button
-          className={`seg-tab ${memTab === "decisions" ? "active" : ""}`}
-          role="tab"
-          aria-selected={memTab === "decisions"}
-          onClick={() => setMemTab("decisions")}
-        >
-          Decisions
-        </button>
-        <button
-          className={`seg-tab ${memTab === "context" ? "active" : ""}`}
-          role="tab"
-          aria-selected={memTab === "context"}
-          onClick={() => setMemTab("context")}
-        >
-          Context
-        </button>
-        <button
-          role="tab"
-          aria-selected={memTab === "activity"}
-          className={`seg-tab ${memTab === "activity" ? "active" : ""}`}
-          onClick={() => setMemTab("activity")}
-        >
-          Agent activity
-        </button>
+        {/* Full tab semantics: roving tabIndex + tab↔panel id links. */}
+        {(
+          [
+            ["chat", "Ask"],
+            ["search", "Search"],
+            ["decisions", "Decisions"],
+            ["context", "Context"],
+            ["activity", "Agent activity"],
+          ] as const
+        ).map(([key, label]) => (
+          <button
+            key={key}
+            role="tab"
+            id={`mem-tab-${key}`}
+            aria-controls={`mem-panel-${key}`}
+            aria-selected={memTab === key}
+            tabIndex={memTab === key ? 0 : -1}
+            className={`seg-tab ${memTab === key ? "active" : ""}`}
+            onClick={() => setMemTab(key)}
+          >
+            {label}
+          </button>
+        ))}
       </div>
       <div className="memory-surface-actions">
         <button className="button primary btn-sm" type="button" onClick={() => setManualOpen((open) => !open)}>
@@ -3067,7 +3062,12 @@ function ChatPane(props: {
         </form>
       ) : null}
       {memTab === "search" ? (
-        <div className="mem-tab-panel" role="tabpanel">
+        <div
+          className="mem-tab-panel"
+          role="tabpanel"
+          id="mem-panel-search"
+          aria-labelledby="mem-tab-search"
+        >
           <form
             className="trusted-search-form"
             onSubmit={(event) => {
@@ -3134,7 +3134,12 @@ function ChatPane(props: {
         </div>
       ) : null}
       {memTab === "activity" ? (
-        <div className="mem-tab-panel" role="tabpanel">
+        <div
+          className="mem-tab-panel"
+          role="tabpanel"
+          id="mem-panel-activity"
+          aria-labelledby="mem-tab-activity"
+        >
           {activity === null ? (
             <p className="muted" role="status">Loading agent activity…</p>
           ) : activity.length === 0 ? (
@@ -3153,7 +3158,12 @@ function ChatPane(props: {
         </div>
       ) : null}
       {memTab === "decisions" ? (
-        <div className="mem-tab-panel">
+        <div
+          className="mem-tab-panel"
+          role="tabpanel"
+          id="mem-panel-decisions"
+          aria-labelledby="mem-tab-decisions"
+        >
           {browseError ? (
             <div className="mem-empty" role="alert">
               <h3>Couldn't load decisions</h3>
@@ -3202,7 +3212,12 @@ function ChatPane(props: {
         </div>
       ) : null}
       {memTab === "context" ? (
-        <div className="mem-tab-panel">
+        <div
+          className="mem-tab-panel"
+          role="tabpanel"
+          id="mem-panel-context"
+          aria-labelledby="mem-tab-context"
+        >
           {browseError ? (
             <div className="mem-empty" role="alert">
               <h3>Couldn't load context</h3>
@@ -3250,7 +3265,13 @@ function ChatPane(props: {
           )}
         </div>
       ) : null}
-      <div className="mem-chat-scroll" style={{ display: memTab === "chat" ? "flex" : "none" }}>
+      <div
+        className="mem-chat-scroll"
+        role="tabpanel"
+        id="mem-panel-chat"
+        aria-labelledby="mem-tab-chat"
+        style={{ display: memTab === "chat" ? "flex" : "none" }}
+      >
         <div className="mem-column" style={{ display: "flex", flexDirection: "column", flex: 1, gap: 16 }}>
           {turns.length === 0 ? (
             <div className="mem-empty">
@@ -3388,6 +3409,7 @@ function ChatPane(props: {
               }
             }}
             placeholder="Ask your memory…"
+            aria-label="Ask your memory"
             autoComplete="off"
           />
           <button onClick={() => void ask()} disabled={sending || !question.trim()}>
@@ -3698,6 +3720,16 @@ function CandidatesPane(props: {
         lastError = undoError;
       }
     }
+    // Refresh FIRST: load() clears the error state on entry, so reporting the
+    // partial-failure outcome before it ran wiped the report a frame later.
+    try {
+      await load();
+      await props.onMemoryChanged();
+    } catch (refreshError) {
+      notifyBackground(`Undo finished, but the view couldn't refresh: ${String(refreshError)}`);
+    } finally {
+      setBusyId(null);
+    }
     const undone = ids.length - failed.length;
     if (failed.length === 0) {
       setUndo(null);
@@ -3709,14 +3741,6 @@ function CandidatesPane(props: {
       setError(
         `Undid ${undone} of ${ids.length}; ${failed.length} could not be undone (${String(lastError)}). Try Undo again.`,
       );
-    }
-    try {
-      await load();
-      await props.onMemoryChanged();
-    } catch (refreshError) {
-      notifyBackground(`Undo finished, but the view couldn't refresh: ${String(refreshError)}`);
-    } finally {
-      setBusyId(null);
     }
   }
 
@@ -4388,7 +4412,11 @@ function SettingsPane(props: {
   // The daemon can die (or be killed) outside this app; without a live check
   // Settings kept saying "Running" indefinitely. Poll quietly while open.
   useEffect(() => {
-    const timer = window.setInterval(() => refreshDaemonStatus(undefined, { silent: true }), 20_000);
+    const timer = window.setInterval(
+      () =>
+        refreshDaemonStatus(undefined, { silent: true, request: settingsRequestRef.current }),
+      20_000,
+    );
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [props.projectRoot]);
@@ -4430,15 +4458,19 @@ function SettingsPane(props: {
   async function patchCaptureConfig(input: Parameters<typeof updateCaptureConfig>[0]) {
     const startDir = draftRoot || props.projectRoot || snapshot?.start_dir || "";
     if (!startDir.trim()) return;
+    // Era-pin the mutation: a save racing a project switch must not display
+    // the OLD project's config (or its "saved" toast) on the new one.
+    const era = settingsRequestRef.current;
     setCaptureConfigBusy(true);
     setMessage(null);
     setError(null);
     try {
       const next = await updateCaptureConfig({ startDir, ...input });
+      if (era !== settingsRequestRef.current) return;
       setCaptureConfig(next);
       setMessage("Capture settings saved.");
     } catch (configError) {
-      setError(String(configError));
+      if (era === settingsRequestRef.current) setError(String(configError));
     } finally {
       setCaptureConfigBusy(false);
     }
@@ -4460,6 +4492,10 @@ function SettingsPane(props: {
   }
 
   async function startProjectDaemon() {
+    // Pin this mutation to the current project era: if the project switches
+    // while the daemon starts, its result (incl. the bearer token) must not
+    // land in the NEW project's Settings.
+    const era = settingsRequestRef.current;
     setDaemonBusy("start");
     setMessage(null);
     setError(null);
@@ -4470,18 +4506,20 @@ function SettingsPane(props: {
         port: daemonPort,
         token: daemonToken,
       });
+      if (era !== settingsRequestRef.current) return;
       // Surface the auto-generated token so the user can give it to external agents.
       if (result.token) setDaemonToken(result.token);
       setMessage(`${result.message} ${result.url}`);
-      await refreshDaemonStatus();
+      await refreshDaemonStatus(undefined, { request: era });
     } catch (daemonError) {
-      setError(String(daemonError));
+      if (era === settingsRequestRef.current) setError(String(daemonError));
     } finally {
       setDaemonBusy(null);
     }
   }
 
   async function stopProjectDaemon() {
+    const era = settingsRequestRef.current;
     setDaemonBusy("stop");
     setMessage(null);
     setError(null);
@@ -4489,10 +4527,11 @@ function SettingsPane(props: {
       const result = await stopDaemon({
         startDir: draftRoot || props.projectRoot || snapshot?.start_dir || "",
       });
+      if (era !== settingsRequestRef.current) return;
       setMessage(result.message);
-      await refreshDaemonStatus();
+      await refreshDaemonStatus(undefined, { request: era });
     } catch (daemonError) {
-      setError(String(daemonError));
+      if (era === settingsRequestRef.current) setError(String(daemonError));
     } finally {
       setDaemonBusy(null);
     }
@@ -4604,21 +4643,30 @@ function SettingsPane(props: {
   return (
     <div className="view-stack settings-stack">
       <div className="seg-tabs" role="tablist" aria-label="Settings sections" onKeyDown={handleTablistKeyDown}>
-        <button role="tab" aria-selected={settingsTab === "projects"} className={`seg-tab ${settingsTab === "projects" ? "active" : ""}`} onClick={() => setSettingsTab("projects")}>
-          Projects
-        </button>
-        <button role="tab" aria-selected={settingsTab === "capture"} className={`seg-tab ${settingsTab === "capture" ? "active" : ""}`} onClick={() => setSettingsTab("capture")}>
-          Capture & privacy
-        </button>
-        <button role="tab" aria-selected={settingsTab === "local-ai"} className={`seg-tab ${settingsTab === "local-ai" ? "active" : ""}`} onClick={() => setSettingsTab("local-ai")}>
-          Local AI
-        </button>
-        <button role="tab" aria-selected={settingsTab === "hookups"} className={`seg-tab ${settingsTab === "hookups" ? "active" : ""}`} onClick={() => setSettingsTab("hookups")}>
-          Agent hookups
-        </button>
-        <button role="tab" aria-selected={settingsTab === "about"} className={`seg-tab ${settingsTab === "about" ? "active" : ""}`} onClick={() => setSettingsTab("about")}>
-          About
-        </button>
+        {/* Full tab semantics: roving tabIndex (one Tab stop, arrows move within)
+            and tab↔panel id links, not just role+selected. */}
+        {(
+          [
+            ["projects", "Projects"],
+            ["capture", "Capture & privacy"],
+            ["local-ai", "Local AI"],
+            ["hookups", "Agent hookups"],
+            ["about", "About"],
+          ] as const
+        ).map(([key, label]) => (
+          <button
+            key={key}
+            role="tab"
+            id={`settings-tab-${key}`}
+            aria-controls={`settings-panel-${key}`}
+            aria-selected={settingsTab === key}
+            tabIndex={settingsTab === key ? 0 : -1}
+            className={`seg-tab ${settingsTab === key ? "active" : ""}`}
+            onClick={() => setSettingsTab(key)}
+          >
+            {label}
+          </button>
+        ))}
       </div>
 
       {message ? <section className="notice compact good">{message}</section> : null}
@@ -4630,7 +4678,12 @@ function SettingsPane(props: {
       ) : null}
 
       {settingsTab === "projects" ? (
-        <section className="settings-grid">
+        <section
+          className="settings-grid"
+          role="tabpanel"
+          id="settings-panel-projects"
+          aria-labelledby="settings-tab-projects"
+        >
           <div className="settings-editor">
             <label className="field-label">
               <span>Project Folder</span>
@@ -4661,7 +4714,12 @@ function SettingsPane(props: {
       ) : null}
 
       {settingsTab === "capture" ? (
-        <section className="settings-grid">
+        <section
+          className="settings-grid"
+          role="tabpanel"
+          id="settings-panel-capture"
+          aria-labelledby="settings-tab-capture"
+        >
           <ListHeading title="Capture Consent" icon={ShieldQuestion} />
           <p className="muted">
             Choose what Grafiki may read from this project. Everything stays on this machine —
@@ -4763,7 +4821,12 @@ function SettingsPane(props: {
       ) : null}
 
       {settingsTab === "local-ai" ? (
-        <section className="settings-grid">
+        <section
+          className="settings-grid"
+          role="tabpanel"
+          id="settings-panel-local-ai"
+          aria-labelledby="settings-tab-local-ai"
+        >
           <ListHeading title="Local AI" icon={Sparkles} />
           <div className="settings-editor">
             {localModels === null ? (
@@ -4799,7 +4862,12 @@ function SettingsPane(props: {
       ) : null}
 
       {settingsTab === "hookups" ? (
-        <section className="settings-grid">
+        <section
+          className="settings-grid"
+          role="tabpanel"
+          id="settings-panel-hookups"
+          aria-labelledby="settings-tab-hookups"
+        >
           <ListHeading title="Agent Hookups" icon={Activity} />
           <div className="settings-editor">
             <p className="muted">
@@ -4927,7 +4995,12 @@ function SettingsPane(props: {
       ) : null}
 
       {settingsTab === "about" ? (
-        <section className="settings-grid">
+        <section
+          className="settings-grid"
+          role="tabpanel"
+          id="settings-panel-about"
+          aria-labelledby="settings-tab-about"
+        >
           <div className="settings-editor">
             <div className="setting-row">
               <span>Appearance</span>
@@ -5444,6 +5517,29 @@ function Inspector(props: {
 
   useEffect(() => setCopyFeedback(null), [selectedId]);
 
+  // Overlay/panel keyboard contract: focus moves in on open, Escape closes,
+  // and focus returns to whatever had it before — the workspace behind the
+  // narrow-width overlay is `inert`, so without this the keyboard user is
+  // stranded with nothing focusable at all.
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const onCloseRef = useRef(props.onClose);
+  onCloseRef.current = props.onClose;
+  useEffect(() => {
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    closeButtonRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCloseRef.current();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      previouslyFocused?.focus?.();
+    };
+  }, []);
+
   const copySelectedId = async () => {
     if (!selectedId) return;
     try {
@@ -5458,6 +5554,9 @@ function Inspector(props: {
   return (
     <motion.aside
       className="inspector"
+      role="dialog"
+      aria-modal={false}
+      aria-label="Inspector"
       initial={props.reduceMotion ? false : { opacity: 0, x: 18 }}
       animate={{ opacity: 1, x: 0 }}
       exit={props.reduceMotion ? undefined : { opacity: 0, x: 18 }}
@@ -5465,7 +5564,14 @@ function Inspector(props: {
     >
       <header>
         <span>Inspector</span>
-        <button className="icon-button" type="button" title="Hide inspector" onClick={props.onClose}>
+        <button
+          ref={closeButtonRef}
+          className="icon-button"
+          type="button"
+          title="Hide inspector (Esc)"
+          aria-label="Hide inspector"
+          onClick={props.onClose}
+        >
           <PanelRight size={17} />
         </button>
       </header>

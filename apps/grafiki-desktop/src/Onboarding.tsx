@@ -1,6 +1,12 @@
 import { motion } from "framer-motion";
 import { useEffect, useState } from "react";
-import { initializeProject, listLocalModels, pickProjectFolder, updateCaptureConfig } from "./api";
+import {
+  confirmDialog,
+  initializeProject,
+  listLocalModels,
+  pickProjectFolder,
+  updateCaptureConfig,
+} from "./api";
 
 /// First-run onboarding (UX_REDESIGN.md §5.0): four steps, under 90 seconds,
 /// honest at every fork. Full-sheet, no rail — nothing else exists until the
@@ -56,13 +62,14 @@ export default function Onboarding(props: {
     if (!dir) return;
     // Re-state consent before flipping capture on from this later step — same
     // disclosure as the step-1 checkbox, so no path enables capture silently.
-    if (
-      !window.confirm(
-        "Turn on terminal capture for this workspace?\n\nGrafiki will store this project's " +
-          "terminal output as local, redacted capture events so it can become reviewable memory. " +
-          "Nothing leaves this Mac, and you can turn it off anytime in Settings → Capture & privacy.",
-      )
-    ) {
+    // (Tauri dialog, not window.confirm — the webview can suppress the latter.)
+    const consented = await confirmDialog(
+      "Turn on terminal capture for this workspace?\n\nGrafiki will store this project's " +
+        "terminal output as local, redacted capture events so it can become reviewable memory. " +
+        "Nothing leaves this Mac, and you can turn it off anytime in Settings → Capture & privacy.",
+      { title: "Turn on terminal capture?", kind: "info", okLabel: "Turn on capture" },
+    );
+    if (!consented) {
       return;
     }
     setEnablingCapture(true);
